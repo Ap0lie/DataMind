@@ -1,0 +1,22 @@
+{
+  "suite_id": "performance",
+  "version": "1.0.0",
+  "description": "Explicit synthetic throughput and concurrency workloads.",
+  "mode": "performance",
+  "corpus_checksum": "auto",
+  "max_duration_seconds": 3600,
+  "cases": [
+    {"case_id": "rows-1k", "name": "1K rows", "subsystem": "performance", "operation": "performance.dataframe", "input": {"rows": 1000}, "validators": [{"type": "exact", "path": "row_count", "expected": 1000}], "timeout_seconds": 30},
+    {"case_id": "rows-100k", "name": "100K rows", "subsystem": "performance", "operation": "performance.dataframe", "input": {"rows": 100000}, "validators": [{"type": "exact", "path": "row_count", "expected": 100000}], "timeout_seconds": 180},
+    {"case_id": "rows-1m", "name": "1M rows", "subsystem": "performance", "operation": "performance.dataframe", "input": {"rows": 1000000}, "validators": [{"type": "exact", "path": "row_count", "expected": 1000000}], "timeout_seconds": 900},
+    {"case_id": "concurrency-5", "name": "Five concurrent tasks", "subsystem": "performance", "operation": "performance.concurrent", "input": {"workers": 5, "rows_per_task": 10000}, "validators": [{"type": "exact", "path": "completed_tasks", "expected": 5}], "timeout_seconds": 180},
+    {"case_id": "concurrency-20", "name": "Twenty concurrent tasks", "subsystem": "performance", "operation": "performance.concurrent", "input": {"workers": 20, "rows_per_task": 5000}, "validators": [{"type": "exact", "path": "completed_tasks", "expected": 20}], "timeout_seconds": 300}
+    ,{"case_id": "tables-2", "name": "Two-table relationship shape", "subsystem": "performance", "operation": "performance.table_shapes", "input": {"tables": 2, "rows_per_table": 100}, "validators": [{"type": "exact", "path": "table_count", "expected": 2}, {"type": "minimum", "path": "candidate_count", "expected": 1}], "timeout_seconds": 90}
+    ,{"case_id": "tables-5", "name": "Five-table relationship shape", "subsystem": "performance", "operation": "performance.table_shapes", "input": {"tables": 5, "rows_per_table": 100}, "validators": [{"type": "exact", "path": "table_count", "expected": 5}, {"type": "minimum", "path": "candidate_count", "expected": 4}], "timeout_seconds": 180}
+    ,{"case_id": "tables-10", "name": "Ten-table relationship shape", "subsystem": "performance", "operation": "performance.table_shapes", "input": {"tables": 10, "rows_per_table": 100}, "validators": [{"type": "exact", "path": "table_count", "expected": 10}, {"type": "minimum", "path": "candidate_count", "expected": 9}], "timeout_seconds": 300}
+  ],
+  "thresholds": [
+    {"metric": "task_success_rate", "direction": "minimum", "value": 0.85, "hard_gate": false},
+    {"metric": "throughput", "direction": "minimum", "value": 1.0, "hard_gate": false}
+  ]
+}

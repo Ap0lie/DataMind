@@ -1,0 +1,11 @@
+[client]
+toolbarMode = "minimal"
+
+[runner]
+fastReruns = true
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

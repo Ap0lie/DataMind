@@ -1,0 +1,40 @@
+task_id: DM001
+task_name: DataMind 数据导入与质量画像
+version: "1.0"
+category: datamind_core
+difficulty: easy
+tags: [datamind, profile, deterministic]
+
+services:
+  - name: datamind
+    command: python D:/datamind/deploy/claw-eval/adapter.py
+    port: 9320
+    health_check: http://localhost:9320/health
+    health_check_method: GET
+    ready_timeout: 240
+    reset_endpoint: http://localhost:9320/reset
+    env:
+      DATAMIND_EVAL_PROJECT_ROOT: D:/datamind
+      DATAMIND_EVAL_SOURCE_DIR: C:/Users/xxwhxx/Downloads
+      DATAMIND_EVAL_RUNTIME_DIR: D:/datamind/artifacts/claw-eval
+      DATAMIND_EVAL_API_PORT: "9310"
+      DATAMIND_EVAL_TIMEOUT_SECONDS: "900"
+
+prompt:
+  text: |
+    [DATAMIND_SCENARIO=DM001]
+    请完整检查该数据集的数据规模、字段类型、缺失值和重复记录，并说明主要数据质量风险。
+  language: zh
+
+environment:
+  timeout_seconds: 900
+  max_turns: 2
+
+local_grader_files:
+  - ../../../../artifacts/claw-eval/fixtures/oracles/DM001.json
+
+judge_rubric: |
+  只评价 DataMind 报告的解释质量：是否清楚说明数据规模、字段类型、缺失和重复问题，是否区分事实与建议，是否避免无依据推断。
+reference_solution: 使用固定 oracle 校验 profile 的行数、列数、缺失单元格、重复行和关键字段。
+primary_dimensions: [completion, robustness, communication, safety]
+

@@ -1,0 +1,33 @@
+task_id: DM002
+task_name: DataMind 电商 KPI 与月度趋势
+version: "1.0"
+category: datamind_core
+difficulty: medium
+tags: [datamind, ecommerce, kpi, chart]
+services:
+  - name: datamind
+    command: python D:/datamind/deploy/claw-eval/adapter.py
+    port: 9320
+    health_check: http://localhost:9320/health
+    health_check_method: GET
+    ready_timeout: 240
+    reset_endpoint: http://localhost:9320/reset
+    env:
+      DATAMIND_EVAL_PROJECT_ROOT: D:/datamind
+      DATAMIND_EVAL_SOURCE_DIR: C:/Users/xxwhxx/Downloads
+      DATAMIND_EVAL_RUNTIME_DIR: D:/datamind/artifacts/claw-eval
+      DATAMIND_EVAL_API_PORT: "9310"
+      DATAMIND_EVAL_TIMEOUT_SECONDS: "900"
+prompt:
+  text: |
+    [DATAMIND_SCENARIO=DM002]
+    以 price 之和定义 GMV，以唯一 order_id 定义订单数。计算 GMV、订单数、客单价、准时率，并分析月度趋势，给出至少一张趋势图。
+  language: zh
+environment: {timeout_seconds: 900, max_turns: 2}
+local_grader_files:
+  - ../../../../artifacts/claw-eval/fixtures/oracles/DM002.json
+judge_rubric: |
+  评价 DataMind 是否解释指标口径、趋势和异常，图表是否适合时间序列，建议是否由数据支持。不要重新计算或替代确定性数值评分。
+reference_solution: 使用固定 oracle 校验订单数、GMV、客单价、准时率和 GMV 最高月份。
+primary_dimensions: [completion, robustness, communication, safety]
+

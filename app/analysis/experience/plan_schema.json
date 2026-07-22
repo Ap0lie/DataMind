@@ -1,0 +1,48 @@
+{
+  "_comment": "Plan shape used by DataMind hypothesis-driven analysis rounds.",
+  "required_fields": [
+    "round_number",
+    "analytical_step",
+    "question",
+    "route",
+    "query_spec",
+    "expected_output",
+    "acceptance_criteria",
+    "stop_condition"
+  ],
+  "analytical_step_enum": [
+    "trend_analysis",
+    "decomposition",
+    "attribution",
+    "risk_mining"
+  ],
+  "route_enum": [
+    "sql",
+    "python",
+    "hybrid"
+  ],
+  "query_spec_required": [
+    "metrics",
+    "group_by",
+    "date_range"
+  ],
+  "expected_output_required": [
+    "format",
+    "required_fields",
+    "unit_sales",
+    "unit_rate"
+  ],
+  "acceptance_criteria_required": [
+    "min_rows",
+    "all_required_fields"
+  ],
+  "stop_condition_required": [
+    "if_impact_below_pct",
+    "reason"
+  ],
+  "column_fields": [
+    "metric_column",
+    "category_column",
+    "time_column"
+  ]
+}

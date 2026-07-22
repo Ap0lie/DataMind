@@ -1,0 +1,18 @@
+{
+  "suite_id": "resilience",
+  "version": "1.0.0",
+  "description": "Repair semantics plus real Compose service availability.",
+  "mode": "resilience",
+  "corpus_checksum": "auto",
+  "max_duration_seconds": 900,
+  "cases": [
+    {"case_id": "repair-after-two-errors", "name": "Third execution succeeds", "subsystem": "resilience", "operation": "resilience.repair", "input": {"failures_before_success": 2, "max_attempts": 3}, "expected": {"recovered": true, "attempts": 3}},
+    {"case_id": "fallback-after-three-errors", "name": "Three failures trigger fallback", "subsystem": "resilience", "operation": "resilience.repair", "input": {"failures_before_success": 3, "max_attempts": 3}, "expected": {"recovered": false, "attempts": 3}},
+    {"case_id": "compose-services-running", "name": "Production services are running", "subsystem": "resilience", "operation": "compose.health", "input": {"services": ["api", "worker", "postgres", "redis", "python-runner"]}, "expected": {"healthy": true}, "requires_compose": true, "timeout_seconds": 30},
+    {"case_id": "production-sse-delivery", "name": "Production SSE delivery stays below two seconds", "subsystem": "resilience", "operation": "production.smoke_metrics", "input": {"path": "artifacts/benchmarks/production-smoke.json"}, "validators": [{"type": "truthy", "path": "success"}, {"type": "minimum", "path": "sse_event_count", "expected": 1}, {"type": "maximum", "path": "sse_delivery_p95_ms", "expected": 2000}], "requires_compose": true}
+  ],
+  "thresholds": [
+    {"metric": "task_success_rate", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "sse_delivery_p95_ms", "direction": "maximum", "value": 2000, "hard_gate": true}
+  ]
+}

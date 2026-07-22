@@ -1,0 +1,12 @@
+{$DATAMIND_DOMAIN:localhost} {
+    encode zstd gzip
+
+    reverse_proxy frontend:80 {
+        flush_interval -1
+        transport http {
+            read_timeout 3600s
+            write_timeout 3600s
+        }
+    }
+}
+

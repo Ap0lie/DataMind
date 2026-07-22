@@ -1,0 +1,22 @@
+{
+  "suite_id": "external",
+  "version": "1.0.0",
+  "description": "Opt-in checksum validation for a user-supplied public benchmark corpus.",
+  "mode": "deterministic",
+  "corpus_checksum": "auto",
+  "max_duration_seconds": 120,
+  "cases": [
+    {
+      "case_id": "external-corpus-checksums",
+      "name": "External corpus files match their pinned manifest",
+      "subsystem": "corpus",
+      "operation": "external.validate",
+      "input": {},
+      "expected": {"available": true},
+      "timeout_seconds": 120
+    }
+  ],
+  "thresholds": [
+    {"metric": "task_success_rate", "direction": "exact", "value": 1.0, "hard_gate": true}
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "_comment": "Business thresholds used by the analysis workflow and report agents.",
+  "profit_rate": {
+    "critical_low": 10.0,
+    "desc": "profit_rate < 10% means immediate intervention; do not scale volume until confirmed.",
+    "warning_low": 13.0,
+    "desc_w": "profit_rate < 13% means pricing should be evaluated within the current quarter.",
+    "healthy_min": 15.0,
+    "desc_h": "profit_rate >= 15% means the structure is healthy."
+  },
+  "yoy_growth": {
+    "strong": 25.0,
+    "desc": "yoy_growth > 25% means strong growth.",
+    "weak": 5.0,
+    "desc_w": "yoy_growth < 5% means weak growth and requires focused analysis.",
+    "decline": 0.0,
+    "desc_d": "yoy_growth < 0% means attribution is required."
+  },
+  "profit_rate_drop": {
+    "structural": 2.0,
+    "desc": "profit_rate drop > 2pp means structural change and requires attribution.",
+    "event_driven": 5.0,
+    "desc_e": "single-month profit_rate drop > 5pp means promotion or event impact should be checked first."
+  },
+  "impact_min_pct": 3.0,
+  "max_analysis_rounds": 3,
+  "default_top_n": 20,
+  "desc": "Stop drilling into a branch when its discovered impact is below 3%."
+}

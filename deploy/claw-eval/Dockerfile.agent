@@ -1,0 +1,23 @@
+ARG REGISTRY=docker.m.daocloud.io
+FROM ${REGISTRY}/python:3.11-slim
+
+WORKDIR /workspace
+
+# Keep the base image's Debian sources. The upstream Dockerfile rewrites them
+# to a regional mirror that is not reachable in every Docker Desktop setup.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-sandbox-server.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
+
+# The build context is D:\claw-eval.
+COPY src/claw_eval/sandbox/ /opt/sandbox/
+
+RUN pip install --no-cache-dir playwright \
+    && playwright install --with-deps chromium
+
+EXPOSE 8080
+ENTRYPOINT ["python", "/opt/sandbox/server.py", "--port", "8080"]

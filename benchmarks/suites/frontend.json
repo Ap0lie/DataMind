@@ -1,0 +1,14 @@
+{
+  "suite_id": "frontend",
+  "version": "1.0.0",
+  "description": "Explicit frontend production build timing benchmark.",
+  "mode": "frontend",
+  "corpus_checksum": "auto",
+  "max_duration_seconds": 600,
+  "cases": [
+    {"case_id": "frontend-production-build", "name": "React production build", "subsystem": "frontend", "operation": "frontend.build", "input": {}, "expected": {"succeeded": true}, "timeout_seconds": 300}
+  ],
+  "thresholds": [
+    {"metric": "task_success_rate", "direction": "exact", "value": 1.0, "hard_gate": true}
+  ]
+}

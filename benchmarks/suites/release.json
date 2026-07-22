@@ -1,0 +1,147 @@
+{
+  "suite_id": "release",
+  "version": "1.0.0",
+  "description": "Deterministic release gates for DataMind core quality and safety.",
+  "mode": "deterministic",
+  "corpus_checksum": "auto",
+  "max_duration_seconds": 300,
+  "cases": [
+    {
+      "case_id": "cleaning-dirty-tabular",
+      "name": "Conservative local cleaning",
+      "subsystem": "cleaning",
+      "operation": "cleaning.basic",
+      "input": {"records": {"$corpus": "dirty_customer_records"}},
+      "expected": {"row_count": 3, "column_count": 3, "duplicate_rows": 0},
+      "validators": [
+        {"type": "exact", "path": "row_count", "expected": 3},
+        {"type": "exact", "path": "column_count", "expected": 3},
+        {"type": "exact", "path": "duplicate_rows", "expected": 0},
+        {"type": "set_equal", "path": "columns", "expected": ["customer_id", "amount", "订单日期"]}
+      ],
+      "tags": ["quality", "deterministic"]
+    },
+    {
+      "case_id": "semantic-chinese-top1",
+      "name": "Chinese semantic candidate ranking",
+      "subsystem": "semantic",
+      "operation": "semantic.rank",
+      "input": {
+        "questions": {"$corpus": "semantic_questions"},
+        "items": [
+          {"id": "sales", "name": "销售额", "aliases": ["营收", "收入", "GMV"], "formula": {"op": "literal", "value": 1}},
+          {"id": "profit", "name": "利润", "aliases": ["收益", "毛利"], "formula": {"op": "literal", "value": 1}},
+          {"id": "region", "name": "地区", "aliases": ["区域", "大区", "地域"], "type": "dimension"},
+          {"id": "product", "name": "产品", "aliases": ["商品", "品类"], "type": "dimension"}
+        ]
+      },
+      "validators": [{"type": "minimum", "path": "top1", "expected": 0.9}],
+      "tags": ["semantic", "chinese"]
+    },
+    {
+      "case_id": "sql-safe-select",
+      "name": "Job-scoped SELECT is accepted",
+      "subsystem": "sql_security",
+      "operation": "sql.safety",
+      "input": {"sql": "SELECT region, SUM(amount) AS total FROM dataset GROUP BY region"},
+      "expected": {"accepted": true}
+    },
+    {
+      "case_id": "sql-reject-write",
+      "name": "Write SQL is rejected",
+      "subsystem": "sql_security",
+      "operation": "sql.safety",
+      "input": {"sql": "DELETE FROM dataset"},
+      "expected": {"accepted": false}
+    },
+    {
+      "case_id": "sql-reject-external-read",
+      "name": "External file SQL is rejected",
+      "subsystem": "sql_security",
+      "operation": "sql.safety",
+      "input": {"sql": "SELECT * FROM read_csv_auto('/tmp/private.csv')"},
+      "expected": {"accepted": false}
+    },
+    {
+      "case_id": "loop-release-thresholds",
+      "name": "Bounded Loop release thresholds",
+      "subsystem": "agent_loop",
+      "operation": "loop.release_gate",
+      "input": {"outcomes": {"$corpus": "loop_outcomes"}},
+      "expected": {"passed": true},
+      "validators": [
+        {"type": "minimum", "path": "legal_call_rate", "expected": 0.95},
+        {"type": "minimum", "path": "repair_success_rate", "expected": 0.9},
+        {"type": "maximum", "path": "mean_tool_calls", "expected": 4},
+        {"type": "exact", "path": "duplicate_successful_actions", "expected": 0}
+      ]
+    },
+    {
+      "case_id": "relationship-commerce-star",
+      "name": "Multi-table relationship precision",
+      "subsystem": "relationships",
+      "operation": "relationship.inference",
+      "input": {
+        "tables": {"$corpus": "relationship_tables"},
+        "expected_edges": [
+          {"left_table": "orders", "right_table": "customers", "column": "customer_id"},
+          {"left_table": "orders", "right_table": "tags", "column": "order_id"}
+        ]
+      },
+      "validators": [
+        {"type": "minimum", "path": "precision", "expected": 0.95},
+        {"type": "minimum", "path": "recall", "expected": 0.9}
+      ],
+      "timeout_seconds": 45
+    },
+    {
+      "case_id": "report-evidence-complete",
+      "name": "Every numeric finding has valid evidence",
+      "subsystem": "report",
+      "operation": "report.evidence",
+      "input": {
+        "evidence": [
+          {"evidence_id": "ev_1", "values": {"total_revenue": 300}},
+          {"evidence_id": "ev_2", "values": {"east_share": 60}}
+        ],
+        "findings": [
+          {"content": "总销售额为 300 元。", "evidence_ids": ["ev_1"], "claims": [{"name": "total_revenue", "value": 300}]},
+          {"content": "华东占比为 60%。", "evidence_ids": ["ev_2"], "claims": [{"name": "east_share", "value": 60}]}
+        ]
+      },
+      "validators": [
+        {"type": "exact", "path": "coverage", "expected": 1.0},
+        {"type": "exact", "path": "numeric_accuracy", "expected": 1.0},
+        {"type": "exact", "path": "invalid_evidence_ids", "expected": []}
+      ]
+    },
+    {
+      "case_id": "assistant-ask-denies-write",
+      "name": "Ask mode cannot mutate data",
+      "subsystem": "assistant_security",
+      "operation": "assistant.permission",
+      "input": {"execution_mode": "ask"},
+      "expected": {"allowed": false}
+    },
+    {
+      "case_id": "assistant-execute-allows-granted-write",
+      "name": "Execute mode honors an explicit grant",
+      "subsystem": "assistant_security",
+      "operation": "assistant.permission",
+      "input": {"execution_mode": "execute"},
+      "expected": {"allowed": true}
+    }
+  ],
+  "thresholds": [
+    {"metric": "task_success_rate", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "security_pass_rate", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "semantic_top1", "direction": "minimum", "value": 0.9, "hard_gate": true},
+    {"metric": "relationship_precision", "direction": "minimum", "value": 0.95, "hard_gate": true},
+    {"metric": "report_evidence_coverage", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "report_numeric_accuracy", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "legal_tool_rate", "direction": "minimum", "value": 0.95, "hard_gate": true},
+    {"metric": "repair_success_rate", "direction": "minimum", "value": 0.9, "hard_gate": true},
+    {"metric": "loop_mean_tool_calls", "direction": "maximum", "value": 4.0, "hard_gate": true},
+    {"metric": "duplicate_successful_actions", "direction": "exact", "value": 0.0, "hard_gate": true}
+  ]
+}

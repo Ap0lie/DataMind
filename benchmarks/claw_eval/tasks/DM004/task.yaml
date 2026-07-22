@@ -1,0 +1,33 @@
+task_id: DM004
+task_name: DataMind 明确关系的多表分析
+version: "1.0"
+category: datamind_core
+difficulty: hard
+tags: [datamind, multi_table, joins, ecommerce]
+services:
+  - name: datamind
+    command: python D:/datamind/deploy/claw-eval/adapter.py
+    port: 9320
+    health_check: http://localhost:9320/health
+    health_check_method: GET
+    ready_timeout: 240
+    reset_endpoint: http://localhost:9320/reset
+    env:
+      DATAMIND_EVAL_PROJECT_ROOT: D:/datamind
+      DATAMIND_EVAL_SOURCE_DIR: C:/Users/xxwhxx/Downloads
+      DATAMIND_EVAL_RUNTIME_DIR: D:/datamind/artifacts/claw-eval
+      DATAMIND_EVAL_API_PORT: "9310"
+      DATAMIND_EVAL_TIMEOUT_SECONDS: "900"
+prompt:
+  text: |
+    [DATAMIND_SCENARIO=DM004]
+    基于已配置的数据表关系，以 order_items.price 之和定义收入，分析总收入、唯一订单数、收入最高的三个英文品类和三个客户州，避免重复连接放大，并生成图表。
+  language: zh
+environment: {timeout_seconds: 900, max_turns: 2}
+local_grader_files:
+  - ../../../../artifacts/claw-eval/fixtures/oracles/DM004.json
+judge_rubric: |
+  评价多表分析是否清楚说明关系和指标粒度，品类与地区洞察是否有数据支持，是否说明连接限制并给出适当图表。
+reference_solution: 使用 order_items 为事实表，分别多对一连接订单、客户、商品、翻译和卖家表。
+primary_dimensions: [completion, robustness, communication, safety]
+

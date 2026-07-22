@@ -1,0 +1,16 @@
+{
+  "name": "datamind-synthetic-v1",
+  "version": "1.0.0",
+  "seed": 20260716,
+  "privacy": "synthetic-only",
+  "scenarios": [
+    "dirty-tabular-cleaning",
+    "chinese-semantic-ranking",
+    "safe-and-unsafe-sql",
+    "multi-table-relationship-inference",
+    "report-evidence-coverage",
+    "assistant-permission-boundaries",
+    "bounded-loop-repair",
+    "large-chart-payload"
+  ]
+}

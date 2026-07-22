@@ -1,0 +1,31 @@
+model:
+  # The model under test is the local DataMind adapter. Kimi is configured on
+  # the DataMind service with DATAMIND_KIMI_* variables, not here.
+  api_key: local-datamind-adapter
+  base_url: http://127.0.0.1:9320/v1
+  model_id: datamind-core
+  context_window: 262144
+  temperature: null
+
+judge:
+  api_key: ${CLAW_EVAL_JUDGE_API_KEY}
+  # Keep these defaults in the config itself so direct `claw-eval grade` calls
+  # use Kimi K3 even when run_datamind_eval.ps1 is not involved.
+  base_url: https://api.moonshot.cn/v1
+  model_id: kimi-k3
+  enabled: true
+
+defaults:
+  trace_dir: D:/claw-eval/traces/datamind-core
+  # claw-eval batch currently ignores this value; run_datamind_eval.ps1 passes
+  # --tasks-dir explicitly so upstream tasks can never be selected by accident.
+  tasks_dir: D:/datamind/benchmarks/claw_eval/tasks
+
+sandbox:
+  # DataMind owns the analysis runtime; claw-eval does not need an agent sandbox.
+  enabled: false
+  image: claw-eval-agent:latest
+  memory_limit: 4g
+  cpu_limit: 2.0
+  container_timeout: 900
+  max_concurrent: 1

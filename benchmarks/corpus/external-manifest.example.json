@@ -1,0 +1,10 @@
+{
+  "version": "replace-with-pinned-source-version",
+  "source": "user-provided-public-corpus",
+  "files": [
+    {
+      "path": "orders_dataset.csv",
+      "sha256": "replace-with-sha256"
+    }
+  ]
+}

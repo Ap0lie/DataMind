@@ -1,0 +1,32 @@
+task_id: DM003
+task_name: DataMind 客户分层与运营洞察
+version: "1.0"
+category: datamind_core
+difficulty: medium
+tags: [datamind, segmentation, rfm, chart]
+services:
+  - name: datamind
+    command: python D:/datamind/deploy/claw-eval/adapter.py
+    port: 9320
+    health_check: http://localhost:9320/health
+    health_check_method: GET
+    ready_timeout: 240
+    reset_endpoint: http://localhost:9320/reset
+    env:
+      DATAMIND_EVAL_PROJECT_ROOT: D:/datamind
+      DATAMIND_EVAL_SOURCE_DIR: C:/Users/xxwhxx/Downloads
+      DATAMIND_EVAL_RUNTIME_DIR: D:/datamind/artifacts/claw-eval
+      DATAMIND_EVAL_API_PORT: "9310"
+      DATAMIND_EVAL_TIMEOUT_SECONDS: "900"
+prompt:
+  text: |
+    [DATAMIND_SCENARIO=DM003]
+    分析 customer_segment 的客户数、monetary 总额、平均评价和准时率，识别金额贡献最高的三个客户分层，并提出有证据的运营建议和图表。
+  language: zh
+environment: {timeout_seconds: 900, max_turns: 2}
+local_grader_files:
+  - ../../../../artifacts/claw-eval/fixtures/oracles/DM003.json
+judge_rubric: |
+  评价分层解释是否清楚、建议是否具有优先级和可操作性、是否说明相关性与因果性的边界，以及图表是否支持结论。
+reference_solution: 使用固定 oracle 校验 monetary 总额最高的三个 customer_segment 及其指标。
+primary_dimensions: [completion, robustness, communication, safety]

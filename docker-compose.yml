@@ -1,0 +1,333 @@
+name: ${COMPOSE_PROJECT_NAME:-datamind}
+
+x-datamind-app: &datamind-app
+  image: ${DATAMIND_APP_IMAGE:-datamind-app}:${DATAMIND_IMAGE_TAG:-latest}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      PYPI_INDEX_URL: ${DATAMIND_PYPI_INDEX_URL:-https://pypi.org/simple}
+
+x-datamind-environment: &datamind-environment
+  DATAMIND_ENVIRONMENT: production
+  DATAMIND_DATABASE_URL: postgresql+psycopg://datamind:${DATAMIND_POSTGRES_PASSWORD:?Set DATAMIND_POSTGRES_PASSWORD}@postgres:5432/datamind
+  DATAMIND_REDIS_URL: redis://:${DATAMIND_REDIS_PASSWORD:?Set DATAMIND_REDIS_PASSWORD}@redis:6379/0
+  DATAMIND_EXECUTION_BACKEND: celery
+  DATAMIND_CHECKPOINT_BACKEND: postgres
+  DATAMIND_AUTH_MODE: session
+  DATAMIND_SESSION_COOKIE_SECURE: "true"
+  DATAMIND_CORS_ORIGINS: ${DATAMIND_PUBLIC_ORIGIN:-https://localhost}
+  DATAMIND_ALLOW_MCP_INVOKE: "false"
+  DATAMIND_RATE_LIMITS_ENABLED: "true"
+  DATAMIND_DATASET_STORE_PATH: /data/datasets
+  DATAMIND_PYTHON_RUNNER_URL: http://python-runner:8020
+  DATAMIND_PYTHON_RUNNER_SHARED_SECRET: ${DATAMIND_PYTHON_RUNNER_SHARED_SECRET:?Set DATAMIND_PYTHON_RUNNER_SHARED_SECRET}
+  DATAMIND_PYTHON_SANDBOX_IMAGE: ${DATAMIND_SANDBOX_IMAGE:-datamind-python-sandbox:latest}
+  DATAMIND_LLM_PROVIDER: ${DATAMIND_LLM_PROVIDER:-}
+  DATAMIND_DEFAULT_LLM_PROVIDER: ${DATAMIND_DEFAULT_LLM_PROVIDER:-deepseek}
+  DATAMIND_CLEANING_LLM_PROVIDER: ${DATAMIND_CLEANING_LLM_PROVIDER:-deepseek}
+  DATAMIND_PLANNER_LLM_PROVIDER: ${DATAMIND_PLANNER_LLM_PROVIDER:-deepseek}
+  DATAMIND_SQL_LLM_PROVIDER: ${DATAMIND_SQL_LLM_PROVIDER:-deepseek}
+  DATAMIND_PYTHON_LLM_PROVIDER: ${DATAMIND_PYTHON_LLM_PROVIDER:-deepseek}
+  DATAMIND_REFLECTION_LLM_PROVIDER: ${DATAMIND_REFLECTION_LLM_PROVIDER:-deepseek}
+  DATAMIND_REPORT_LLM_PROVIDER: ${DATAMIND_REPORT_LLM_PROVIDER:-kimi}
+  DATAMIND_REVIEW_LLM_PROVIDER: ${DATAMIND_REVIEW_LLM_PROVIDER:-kimi}
+  DATAMIND_MULTIMODAL_LLM_PROVIDER: ${DATAMIND_MULTIMODAL_LLM_PROVIDER:-kimi}
+  DATAMIND_LLM_MODEL: ${DATAMIND_LLM_MODEL:-deepseek-chat}
+  DATAMIND_DEEPSEEK_MODEL: ${DATAMIND_DEEPSEEK_MODEL:-deepseek-chat}
+  DATAMIND_KIMI_MODEL: ${DATAMIND_KIMI_MODEL:-kimi-k2.6}
+  DATAMIND_LLM_BASE_URL: ${DATAMIND_LLM_BASE_URL:-}
+  DATAMIND_DEEPSEEK_BASE_URL: ${DATAMIND_DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+  DATAMIND_KIMI_BASE_URL: ${DATAMIND_KIMI_BASE_URL:-https://api.moonshot.cn/v1}
+  DATAMIND_LLM_API_KEY: ${DATAMIND_LLM_API_KEY:-}
+  DATAMIND_DEEPSEEK_API_KEY: ${DATAMIND_DEEPSEEK_API_KEY:-}
+  DATAMIND_KIMI_API_KEY: ${DATAMIND_KIMI_API_KEY:-}
+  DATAMIND_ASSISTANT_ENABLED: ${DATAMIND_ASSISTANT_ENABLED:-true}
+  DATAMIND_ASSISTANT_LLM_PROVIDER: ${DATAMIND_ASSISTANT_LLM_PROVIDER:-kimi}
+  DATAMIND_ASSISTANT_LLM_MODEL: ${DATAMIND_ASSISTANT_LLM_MODEL:-kimi-k2.6}
+  DATAMIND_ASSISTANT_MAX_TOOL_CALLS: ${DATAMIND_ASSISTANT_MAX_TOOL_CALLS:-8}
+  DATAMIND_ASSISTANT_MAX_CONTEXT_CHARS: ${DATAMIND_ASSISTANT_MAX_CONTEXT_CHARS:-60000}
+  DATAMIND_ASSISTANT_TIMEOUT_SECONDS: ${DATAMIND_ASSISTANT_TIMEOUT_SECONDS:-300}
+  DATAMIND_ASSISTANT_LLM_TIMEOUT_SECONDS: ${DATAMIND_ASSISTANT_LLM_TIMEOUT_SECONDS:-120}
+  DATAMIND_ASSISTANT_IMAGE_MAX_BYTES: ${DATAMIND_ASSISTANT_IMAGE_MAX_BYTES:-5242880}
+  DATAMIND_ASSISTANT_DATA_FILE_MAX_BYTES: ${DATAMIND_ASSISTANT_DATA_FILE_MAX_BYTES:-209715200}
+  DATAMIND_ASSISTANT_DATA_FILE_MAX_COUNT: ${DATAMIND_ASSISTANT_DATA_FILE_MAX_COUNT:-20}
+  DATAMIND_ASSISTANT_DATA_BATCH_MAX_BYTES: ${DATAMIND_ASSISTANT_DATA_BATCH_MAX_BYTES:-1073741824}
+  DATAMIND_ASSISTANT_RECYCLE_RETENTION_DAYS: ${DATAMIND_ASSISTANT_RECYCLE_RETENTION_DAYS:-30}
+  DATAMIND_ASSISTANT_RATE_LIMIT: ${DATAMIND_ASSISTANT_RATE_LIMIT:-30}
+  DATAMIND_OTEL_EXPORTER_OTLP_ENDPOINT: ${DATAMIND_OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  DATAMIND_SEMANTIC_EMBEDDING_ENABLED: ${DATAMIND_SEMANTIC_EMBEDDING_ENABLED:-true}
+  DATAMIND_SEMANTIC_EMBEDDING_REQUIRED: ${DATAMIND_SEMANTIC_EMBEDDING_REQUIRED:-true}
+  DATAMIND_SEMANTIC_EMBEDDING_MODEL_PATH: /opt/datamind/models/bge-small-zh-v1.5
+  DATAMIND_SEMANTIC_EMBEDDING_REVISION: 4e17e244a0fb63bfb78fca8fcf95079fcc664f5c
+  DATAMIND_SEMANTIC_EMBEDDING_LOCAL_FILES_ONLY: "true"
+  DATAMIND_SEMANTIC_EMBEDDING_DEVICE: cpu
+  DATAMIND_SEMANTIC_EMBEDDING_BATCH_SIZE: "32"
+  DATAMIND_AGENT_LOOP_ENABLED: ${DATAMIND_AGENT_LOOP_ENABLED:-true}
+  DATAMIND_AGENT_LOOP_DEFAULT_MODE: ${DATAMIND_AGENT_LOOP_DEFAULT_MODE:-loop}
+  DATAMIND_AGENT_LOOP_ALLOW_REQUEST_OVERRIDE: ${DATAMIND_AGENT_LOOP_ALLOW_REQUEST_OVERRIDE:-true}
+  DATAMIND_AGENT_LOOP_PROVIDER: ${DATAMIND_AGENT_LOOP_PROVIDER:-deepseek}
+  DATAMIND_AGENT_LOOP_MODEL: ${DATAMIND_AGENT_LOOP_MODEL:-deepseek-chat}
+  DATAMIND_AGENT_LOOP_MAX_TOOL_CALLS: ${DATAMIND_AGENT_LOOP_MAX_TOOL_CALLS:-12}
+  DATAMIND_AGENT_LOOP_MAX_DECISIONS: ${DATAMIND_AGENT_LOOP_MAX_DECISIONS:-16}
+  DATAMIND_AGENT_LOOP_MAX_TOOL_ATTEMPTS: ${DATAMIND_AGENT_LOOP_MAX_TOOL_ATTEMPTS:-3}
+  DATAMIND_AGENT_LOOP_TIMEOUT_SECONDS: ${DATAMIND_AGENT_LOOP_TIMEOUT_SECONDS:-300}
+  DATAMIND_AGENT_LOOP_MAX_TOKENS: ${DATAMIND_AGENT_LOOP_MAX_TOKENS:-50000}
+  DATAMIND_CLEANING_LOOP_ENABLED: ${DATAMIND_CLEANING_LOOP_ENABLED:-true}
+  DATAMIND_CLEANING_LOOP_MAX_DECISIONS: ${DATAMIND_CLEANING_LOOP_MAX_DECISIONS:-8}
+  DATAMIND_CLEANING_LOOP_MAX_TOOL_CALLS: ${DATAMIND_CLEANING_LOOP_MAX_TOOL_CALLS:-5}
+  DATAMIND_CLEANING_LOOP_MAX_STRATEGY_ATTEMPTS: ${DATAMIND_CLEANING_LOOP_MAX_STRATEGY_ATTEMPTS:-2}
+  DATAMIND_CLEANING_LOOP_TIMEOUT_SECONDS: ${DATAMIND_CLEANING_LOOP_TIMEOUT_SECONDS:-180}
+  DATAMIND_CLEANING_LOOP_MAX_TOKENS: ${DATAMIND_CLEANING_LOOP_MAX_TOKENS:-12000}
+  DATAMIND_REPORT_LOOP_ENABLED: ${DATAMIND_REPORT_LOOP_ENABLED:-true}
+  DATAMIND_REPORT_LOOP_MAX_DECISIONS: ${DATAMIND_REPORT_LOOP_MAX_DECISIONS:-6}
+  DATAMIND_REPORT_LOOP_MAX_REVISIONS: ${DATAMIND_REPORT_LOOP_MAX_REVISIONS:-2}
+  DATAMIND_REPORT_LOOP_TIMEOUT_SECONDS: ${DATAMIND_REPORT_LOOP_TIMEOUT_SECONDS:-60}
+  DATAMIND_REPORT_LOOP_MAX_TOKENS: ${DATAMIND_REPORT_LOOP_MAX_TOKENS:-8000}
+
+services:
+  gateway:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    environment:
+      DATAMIND_DOMAIN: ${DATAMIND_DOMAIN:-localhost}
+    ports:
+      - "${DATAMIND_HTTP_PORT:-80}:80"
+      - "${DATAMIND_HTTPS_PORT:-443}:443"
+      - "${DATAMIND_HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      frontend:
+        condition: service_healthy
+    networks:
+      - edge
+    security_opt:
+      - no-new-privileges:true
+
+  frontend:
+    image: ${DATAMIND_FRONTEND_IMAGE:-datamind-frontend}:${DATAMIND_IMAGE_TAG:-latest}
+    build:
+      context: ./frontend/react
+      dockerfile: Dockerfile
+      args:
+        VITE_DATAMIND_API_BASE_URL: /api/v1
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    expose:
+      - "80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - edge
+      - backend
+    security_opt:
+      - no-new-privileges:true
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: datamind
+      POSTGRES_USER: datamind
+      POSTGRES_PASSWORD: ${DATAMIND_POSTGRES_PASSWORD:?Set DATAMIND_POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datamind -d datamind"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${DATAMIND_REDIS_PASSWORD:?Set DATAMIND_REDIS_PASSWORD}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${DATAMIND_REDIS_PASSWORD:?Set DATAMIND_REDIS_PASSWORD}"]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+
+  migrate:
+    <<: *datamind-app
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment: *datamind-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
+  init-data:
+    <<: *datamind-app
+    user: "0:0"
+    restart: "no"
+    command: ["sh", "-c", "mkdir -p /data/datasets /data/assistant-attachments && chown -R 10001:10001 /data"]
+    volumes:
+      - datamind-data:/data
+
+  api:
+    <<: *datamind-app
+    init: true
+    restart: unless-stopped
+    environment: *datamind-environment
+    ports:
+      - "${DATAMIND_API_BIND_ADDRESS:-127.0.0.1}:${DATAMIND_API_PORT:-8010}:8000"
+    volumes:
+      - datamind-data:/data
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      init-data:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      python-runner:
+        condition: service_healthy
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 45s
+
+  worker:
+    <<: *datamind-app
+    init: true
+    restart: unless-stopped
+    command: ["celery", "-A", "app.task_queue:celery_app", "worker", "--loglevel=INFO", "--concurrency=${DATAMIND_WORKER_CONCURRENCY:-2}"]
+    environment: *datamind-environment
+    volumes:
+      - datamind-data:/data
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.task_queue:celery_app inspect ping -d celery@$$HOSTNAME --timeout=5 | grep -q pong"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 60s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      init-data:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      python-runner:
+        condition: service_healthy
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 90s
+
+  beat:
+    <<: *datamind-app
+    init: true
+    restart: unless-stopped
+    command: ["celery", "-A", "app.task_queue:celery_app", "beat", "--loglevel=INFO", "--pidfile=/tmp/celerybeat.pid", "--schedule=/tmp/celerybeat-schedule"]
+    environment: *datamind-environment
+    volumes:
+      - datamind-data:/data
+    tmpfs:
+      - /tmp
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      init-data:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+  python-runner:
+    image: ${DATAMIND_RUNNER_IMAGE:-datamind-python-runner}:${DATAMIND_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+      args:
+        PYPI_INDEX_URL: ${DATAMIND_PYPI_INDEX_URL:-https://pypi.org/simple}
+    init: true
+    restart: unless-stopped
+    environment:
+      DATAMIND_ENVIRONMENT: runner
+      DATAMIND_PYTHON_RUNNER_SHARED_SECRET: ${DATAMIND_PYTHON_RUNNER_SHARED_SECRET:?Set DATAMIND_PYTHON_RUNNER_SHARED_SECRET}
+      DATAMIND_PYTHON_SANDBOX_IMAGE: ${DATAMIND_SANDBOX_IMAGE:-datamind-python-sandbox:latest}
+      DATAMIND_PYTHON_RUNNER_TEMP_PATH: /var/lib/datamind-runner
+      DATAMIND_PYTHON_RUNNER_VOLUME_NAME: ${DATAMIND_RUNNER_VOLUME_NAME:-datamind-runner-temp}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-temp:/var/lib/datamind-runner
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      python-sandbox:
+        condition: service_completed_successfully
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+  python-sandbox:
+    image: ${DATAMIND_SANDBOX_IMAGE:-datamind-python-sandbox:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+      args:
+        PYPI_INDEX_URL: ${DATAMIND_PYPI_INDEX_URL:-https://pypi.org/simple}
+    restart: "no"
+    entrypoint: ["/bin/true"]
+    network_mode: none
+
+volumes:
+  postgres-data:
+  redis-data:
+  datamind-data:
+  runner-temp:
+    name: ${DATAMIND_RUNNER_VOLUME_NAME:-datamind-runner-temp}
+  caddy-data:
+  caddy-config:
+
+networks:
+  edge:
+  backend:

@@ -1,0 +1,58 @@
+{
+  "suite_id": "provider",
+  "version": "1.0.0",
+  "description": "Real DeepSeek and Kimi canary; quality gates remain observational during calibration.",
+  "mode": "provider",
+  "corpus_checksum": "auto",
+  "max_total_tokens": 500000,
+  "max_duration_seconds": 3600,
+  "cases": [
+    {
+      "case_id": "deepseek-structured-answer",
+      "name": "DeepSeek structured analysis response",
+      "subsystem": "provider",
+      "operation": "provider.complete",
+      "input": {
+        "provider": "deepseek",
+        "model": "deepseek-chat",
+        "max_tokens": 200,
+        "messages": [
+          {"role": "system", "content": "Return a concise JSON object with status and answer. Do not use markdown."},
+          {"role": "user", "content": "Dataset aggregate: revenue=300, orders=3. Return status=ok and the revenue."}
+        ]
+      },
+      "validators": [
+        {"type": "truthy", "path": "non_empty"},
+        {"type": "contains", "path": "content", "expected": "300"}
+      ],
+      "requires_provider": true,
+      "timeout_seconds": 120
+    },
+    {
+      "case_id": "kimi-evidence-answer",
+      "name": "Kimi evidence-grounded response",
+      "subsystem": "provider",
+      "operation": "provider.complete",
+      "input": {
+        "provider": "kimi",
+        "model": "kimi-k2.6",
+        "max_tokens": 200,
+        "messages": [
+          {"role": "system", "content": "Answer only from the supplied evidence and mention evidence_id."},
+          {"role": "user", "content": "Evidence ev_1: total revenue is 300. What is total revenue?"}
+        ]
+      },
+      "validators": [
+        {"type": "contains", "path": "content", "expected": "300"},
+        {"type": "contains", "path": "content", "expected": "ev_1"}
+      ],
+      "requires_provider": true,
+      "timeout_seconds": 180
+    }
+  ],
+  "thresholds": [
+    {"metric": "total_tokens", "direction": "maximum", "value": 500000, "hard_gate": true},
+    {"metric": "task_success_rate", "direction": "minimum", "value": 0.85, "hard_gate": false},
+    {"metric": "p95_latency_ms", "direction": "maximum", "value": 300000, "hard_gate": false}
+  ]
+}
