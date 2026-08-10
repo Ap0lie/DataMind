@@ -48,18 +48,9 @@ Python Runner、受控工具和模型服务，并通过 Redis/Celery 交换任�
 
 ## 端到端流程
 
-```mermaid
-flowchart LR
-    Import["导入文件"] --> Clean["清洗 Loop 与质量门禁"]
-    Clean --> Profile["画像、漂移与语义模型"]
-    Profile --> Plan["Planner 与分析契约"]
-    Plan --> Execute["SQL 与 Python 工具 Loop"]
-    Execute --> Validate["数据粒度与统计验证"]
-    Validate -->|"需要修复"| Plan
-    Validate --> Review["对抗审查"]
-    Review --> Report["证据化报告 Loop"]
-    Report --> Assistant["Kimi 检索与后续操作"]
-```
+[![DataMind 端到端流程](docs/assets/datamind-workflow-zh.png)](docs/assets/datamind-workflow-zh.svg)
+
+<p align="center"><sub>可信数据准备 → 有边界的自主分析与验证 → 证据化交付与后续行动。点击图片可打开矢量版本。</sub></p>
 
 所有 Loop 都受工具次数、决策次数、Token、重试和总时限约束。LLM 生成的
 Python 代码执行失败后，错误会被反馈给模型，最多进行两次修复；无法获得可信结果时，
@@ -245,7 +236,7 @@ tests/                Unit、Workflow、Integration、Sandbox 与 Benchmark
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 
-安装前端依赖后，系统边界发生变化时可同时重新生成中英文 SVG 与 PNG 架构图：
+安装前端依赖后，系统边界发生变化时可同时重新生成中英文 SVG 与 PNG 架构图和流程图：
 
 ```bash
 node scripts/render_readme_architecture.mjs

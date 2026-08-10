@@ -7,6 +7,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDir = resolve(root, "docs", "assets");
 const width = 1400;
 const height = 795;
+const workflowHeight = 685;
 
 const locales = {
   en: {
@@ -96,6 +97,67 @@ const locales = {
   },
 };
 
+const workflowLocales = {
+  en: {
+    output: "datamind-workflow-en.svg",
+    title: "DataMind end-to-end workflow",
+    description:
+      "Data preparation, bounded autonomous analysis, verification, reporting, and Kimi follow-up.",
+    layers: [
+      "1 · Prepare trusted data",
+      "2 · Analyze with bounded loops",
+      "3 · Deliver evidence-backed answers",
+    ],
+    preparation: [
+      ["Import files", "Batch · Drag and drop", "Disk-backed staging", "experience"],
+      ["Cleaning Loop", "Rules · LLM · Hybrid", "Repair · Quality gate", "loop"],
+      ["Validated versions", "Diff · Activate · Rollback", "No unsafe overwrite", "verify"],
+      ["Profile & semantics", "Drift · Roles · Metrics", "Relationship graph", "control"],
+    ],
+    analysis: [
+      ["Planner", "Question · Scope · Grain", "Analysis contract", "loop"],
+      ["Tool Loop", "Safe SQL · Python", "Evidence artifacts", "loop"],
+      ["Verifier", "Join grain · Statistics", "Numeric evidence", "verify"],
+      ["Reviewer", "Adversarial checks", "Replan on failure", "verify"],
+      ["Report Loop", "Draft · Repair · Verify", "Idempotent commit", "report"],
+    ],
+    delivery: [
+      ["Report artifact", "Charts · Lineage · Versions", "HTML · Markdown · PDF", "report"],
+      ["Kimi assistant", "Retrieve cited evidence", "Ask · Execute · Attach", "experience"],
+      ["Next action", "Follow-up · Reanalyze", "Audited and recoverable", "control"],
+    ],
+    labels: [
+      "bounded repair / replan",
+      "Durable jobs · checkpoints · ordered SSE events",
+    ],
+  },
+  zh: {
+    output: "datamind-workflow-zh.svg",
+    title: "DataMind 端到端流程",
+    description: "从数据准备到自主分析、验证、报告和 Kimi 后续操作的完整流程。",
+    layers: ["1 · 准备可信数据", "2 · 有边界的自主分析", "3 · 交付证据化答案"],
+    preparation: [
+      ["导入文件", "批量 · 拖拽上传", "大文件落盘暂存", "experience"],
+      ["清洗 Loop", "规则 · LLM · Hybrid", "修复 · 质量门禁", "loop"],
+      ["可信清洗版本", "Diff · 激活 · 回滚", "失败不覆盖当前版本", "verify"],
+      ["画像与语义", "漂移 · 角色 · 指标", "实体关系图", "control"],
+    ],
+    analysis: [
+      ["Planner", "问题 · 范围 · 粒度", "分析契约", "loop"],
+      ["工具 Loop", "安全 SQL · Python", "证据 Artifact", "loop"],
+      ["验证器", "Join 粒度 · 统计", "数值证据", "verify"],
+      ["Reviewer", "对抗审查", "失败触发重规划", "verify"],
+      ["报告 Loop", "草稿 · 修复 · 验证", "幂等提交", "report"],
+    ],
+    delivery: [
+      ["报告资产", "图表 · 血缘 · 版本", "HTML · Markdown · PDF", "report"],
+      ["Kimi 助手", "检索已引用证据", "问答 · 执行 · 附件", "experience"],
+      ["后续行动", "追问 · 重新分析", "可审计 · 可恢复", "control"],
+    ],
+    labels: ["有边界的修复 / 重规划", "持久任务 · Checkpoint · 有序 SSE 事件"],
+  },
+};
+
 const tones = {
   experience: ["#ecfdf5", "#10b981", "#064e3b"],
   control: ["#eff6ff", "#60a5fa", "#1e3a8a"],
@@ -150,25 +212,11 @@ function label(text, x, y) {
   return `<text x="${x}" y="${y}" text-anchor="middle" class="flow-label">${escapeXml(text)}</text>`;
 }
 
-function render(locale) {
-  const experienceX = [63, 388, 713, 1038];
-  const controlX = [...experienceX];
-  const agentX = Array.from({ length: 7 }, (_, index) => 22 + index * 196);
-  const agentTones = ["loop", "loop", "loop", "verify", "verify", "report", "loop"];
-  const infrastructureTones = [
-    "infrastructure",
-    "infrastructure",
-    "runner",
-    "infrastructure",
-    "infrastructure",
-    "infrastructure",
-    "infrastructure",
-  ];
-
-  const parts = [`<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="title desc">
-  <title id="title">DataMind architecture</title>
-  <desc id="desc">DataMind product, API, data-agent workflow, and infrastructure architecture.</desc>
+function svgStart({ svgHeight, title, description }) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${svgHeight}" viewBox="0 0 ${width} ${svgHeight}" role="img" aria-labelledby="title desc">
+  <title id="title">${escapeXml(title)}</title>
+  <desc id="desc">${escapeXml(description)}</desc>
   <defs>
     <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse" markerUnits="strokeWidth">
       <path d="M0,0 L8,4 L0,8 Z" fill="#64748b"/>
@@ -185,7 +233,32 @@ function render(locale) {
       .service-bus { font-size: 14px; font-weight: 700; fill: #334155; }
     </style>
   </defs>
-  <rect width="${width}" height="${height}" fill="#ffffff"/>`];
+  <rect width="${width}" height="${svgHeight}" fill="#ffffff"/>`;
+}
+
+function render(locale) {
+  const experienceX = [63, 388, 713, 1038];
+  const controlX = [...experienceX];
+  const agentX = Array.from({ length: 7 }, (_, index) => 22 + index * 196);
+  const agentTones = ["loop", "loop", "loop", "verify", "verify", "report", "loop"];
+  const infrastructureTones = [
+    "infrastructure",
+    "infrastructure",
+    "runner",
+    "infrastructure",
+    "infrastructure",
+    "infrastructure",
+    "infrastructure",
+  ];
+
+  const parts = [
+    svgStart({
+      svgHeight: height,
+      title: "DataMind architecture",
+      description:
+        "DataMind product, API, data-agent workflow, and infrastructure architecture.",
+    }),
+  ];
 
   parts.push(band(locale.layers[0], 16, 150, "#f8fffc"));
   parts.push(band(locale.layers[1], 181, 140, "#f8fbff"));
@@ -279,12 +352,121 @@ function render(locale) {
   return parts.join("\n");
 }
 
+function renderWorkflow(locale) {
+  const preparationX = [63, 388, 713, 1038];
+  const analysisX = [40, 310, 580, 850, 1120];
+  const deliveryX = [200, 550, 900];
+  const parts = [
+    svgStart({
+      svgHeight: workflowHeight,
+      title: locale.title,
+      description: locale.description,
+    }),
+  ];
+
+  parts.push(band(locale.layers[0], 16, 180, "#f8fffc"));
+  parts.push(band(locale.layers[1], 211, 260, "#fbfdfc"));
+  parts.push(band(locale.layers[2], 486, 183, "#fafbff"));
+
+  locale.preparation.forEach(([title, ...rest], index) => {
+    const tone = rest.pop();
+    parts.push(
+      card({
+        x: preparationX[index],
+        y: 66,
+        w: 290,
+        h: 105,
+        title,
+        details: rest,
+        tone,
+        titleSize: 19,
+      }),
+    );
+  });
+
+  locale.analysis.forEach(([title, ...rest], index) => {
+    const tone = rest.pop();
+    parts.push(
+      card({
+        x: analysisX[index],
+        y: 261,
+        w: 240,
+        h: 130,
+        title,
+        details: rest,
+        tone,
+        titleSize: 18,
+      }),
+    );
+  });
+
+  locale.delivery.forEach(([title, ...rest], index) => {
+    const tone = rest.pop();
+    parts.push(
+      card({
+        x: deliveryX[index],
+        y: 536,
+        w: 300,
+        h: 110,
+        title,
+        details: rest,
+        tone,
+        titleSize: 19,
+      }),
+    );
+  });
+
+  for (let index = 0; index < preparationX.length - 1; index += 1) {
+    parts.push(arrow(preparationX[index] + 290, 118, preparationX[index + 1], 118));
+  }
+  parts.push(
+    `<path d="M 1183 171 V 203 H 160 V 261" class="arrow" marker-end="url(#arrow)"/>`,
+  );
+
+  for (let index = 0; index < analysisX.length - 1; index += 1) {
+    parts.push(arrow(analysisX[index] + 240, 326, analysisX[index + 1], 326));
+  }
+  parts.push(
+    `<path d="M 1240 391 C 1240 425, 160 425, 160 391" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>`,
+  );
+  parts.push(label(locale.labels[0], 700, 418));
+  parts.push(
+    `<rect x="230" y="439" width="940" height="24" rx="8" fill="#eef2f7" stroke="#94a3b8"/>`,
+  );
+  parts.push(
+    `<text x="700" y="456" text-anchor="middle" class="service-bus">${escapeXml(locale.labels[1])}</text>`,
+  );
+  parts.push(
+    `<path d="M 1360 326 H 1372 V 479 H 350 V 536" class="arrow" marker-end="url(#arrow)"/>`,
+  );
+
+  for (let index = 0; index < deliveryX.length - 1; index += 1) {
+    parts.push(arrow(deliveryX[index] + 300, 591, deliveryX[index + 1], 591));
+  }
+
+  parts.push(`</svg>`);
+  return parts.join("\n");
+}
+
 mkdirSync(outputDir, { recursive: true });
 const generated = [];
-for (const locale of Object.values(locales)) {
+for (const [language, locale] of Object.entries(locales)) {
   const svgPath = resolve(outputDir, locale.output);
   writeFileSync(svgPath, render(locale), "utf8");
-  generated.push({ svgPath, pngPath: svgPath.replace(/\.svg$/, ".png") });
+  generated.push({
+    svgPath,
+    pngPath: svgPath.replace(/\.svg$/, ".png"),
+    svgHeight: height,
+  });
+
+  const workflowLocale = workflowLocales[language];
+  const workflowSvgPath = resolve(outputDir, workflowLocale.output);
+  writeFileSync(workflowSvgPath, renderWorkflow(workflowLocale), "utf8");
+  generated.push({
+    svgPath: workflowSvgPath,
+    pngPath: workflowSvgPath.replace(/\.svg$/, ".png"),
+    svgHeight: workflowHeight,
+  });
 }
 
 const requireFromFrontend = createRequire(resolve(root, "frontend", "react", "package.json"));
@@ -292,7 +474,8 @@ const { chromium } = requireFromFrontend("@playwright/test");
 const browser = await chromium.launch();
 try {
   const page = await browser.newPage({ viewport: { width, height } });
-  for (const { svgPath, pngPath } of generated) {
+  for (const { svgPath, pngPath, svgHeight } of generated) {
+    await page.setViewportSize({ width, height: svgHeight });
     await page.goto(pathToFileURL(svgPath).href);
     await page.screenshot({ path: pngPath });
   }

@@ -52,18 +52,9 @@ arrows show workflow control; the dashed path shows bounded repair or replanning
 
 ## End-to-End Workflow
 
-```mermaid
-flowchart LR
-    Import["Import files"] --> Clean["Cleaning loop and quality gates"]
-    Clean --> Profile["Profile, drift and semantic model"]
-    Profile --> Plan["Planner and analysis contract"]
-    Plan --> Execute["SQL and Python tool loop"]
-    Execute --> Validate["Grain and statistical verification"]
-    Validate -->|"repair required"| Plan
-    Validate --> Review["Adversarial review"]
-    Review --> Report["Evidence-backed report loop"]
-    Report --> Assistant["Kimi retrieval and follow-up actions"]
-```
+[![DataMind end-to-end workflow](docs/assets/datamind-workflow-en.png)](docs/assets/datamind-workflow-en.svg)
+
+<p align="center"><sub>Trusted data preparation → bounded analysis and verification → evidence-backed delivery and follow-up. Select the image to open the vector version.</sub></p>
 
 The loops are bounded by tool, decision, token, retry, and wall-clock budgets.
 Failed generated Python code is returned to the model for at most two repairs;
@@ -267,7 +258,7 @@ tests/                Unit, workflow, integration, sandbox and benchmark tests
 - [Security Policy](SECURITY.md)
 
 After installing the frontend dependencies, regenerate the localized SVG and PNG
-architecture images whenever system boundaries change:
+architecture and workflow images whenever system boundaries change:
 
 ```bash
 node scripts/render_readme_architecture.mjs
