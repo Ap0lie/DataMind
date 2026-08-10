@@ -58,3 +58,17 @@ tests/
 
 Unit tests should use in-memory or local adapters. External systems belong in
 explicit integration tests.
+
+## README Diagrams
+
+The localized architecture and end-to-end workflow diagrams are generated from
+`scripts/render_readme_architecture.mjs`. After installing the frontend
+dependencies, regenerate both SVG and PNG assets whenever system boundaries or
+workflow stages change:
+
+```bash
+node scripts/render_readme_architecture.mjs
+```
+
+Commit the generated files in `docs/assets/` together with the source change and
+inspect both language variants before opening a pull request.

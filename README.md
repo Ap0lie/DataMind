@@ -257,13 +257,6 @@ tests/                Unit, workflow, integration, sandbox and benchmark tests
 - [Contributing](CONTRIBUTING.md)
 - [Security Policy](SECURITY.md)
 
-After installing the frontend dependencies, regenerate the localized SVG and PNG
-architecture and workflow images whenever system boundaries change:
-
-```bash
-node scripts/render_readme_architecture.mjs
-```
-
 ## License
 
 DataMind is currently proprietary and all rights are reserved. See [LICENSE](LICENSE).

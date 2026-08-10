@@ -236,12 +236,6 @@ tests/                Unit、Workflow、Integration、Sandbox 与 Benchmark
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 
-安装前端依赖后，系统边界发生变化时可同时重新生成中英文 SVG 与 PNG 架构图和流程图：
-
-```bash
-node scripts/render_readme_architecture.mjs
-```
-
 ## 许可证
 
 DataMind 当前为专有项目并保留所有权利，详情参见 [LICENSE](LICENSE)。
