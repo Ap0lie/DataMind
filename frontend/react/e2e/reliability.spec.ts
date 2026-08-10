@@ -170,7 +170,7 @@ test("login, workflow navigation, and logout remain operational", async ({ page 
   if (testInfo.project.name.includes("mobile")) {
     await page.getByTitle("打开消息记录").click();
     await expect(page.locator(".assistant-history.open")).toBeVisible();
-    await page.getByRole("button", { name: "关闭消息记录" }).click();
+    await page.locator(".assistant-history").getByRole("button", { name: "关闭", exact: true }).click();
     await expect(page.locator(".assistant-history.open")).toHaveCount(0);
     await page.getByRole("button", { name: /打开 Kimi 工作台/ }).click();
     await expect(page.locator(".assistant-history.open")).toHaveCount(0);
@@ -430,10 +430,6 @@ test("Kimi initialization disables manual creation and produces one active conve
   });
 
   await page.goto("/");
-  await page.getByLabel("用户名").fill(`qa_assistant_initializing_${testInfo.project.name.replace(/\W/g, "_")}_${Date.now()}`);
-  await page.getByLabel("密码").fill("qa-reliability-password");
-  await page.getByRole("button", { name: /Log in|登录/ }).click();
-  await expect(page.getByRole("heading", { name: "工作区" })).toBeVisible();
   await page.route("**/api/v1/assistant/conversations", async (route) => {
     if (route.request().method() === "GET" && initialConversationRead) {
       initialConversationRead = false;
@@ -443,6 +439,10 @@ test("Kimi initialization disables manual creation and produces one active conve
     }
     await route.fallback();
   });
+  await page.getByLabel("用户名").fill(`qa_assistant_initializing_${testInfo.project.name.replace(/\W/g, "_")}_${Date.now()}`);
+  await page.getByLabel("密码").fill("qa-reliability-password");
+  await page.getByRole("button", { name: /Log in|登录/ }).click();
+  await expect(page.getByRole("heading", { name: "工作区" })).toBeVisible();
 
   await page.getByRole("button", { name: "Kimi" }).click();
   const newConversation = page.getByRole("button", { name: "新建对话" });
