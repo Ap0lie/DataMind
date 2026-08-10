@@ -4,7 +4,7 @@
 
 **AI Data Analysis Copilot based on FastAPI, LangGraph, React and provider-routed LLM agents**
 
-Version: v1.2 implementation-aligned (2026-07-15)
+Version: v1.3 implementation-aligned (2026-07-30)
 
 ---
 
@@ -89,6 +89,7 @@ Ask analysis question
   │
   ▼
 Planner + semantic decision
+  └─ freeze AnalysisContract: scope, metric, grain, method, assumptions and budgets
   │
   ▼
 Autonomous analysis Loop (default)
@@ -99,7 +100,18 @@ Autonomous analysis Loop (default)
   └─ deterministic fallback when budgets or providers fail
   │
   ▼
-Adversarial review + chart formatting
+Chart formatting
+  │
+  ▼
+Deterministic statistical verification
+  ├─ numeric evidence coverage
+  ├─ comparison sample size / effect size / confidence interval
+  ├─ observational causal-language guard
+  └─ Join grain and row-expansion validation
+  │
+  ▼
+Adversarial review
+  └─ failed verification may return once to the analysis Loop
   │
   ▼
 Report Loop
@@ -115,6 +127,8 @@ Structured report page
   ├─ Charts
   ├─ SQL Results
   ├─ Validation Issues
+  ├─ Analysis Contract and Statistical Verification
+  ├─ Field / metric / finding / chart / report lineage
   ├─ Analysis Trace
   └─ HTML / Markdown / browser-print PDF export
 
@@ -228,6 +242,14 @@ After upload/import, DataMind generates:
 - Categorical/text fields.
 - Field type summary.
 - Basic descriptive statistics.
+
+Data reliability monitoring:
+
+- Every active raw/cleaned version has a bounded, privacy-safe profile snapshot with Schema fingerprint, row count, inferred types, missing rate, unique rate, numeric distribution summary, and hashed value signatures.
+- New data is compared with the previous snapshot for added/removed/renamed fields, type changes, row-count changes, missing/unique-rate drift, and numeric distribution shifts.
+- Dataset-group relationship keys are revalidated against current fields and bounded sample match rates. Material drops mark the relationship stale instead of silently continuing to Join.
+- Schema-breaking drift marks affected published semantic models and reports stale while preserving their immutable historical content and execution-time references.
+- The dataset-group workbench shows current reliability status, stale relationships, detected changes, and suggested cleaning/relationship/analysis actions. Suggested mutations require the existing user/Kimi authorization path; monitoring never silently rewrites data.
 
 Example:
 
@@ -436,12 +458,15 @@ Implemented behavior:
 - Join execution resolves original fields through every chain level, prefixes all attached-table columns, and still exposes one internal DuckDB table named `dataset` to SQL and Python.
 - A join estimated above 10x row expansion or 1,000,000 output rows is skipped before materialization; moderate expansion is executed with an explicit aggregation-duplication warning.
 - Relationship plans are validated before persistence or async job creation for real columns, one root, one parent per table, reachability, duplicate edges, and cycles.
+- Persisted relationships retain baseline/current match rates, drift amount, validation timestamp, freshness state, and the triggering drift event.
+- Published semantic execution uses an entity relationship graph and selects only the shortest declared path needed by the chosen metric and dimensions.
+- The Planner distinguishes fact-table analysis grain from metric-source entities. Many-to-one and one-to-one traversals are direct; one-to-many requires an explicit deduplication rule; unsupported pre-aggregation, semi-join, unknown-cardinality, and many-to-many paths are blocked before SQL execution.
 
 Limitations:
 
 - Relationship modeling and published semantic models provide a governed semantic-layer v1, not organization-wide semantic governance.
 - Arbitrary user-authored multi-table SQL is intentionally not exposed; multi-table SQL must come from a validated published semantic model and metric DSL.
-- Cross-dataset lineage graph is still future work.
+- Organization-wide lineage governance and interactive impact exploration remain future work; execution-scoped cross-dataset lineage is implemented.
 
 ## 6.14 Semantic Models, Metric Ontology, And Embeddings
 
@@ -451,6 +476,8 @@ Implemented semantic model lifecycle:
 - Entities with fact/dimension roles, stable entity IDs, stable field IDs, source bindings, grain, dimensions, time dimensions, metrics, relationships, cardinality, join risk, and deduplication requirements.
 - Published models are immutable; changes create the next draft version.
 - Jobs, planner decisions, generated reports, metric formulas, field provenance, join paths, and semantic model versions remain pinned to the execution-time version.
+- Planner decisions include the selected entity graph, fact grain, metric-source entities, Join strategies, safety verdict, and warnings.
+- Analysis responses and report metadata persist a lineage graph from source fields and semantic metrics through findings/charts to the report artifact.
 - The dataset-group workbench provides a visual editor for entity roles/grain, dimensions, metrics, aliases, source-field bindings, relationships, cardinality, and enabled state, plus a relationship/lineage view. Advanced JSON DSL editing remains available for expressions not yet covered by the visual controls.
 
 Metric DSL requirements:
@@ -527,9 +554,10 @@ START
        │                                      └─ exhausted/provider failure -> loop_fallback
        └─ finish -> loop_finalize
   -> integrate_insights
+  -> format_charts
+  -> statistical_verify
   -> adversarial_validate
        └─ one optional evidence repair -> loop_adversarial_repair -> loop_decide
-  -> format_charts
   -> report_decide
   -> report_execute
   -> report_verify
@@ -548,6 +576,9 @@ Current behavior:
 - Successful actions and report commits are idempotent across retries and checkpoint recovery. Ordered events expose decisions, tool execution, verification, repair, fallback, report validation, and commit without storing hidden reasoning or unbounded raw rows.
 - SQL remains guarded by deterministic safety validation. Generated Python remains sandboxed, output-bounded, compacted, and eligible for up to two LLM repairs before deterministic fallback.
 - Report findings with numeric claims must reference valid evidence IDs. The report Loop may revise twice and request one additional analysis pass before committing or falling back.
+- Planner execution freezes a versioned `AnalysisContract` with data scope, population, metric, dimensions, time field, analysis grain, method, assumptions, acceptance criteria, stop conditions, causal policy, and server-owned budgets.
+- `statistical_verify` deterministically checks every finding before report generation. Numeric evidence coverage must be 100%; comparison claims carry sample size and an effect size or 95% confidence interval; unsafe Join expansion without source-grain evidence and unqualified causal language fail validation.
+- High-severity statistical failures reuse the existing one-pass adversarial evidence-repair route. Findings that still fail after bounded repair are excluded from the final report and remain visible as validation issues.
 - `agent_mode=legacy` preserves the fixed planner -> SQL/Python -> iterative rounds -> review -> report graph for historical compatibility and operational diagnosis.
 
 Related autonomous cleaning graph:
@@ -605,6 +636,8 @@ Remaining gaps:
 - Separate API, Celery Worker, Beat, PostgreSQL, password-protected Redis, Python Runner, and one-shot sandbox image, plus explicit data-volume initialization and Alembic migration jobs.
 - Persistent PostgreSQL, Redis, application data, Assistant attachment, Runner temp, and Caddy certificate volumes; backend services remain on an internal network and only the gateway is publicly exposed.
 - Non-root application images, read-only frontend filesystem, service health checks, restart policies, graceful Worker shutdown, and dynamic Docker DNS resolution for rolling API replacement.
+- Production startup requires an authenticated Python Runner. Each generated-code container has a controller-enforced wall timeout and is killed and removed in `finally`; production cannot fall back to a host subprocess.
+- `/health/ready` verifies PostgreSQL, Redis, a live Celery Worker, Python Runner, MCP Registry, required semantic embedding, and Assistant configuration. Failed critical checks return HTTP 503, and Compose gates the frontend on this strict readiness endpoint.
 - Optional OpenTelemetry OTLP export.
 - Production Compose enables autonomous cleaning, analysis, and report Loops by default while local compatibility modes remain configurable.
 - `.github/workflows/production-smoke.yml` provisions the real PostgreSQL/Redis/Celery/Python Runner stack and verifies Cookie login, asynchronous cleaning, autonomous analysis, persisted report generation, and result retrieval.
@@ -709,12 +742,17 @@ Remaining gaps:
 - Persistent user-scoped conversation history with create, rename, soft-delete, and cross-page run recovery.
 - Automatic evidence retrieval across the user's completed reports and analysis jobs, with optional dataset, dataset-group, or report scope pinning.
 - JPEG/PNG/WebP upload with authenticated storage and native Kimi visual context.
-- CSV/XLSX/JSON/TXT chat attachments support preview-first multi-file import, one-file-at-a-time parsing, automatic cleaning, dataset-group creation, relationship inference, and explicit management authorization.
+- CSV/XLSX/JSON/TXT chat attachments support preview-first multi-file import, disk-backed upload staging, bounded batch parsing, read-only per-Sheet XLSX scanning, automatic cleaning, dataset-group creation, relationship inference, and explicit management authorization.
 - Ask mode is read-only. Execute mode exposes cleaning, relationship, analysis, report, semantic draft/publication, recycle, and restore tools only when conversation scope and a long-lived asset Grant both allow the operation.
 - `AssistantPermissionService` performs authorization independently from `NodeExecutionHarness`; the model cannot supply a user ID, Grant ID, or expanded scope.
 - Every mutation uses a canonical action hash, idempotency key, before/after state, and user-scoped audit record. Reversible actions can be undone from the Kimi workbench.
 - Dataset-group Grants inherit to member datasets and future reports/tasks/semantic versions; revocation applies on the next tool call.
-- Report-scoped Grants can run analysis only against that report's source dataset, enabling Kimi to create improved report versions without widening access to unrelated assets.
+- Grants are constrained by a server-side asset capability matrix. Report-scoped Grants can manage/recycle the report and run analysis only against its source dataset; they cannot clean, edit fields, manage relationships/semantic models, or recycle the source dataset even if an older stored Grant contains those capabilities.
+- Assistant Celery Runs use atomic database claims, expiring leases, independent heartbeats, periodic recovery, and checkpoint-safe idempotency. Event sequence allocation is an atomic counter rather than concurrent `MAX(sequence)+1`.
+- Final Kimi answers use the provider's native SSE stream; visible `message.delta` events are emitted as answer tokens arrive rather than splitting an already completed response.
+- Ask-mode questions already covered by validated report evidence use a deterministic fast path that skips the redundant non-streaming tool-routing model call. Execute mode and requests involving status, schema, cleaning, relationships, semantics, or report mutation always retain the full permissioned tool route.
+- Assistant completion telemetry records queue wait, retrieval, tool routing, provider first-token, first-answer, total latency, fast-path usage, and combined token usage. The privacy-safe Benchmark history summary aggregates only these metrics and never reads prompts, message bodies, dataset rows, or report content.
+- Assistant Repository schema initialization is process-scoped in local SQLite mode. Production PostgreSQL performs a lightweight migrated-schema check and leaves all DDL to Alembic.
 - Report revisions are presentation-only operations: they reuse the source report's frozen SQL rows, Python statistics, chart records, and evidence fingerprint instead of rerunning the analysis Workflow. Concise or visual revisions may select fewer findings/charts and change chart presentation metadata, but cannot change analytical values.
 - Each Assistant message has at most one primary report deliverable. Historical or supporting reports remain clickable evidence, while the report created by the latest audited action is rendered as the single complete-report card.
 - Chat images are loaded through the authenticated API client rather than direct browser URLs, so both secure Cookie sessions and local legacy user headers can display protected attachments.
@@ -758,6 +796,8 @@ Dataset store extensions:
 - `POST /api/v1/store/dataset-groups/{group_id}/relationship-suggestions`
 - `PATCH /api/v1/store/dataset-groups/{group_id}/relationships`
 - `POST /api/v1/store/dataset-groups/{group_id}/relationships/auto-configure`
+- `GET /api/v1/store/dataset-groups/{group_id}/drift`
+- `POST /api/v1/store/dataset-groups/{group_id}/drift/scan`
 - `DELETE /api/v1/store/dataset-groups/{group_id}?delete_datasets=`
 - `POST /api/v1/store/datasets/{dataset_id}/cleaning-runs` with optional `use_llm`
 - `GET /api/v1/store/datasets/{dataset_id}/cleaning-runs`
@@ -768,6 +808,9 @@ Dataset store extensions:
 - `GET /api/v1/store/datasets/{dataset_id}/columns`
 - `POST /api/v1/store/datasets/{dataset_id}/columns`
 - `PATCH /api/v1/store/datasets/{dataset_id}/columns/{column_name}`
+- `GET /api/v1/store/datasets/{dataset_id}/drift`
+- `POST /api/v1/store/datasets/{dataset_id}/drift/scan`
+- `GET /api/v1/store/datasets/{dataset_id}/drift/history`
 
 Autonomous cleaning job extensions:
 
@@ -871,12 +914,14 @@ app/
       deps.py
   analysis/
     agent_loop.py
+    analysis_contract.py
     checkpoints.py
     cleaning_jobs.py
     cleaning_sandbox.py
     cleaning_workflow.py
     dataset_groups.py
     jobs.py
+    lineage.py
     multidataset.py
     prompt_override_router.py
     prompt_utils.py
@@ -884,6 +929,7 @@ app/
     workflow.py
     workflow_prompt_context.py
     services.py
+    statistical_verifier.py
     model_router.py
     python_sandbox.py
     text_analysis.py
@@ -901,12 +947,16 @@ app/
     embedding.py
     ranking.py
     service.py
+    relationship_graph.py
     download_model.py
+  data_reliability/
+    drift.py
   schemas/
     analysis.py
     assistant.py
     auth.py
     dataset_store.py
+    data_reliability.py
     prompt_overrides.py
     semantic.py
   services/
@@ -949,6 +999,10 @@ frontend/
           types.ts
         datasets/
           CleaningWorkspace.tsx
+        data-reliability/
+          DriftMonitorPanel.tsx
+        analysis/
+          AnalysisReliabilityPanel.tsx
         reports/
           chart-export.ts
           report-templates.ts
@@ -972,6 +1026,8 @@ migrations/
     0006_ai_assistant.py
     0007_kimi_capabilities.py
     0008_agent_prompt_overrides.py
+    0009_p1_security_reliability.py
+    0010_data_reliability_graph.py
 ```
 
 ---
@@ -992,6 +1048,7 @@ migrations/
 - `semantic_models`, `planner_decisions`, `planner_feedback`, and `planner_calibrators` are introduced by migration `0002_semantic_layer`.
 - `semantic_embedding_cache` is introduced by `0003_semantic_embedding_cache` and is included in SQLite-to-PostgreSQL migration.
 - `analysis_jobs` stores `planner_decision_id`, `semantic_model_id`, and `semantic_model_version` without changing existing UUIDs.
+- `data_snapshots` and `data_drift_events` are introduced by `0010_data_reliability_graph` and included in SQLite-to-PostgreSQL migration.
 - `python -m app.semantic.download_model` downloads the configured fixed revision outside request handling; `--verify-only` validates an existing local model.
 - Production API and Worker share the model image layer; the Python sandbox image does not contain the embedding model.
 - Readiness reports `semantic_embedding=ready|disabled|fallback|failed` and fails when embedding is configured as required but is unavailable.
@@ -1034,7 +1091,7 @@ Assistant configuration:
 
 ### Bounded Loop Engineering (implemented, default)
 
-The stable planner, insight integration, chart formatting, adversarial review and report nodes remain in place. The default LangGraph path replaces the fixed SQL/Python/iterative execution segment with `loop_bootstrap → loop_decide → loop_execute → loop_observe → loop_verify → loop_repair|loop_fallback → loop_finalize`. Adversarial validation may return to the Loop once for a final evidence repair. The legacy path remains available only as an explicit compatibility mode.
+The stable planner, insight integration, chart formatting, deterministic statistical verification, adversarial review and report nodes remain in place. The default LangGraph path replaces the fixed SQL/Python/iterative execution segment with `loop_bootstrap → loop_decide → loop_execute → loop_observe → loop_verify → loop_repair|loop_fallback → loop_finalize`. Statistical or adversarial validation may return to the Loop once for a final evidence repair. The legacy path remains available only as an explicit compatibility mode.
 
 - The model receives an explicit read-only tool allowlist and may issue at most one Tool Call per decision.
 - `AgentToolRuntime` injects the authenticated repository, job ID, dataset scope and semantic decision server-side; model arguments cannot override identity or scope.
@@ -1043,7 +1100,7 @@ The stable planner, insight integration, chart formatting, adversarial review an
 - `agent_mode=legacy` preserves the existing workflow; `auto` resolves to Loop under the default deployment policy; explicit deployment configuration can still disable Loop or select legacy compatibility mode.
 - The frontend keeps the seven-stage workflow, labels the execution segment as an autonomous loop, and renders decision, execution, verification, repair, fallback and remaining-budget events in a separate component.
 - The offline release evaluator records legal tool selection, repair success, simple-task call count and duplicate successful actions against the 95% / 90% / 4-call / zero-duplicate gates. Provider-specific benchmark outcomes can be fed into this evaluator without storing source data rows.
-- The project-level Benchmark Harness executes frozen deterministic cases for cleaning, Chinese semantic ranking, SQL safety, relationship inference, report evidence, Assistant permissions and Loop reliability. It writes JSON, JSONL, Markdown and JUnit artifacts with environment/model identity and corpus checksums; missing latency/token telemetry is `metric_unavailable`, never zero.
+- The project-level Benchmark Harness executes frozen deterministic cases for cleaning, Chinese semantic ranking, SQL safety, relationship inference, Schema drift, relationship-grain safety, report evidence, statistical contracts, Assistant permissions and Loop reliability. It writes JSON, JSONL, Markdown and JUnit artifacts with environment/model identity and corpus checksums; missing latency/token telemetry is `metric_unavailable`, never zero.
 - Push/PR CI runs the deterministic `release` benchmark. A separate weekly/manual workflow runs three-repeat DeepSeek/Kimi canaries plus explicit performance and resilience suites on the Docker production stack. Real-provider quality and performance remain observational until five valid calibration batches exist; safety gates are always blocking.
 
 Configuration:
@@ -1058,6 +1115,8 @@ Configuration:
 - `DATAMIND_AGENT_LOOP_MAX_TOOL_ATTEMPTS`
 - `DATAMIND_AGENT_LOOP_TIMEOUT_SECONDS`
 - `DATAMIND_AGENT_LOOP_MAX_TOKENS`
+- `DATAMIND_ANALYSIS_FAST_PATH_ENABLED`
+- `DATAMIND_ANALYSIS_FAST_PATH_MAX_ROWS`
 
 ---
 
@@ -1066,6 +1125,7 @@ Configuration:
 Implemented:
 
 - React + Vite + Tailwind frontend.
+- Configurable single-dataset SQL fast path preserves the bounded Agent Loop, statistical verification and final report while avoiding redundant intermediate LLM calls; complex, multi-dataset and multimodal analyses retain the full model path.
 - React runtime and TypeScript declarations are aligned on React 18 (`react`/`react-dom` 18.3, `@types/react`/`@types/react-dom` 18.x).
 - Frontend modularization phase 1: Workflow node definitions, status derivation, log translation, and task labels live in `frontend/react/src/workflow-ui.ts` instead of the application entrypoint.
 - Frontend modularization phase 2: API base URL/fallback, Cookie/CSRF request headers, typed GET/POST/PATCH/DELETE helpers, cleaning compatibility calls, and auth cache live in `frontend/react/src/api-client.ts`.
@@ -1080,7 +1140,7 @@ Implemented:
 - SQLite-to-PostgreSQL UUID-preserving migration command.
 - Revocable HttpOnly Cookie sessions, CSRF/Origin validation, Argon2id password migration, and user-scoped records.
 - Redis rate limits for login, analysis job creation, and LLM calls in production.
-- CSV/XLSX/JSON/TXT upload through backend parsing.
+- CSV/XLSX/JSON/TXT upload through disk-backed backend parsing. Uploads are capped before parsing, JSON and delimited text are consumed in bounded record batches, XLSX uses read-only per-Sheet scans, and database inserts retain only one bounded batch in memory.
 - Batch upload queue in the React dataset page with drag-and-drop, file-picker duplicate-guarding, per-file status, Excel sheet selection, import, and cleaning.
 - Cross-page dataset-import state preservation: active upload/cleaning work continues when the user navigates away and is restored unchanged on return.
 - Single-file and batch imports create asynchronous cleaning jobs with `cleaning_strategy=auto`; the bounded controller selects rules/LLM/hybrid, validates candidate quality, repairs or falls back, and activates only a verified version.
@@ -1089,6 +1149,8 @@ Implemented:
 - Relationship recommendation v1 with rules first, manually refreshed compact-context LLM semantic supplementation, backend validation, and row-multiplication risk notes.
 - Automatic relationship configuration integrated into batch import: rules and compact-context LLM suggestions are backend-validated, selected into an executable acyclic relationship tree, persisted automatically, and shown in a live import pipeline with unresolved-table fallback.
 - Chained local multi-dataset execution with original-to-prefixed column lineage, directional match rates, vectorized row-count estimation, hard expansion limits, and per-join executed/skipped risk summaries.
+- Version-to-version data reliability monitoring with bounded snapshots, Schema/type/missing/unique/distribution drift, relationship match-rate revalidation, and stale propagation to semantic models, reports, and saved relationships.
+- Dataset-group reliability UI with live scan status, stale relationship reasons, drift changes, and authorization-gated recommended actions.
 - Raw and cleaned dataset storage.
 - Dataset detail previews and profile/schema display.
 - Dashboard real backend statistics.
@@ -1111,6 +1173,7 @@ Implemented:
 - Manual field type correction, field roles, and field descriptions.
 - Profile and planner behavior using user-overridden field metadata.
 - Planner metadata with confidence, route reason, candidate fields, and non-blocking clarifying questions.
+- Planner-frozen `AnalysisContract` plus deterministic `StatisticalVerifier` for numeric evidence coverage, comparison support, observational causal-language qualification, and multi-table grain/row-expansion validation. Failed checks reuse the bounded evidence-repair Loop; unresolved findings are excluded from reports while verdicts remain persisted and visible.
 - Workflow timeline/debugger based on analysis trace and node summaries.
 - Event-driven realtime workflow runner UI: agent plan chips, seven-step workflow state, running log auto-scroll, and expandable agent details driven by ordered SSE job events, with polling fallback.
 - Cross-page floating task-progress capsule driven by the same live job updates; desktop and mobile layouts keep it clear of primary navigation and return directly to the active analysis session.
@@ -1146,13 +1209,21 @@ Implemented:
 - Versioned dataset/dataset-group semantic models with automatic drafts, immutable publication, copy/rebinding support, schema fingerprints, entity/dimension/relationship definitions, and a safe metric expression DSL.
 - Semantic Planner preview and feedback APIs with component confidence scores, monotonic PAVA calibration, high/medium/low decision bands, low-confidence confirmation gates, and immutable decision references on analysis jobs.
 - Deterministic semantic metric compilation and direct DuckDB multi-table execution; `sqlglot` AST validation restricts SQL to published entities, fields, relationships, and safe SELECT/CTE operations.
+- Native semantic relationship-graph planning separates fact grain from metric-source entities, selects only required paths, compiles explicit deduplication, and blocks unsupported one-to-many/many-to-many expansion before execution.
+- Execution-scoped lineage persists source fields, semantic metrics, findings, charts, relationship graph, grain plan, and the report artifact in both analysis responses and report metadata.
 - React semantic-model workbench with visual entity/grain, dimension, metric binding, relationship/cardinality, and lineage editing; advanced JSON DSL editing, validation/publication, version selection, and the analysis-time semantic-plan confidence card remain available.
 - Chinese-safe semantic DSL v2 with stable entity/field IDs, quoted source-column resolution, backward-compatible v1 reads, and direct execution for Chinese, mixed-language, spaced, slash, parenthesis, and quoted column names.
 - Optional local `BAAI/bge-small-zh-v1.5` semantic embedding provider with process/database caches, deterministic fallback, Planner candidate evidence, relationship-score supplementation, and copy/rebinding candidate support.
 - Production API/Worker image packages a pinned BGE revision and runs with local-files-only inference; readiness reports embedding availability and production can require it.
+- Session identities use an independent UUID owner ID and a separately normalized unique login name. Existing owner IDs remain stable during migration, while punctuation-distinct login names no longer collapse into one data space and blank usernames are rejected.
+- P1 production hardening reverified 2026-07-30: 111 Unit, 33 Workflow, and 70 Integration tests passed; Ruff, frontend production build, Alembic `0001 -> 0009`, PostgreSQL `0008 -> 0009`, strict Docker readiness, real container Runner smoke, and the public same-origin endpoint passed.
+- P2/P3 reliability hardening reverified 2026-07-30: 114 Unit, 34 Workflow, 71 Integration, and 26 desktop/mobile Playwright tests passed; the frontend production build, zero-vulnerability npm audit, Docker rebuild/readiness, and a real Kimi Provider SSE smoke passed; ordinary and Assistant imports use bounded-memory parsing, Assistant DDL is process-scoped/Alembic-owned in production, Kimi final answers use native Provider SSE, and Playwright uses dedicated strict ports without silently reusing an unrelated local application.
+- AnalysisContract/StatisticalVerifier v1 reverified 2026-07-30: Ruff passed; 119 Unit, 36 Workflow, 71 Integration, the deterministic release Benchmark, the frontend production build, and all 26 desktop/mobile Playwright cases passed. The Workflow tests cover unsupported numeric report summaries and a failed Join-grain verdict returning to the autonomous Loop and succeeding only after source-table native-grain evidence is collected.
+- Data reliability and grain-aware relationship graph v1 reverified 2026-07-30: Ruff passed; 126 Unit, 36 Workflow, and 72 Integration tests passed together with the deterministic release Benchmark, frontend production build, and all 26 desktop/mobile Playwright cases. Alembic `0001 -> 0010`, `0010 -> 0009`, and re-upgrade to `0010` passed on a fresh SQLite database; coverage includes drift invalidation, relationship freshness, unsafe grain blocking, shortest-path planning, and field-to-report lineage persistence.
 - Persistent Kimi data assistant with independent `kimi-k2.6` routing, user-scoped conversation/message history, protected image attachments, automatic report/result retrieval, and validated evidence citations.
+- Kimi ask-mode report fast path, database-level Top-N report retrieval, bounded recent-message context, segmented first-answer latency telemetry, combined token accounting, and Benchmark P50/P95 aggregation.
 - Kimi report revision with frozen analytical evidence, deterministic evidence fingerprints, no analysis rerun, and one audited primary report deliverable per message.
-- Assistant LangGraph and local/Celery execution path with ordered SSE tool/analysis/message events, cancellation, low-confidence semantic-plan confirmation, and analysis-job reuse.
+- Assistant LangGraph and local/Celery execution path with ordered SSE tool/analysis/message events, immediate terminal cancellation, checkpoint-safe pause/resume, low-confidence semantic-plan confirmation, and analysis-job reuse. Cancel and final-answer commits are atomic so a late model response cannot overwrite the user's stop action.
 - Assistant execute mode exposes the user-facing cleaning, relationship, analysis, report, semantic-model, recycle, and restore tools through server-injected scope and capability checks. Kimi can refine individual Agent stages with bounded prompt overrides, but cannot replace system prompts, disable validation, invoke arbitrary SQL, expose raw paths, or bypass Python sandbox rules.
 
 Not complete yet:
@@ -1163,7 +1234,7 @@ Not complete yet:
 - Rich semantic-layer lifecycle tooling beyond the current dataset-group scoped v1, including visual formula authoring and organization-wide governance.
 - Kubernetes/gVisor-grade sandbox isolation and multi-host Runner scheduling beyond the Docker single-host controller.
 - Fully interactive editable workflow graph/debugger.
-- Cross-dataset lineage graph and automatic semantic-layer management.
+- Organization-wide lineage impact analysis, interactive graph traversal, and policy-driven automatic remediation beyond the current execution-scoped v1.
 - Full parity with the referenced `data-analysis-report-agent` multi-round hypothesis workflow.
 
 ---
@@ -1194,7 +1265,9 @@ The current product is successful when users can:
 - Track async analysis job progress, cancel or retry jobs, and inspect job history.
 - Start each analysis as a new session record and reopen any dashboard/history record to inspect its complete Workflow, logs, errors, and persisted outputs.
 - Inspect planner metadata and workflow debugger node details.
+- Inspect the frozen analysis contract and per-check statistical verdict, including numeric evidence coverage, comparison sample size/effect or confidence interval, causal-language policy, and Join-grain result.
 - Inspect multi-dataset join summaries, connected table counts, joined row/column counts, row-expansion ratios, key uniqueness, skipped relationships, and validation issues.
+- Inspect data/package drift status, stale relationship match rates, affected reports/semantic models, and authorization-gated remediation suggestions.
 - Generate SQL safely against internal DuckDB.
 - Run Python analysis on numeric, categorical, and text datasets.
 - See charts in the analysis result and report page.
@@ -1212,6 +1285,7 @@ The current product is successful when users can:
 - Explicitly confirm low-confidence plans while medium/high-confidence plans retain the documented execution policy.
 - Execute published metric definitions safely across declared DuckDB entities, including Chinese and special-character source fields, without storing arbitrary SQL.
 - Reopen a historical job/report and retain its original planner decision, semantic model version, metric formula, field provenance, and join path.
+- Trace source fields and semantic metrics through verified findings/charts to the persisted report, including the selected relationship path and grain-safety decision.
 - Run with semantic embedding disabled/fallback in development and fail production readiness when required local embeddings are unavailable.
 - Ask Kimi about existing DataMind reports and completed analyses, upload an image for visual context, and receive answers backed by clickable report/job/dataset evidence.
 - Let Kimi start a DataMind analysis when evidence is insufficient, follow the Workflow inside the conversation, confirm low-confidence semantic plans, and continue the answer from the completed result.
@@ -1235,9 +1309,9 @@ The current product is successful when users can:
 
 ## Later
 
-- Cross-dataset lineage graph and organization-wide semantic-layer management.
+- Organization-wide semantic governance, interactive cross-run impact lineage, and policy-managed remediation.
 - More mature experience library editing.
-- Evaluation framework for SQL/Python/report quality.
+- Extend deterministic statistical verification with experiment-design metadata, power analysis, multiple-comparison correction, missingness-mechanism checks, and time-series diagnostics.
 - Cross-report filtering, drill-down, and reusable dashboard composition beyond the Next-phase report chart improvements.
 - Standard external MCP stdio/Streamable HTTP client support; the current MCP Runtime remains internal.
 - Kubernetes-native workers, gVisor-level sandboxing, and multi-host Runner scheduling.

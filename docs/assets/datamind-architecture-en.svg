@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="795" viewBox="0 0 1400 795" role="img" aria-labelledby="title desc">
+  <title id="title">DataMind architecture</title>
+  <desc id="desc">DataMind product, API, data-agent workflow, and infrastructure architecture.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse" markerUnits="strokeWidth">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#64748b"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
+      .layer { font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .card-title { font-weight: 700; }
+      .card-detail { font-size: 15px; font-weight: 500; }
+      .arrow { stroke: #64748b; stroke-width: 2; fill: none; }
+      .arrow.muted { stroke: #94a3b8; stroke-width: 1.7; }
+      .shared-connection { stroke: #64748b; stroke-width: 1.7; fill: none; }
+      .flow-label { font-size: 14px; font-weight: 700; fill: #475569; }
+      .service-bus { font-size: 14px; font-weight: 700; fill: #334155; }
+    </style>
+  </defs>
+  <rect width="1400" height="795" fill="#ffffff"/>
+
+    <rect x="16" y="16" width="1368" height="150" rx="8" fill="#f8fffc" stroke="#dbe4ef"/>
+    <text x="34" y="43" class="layer">Product experience</text>
+
+    <rect x="16" y="181" width="1368" height="140" rx="8" fill="#f8fbff" stroke="#dbe4ef"/>
+    <text x="34" y="208" class="layer">API and control plane</text>
+
+    <rect x="16" y="336" width="1368" height="220" rx="8" fill="#fbfdfc" stroke="#dbe4ef"/>
+    <text x="34" y="363" class="layer">LangGraph data-agent runtime</text>
+
+    <rect x="16" y="571" width="1368" height="208" rx="8" fill="#fafbfc" stroke="#dbe4ef"/>
+    <text x="34" y="598" class="layer">Durable services and execution boundaries</text>
+
+    <rect x="63" y="66" width="290" height="76" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+    <text x="208" y="102" text-anchor="middle" class="card-title" font-size="20" fill="#064e3b">Data workspace</text>
+    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="208" y="136">Upload · Clean · Relate</tspan></text>
+
+    <rect x="388" y="66" width="290" height="76" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+    <text x="533" y="102" text-anchor="middle" class="card-title" font-size="20" fill="#064e3b">Analysis tasks</text>
+    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="533" y="136">Workflow · History · Trace</tspan></text>
+
+    <rect x="713" y="66" width="290" height="76" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+    <text x="858" y="102" text-anchor="middle" class="card-title" font-size="20" fill="#064e3b">Reports</text>
+    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="858" y="136">Evidence · Versions · Export</tspan></text>
+
+    <rect x="1038" y="66" width="290" height="76" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+    <text x="1183" y="102" text-anchor="middle" class="card-title" font-size="20" fill="#064e3b">Kimi assistant</text>
+    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="1183" y="136">Ask · Execute · Attach</tspan></text>
+
+    <rect x="63" y="221" width="290" height="76" rx="8" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+    <text x="208" y="257" text-anchor="middle" class="card-title" font-size="20" fill="#1e3a8a">FastAPI API</text>
+    <text text-anchor="middle" class="card-detail" fill="#1e3a8a"><tspan x="208" y="291">Typed HTTP contracts</tspan></text>
+
+    <rect x="388" y="221" width="290" height="76" rx="8" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+    <text x="533" y="257" text-anchor="middle" class="card-title" font-size="20" fill="#1e3a8a">Session security</text>
+    <text text-anchor="middle" class="card-detail" fill="#1e3a8a"><tspan x="533" y="291">Cookie · CSRF · Limits</tspan></text>
+
+    <rect x="713" y="221" width="290" height="76" rx="8" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+    <text x="858" y="257" text-anchor="middle" class="card-title" font-size="20" fill="#1e3a8a">Permission service</text>
+    <text text-anchor="middle" class="card-detail" fill="#1e3a8a"><tspan x="858" y="291">Scope · Grants · Audit</tspan></text>
+
+    <rect x="1038" y="221" width="290" height="76" rx="8" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+    <text x="1183" y="257" text-anchor="middle" class="card-title" font-size="20" fill="#1e3a8a">Task control</text>
+    <text text-anchor="middle" class="card-detail" fill="#1e3a8a"><tspan x="1183" y="291">SSE · Cancel · Retry · Resume</tspan></text>
+
+    <rect x="22" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="112" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Cleaning Loop</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="112" y="452">Decide · Execute</tspan><tspan x="112" y="473">Gate · Commit</tspan></text>
+
+    <rect x="218" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="308" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Planner</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="308" y="452">Profile · Semantics</tspan><tspan x="308" y="473">Analysis contract</tspan></text>
+
+    <rect x="414" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="504" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Analysis Loop</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="504" y="452">Safe SQL · Python</tspan><tspan x="504" y="473">Repair · Charts</tspan></text>
+
+    <rect x="610" y="386" width="180" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+    <text x="700" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#78350f">Verifier</text>
+    <text text-anchor="middle" class="card-detail" fill="#78350f"><tspan x="700" y="452">Grain · Statistics</tspan><tspan x="700" y="473">Evidence</tspan></text>
+
+    <rect x="806" y="386" width="180" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+    <text x="896" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#78350f">Reviewer</text>
+    <text text-anchor="middle" class="card-detail" fill="#78350f"><tspan x="896" y="452">Adversarial</tspan><tspan x="896" y="473">validation</tspan></text>
+
+    <rect x="1002" y="386" width="180" height="120" rx="8" fill="#faf5ff" stroke="#c084fc" stroke-width="2"/>
+    <text x="1092" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#581c87">Report Loop</text>
+    <text text-anchor="middle" class="card-detail" fill="#581c87"><tspan x="1092" y="452">Draft · Repair</tspan><tspan x="1092" y="473">Verify · Commit</tspan></text>
+
+    <rect x="1198" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="1288" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Assistant Graph</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="1288" y="452">Retrieve · Tools</tspan><tspan x="1288" y="473">Confirm · Answer</tspan></text>
+
+    <rect x="22" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="112" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">Data store</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="112" y="714">PostgreSQL · SQLite</tspan><tspan x="112" y="735">Assets · Versions · Reports</tspan></text>
+
+    <rect x="218" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="308" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">BGE embedding</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="308" y="714">Chinese semantics</tspan><tspan x="308" y="735">User-scoped cache</tspan></text>
+
+    <rect x="414" y="648" width="180" height="124" rx="8" fill="#fff7ed" stroke="#fb923c" stroke-width="2"/>
+    <text x="504" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#7c2d12">Python Runner</text>
+    <text text-anchor="middle" class="card-detail" fill="#7c2d12"><tspan x="504" y="714">Disposable container</tspan><tspan x="504" y="735">No network</tspan></text>
+
+    <rect x="610" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="700" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">Checkpoints</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="700" y="714">Resume · Idempotency</tspan><tspan x="700" y="735">Ordered events</tspan></text>
+
+    <rect x="806" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="896" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">Tool runtime</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="896" y="714">Schema · Policy</tspan><tspan x="896" y="735">Invocation</tspan></text>
+
+    <rect x="1002" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="1092" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">LLM providers</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="1092" y="714">DeepSeek · Kimi</tspan><tspan x="1092" y="735">Role routing</tspan></text>
+
+    <rect x="1198" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="1288" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">Redis + Celery</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="1288" y="714">Broker · Worker</tspan><tspan x="1288" y="735">Beat</tspan></text>
+<line x1="700" y1="166" x2="700" y2="221" class="arrow" marker-end="url(#arrow)"/>
+<text x="735" y="198" text-anchor="middle" class="flow-label">HTTPS</text>
+<line x1="700" y1="321" x2="700" y2="386" class="arrow" marker-end="url(#arrow)"/>
+<text x="750" y="357" text-anchor="middle" class="flow-label">dispatch</text>
+<line x1="202" y1="446" x2="218" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="398" y1="446" x2="414" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="594" y1="446" x2="610" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="790" y1="446" x2="806" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="986" y1="446" x2="1002" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="1182" y1="446" x2="1198" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<rect x="226" y="604" width="948" height="30" rx="8" fill="#eef2f7" stroke="#94a3b8"/>
+<text x="700" y="624" text-anchor="middle" class="service-bus">Shared runtime services · calls · state · queue · events</text>
+<line x1="700" y1="556" x2="700" y2="604" class="shared-connection" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+<line x1="112" y1="634" x2="112" y2="648" class="shared-connection"/>
+<line x1="308" y1="634" x2="308" y2="648" class="shared-connection"/>
+<line x1="504" y1="634" x2="504" y2="648" class="shared-connection"/>
+<line x1="700" y1="634" x2="700" y2="648" class="shared-connection"/>
+<line x1="896" y1="634" x2="896" y2="648" class="shared-connection"/>
+<line x1="1092" y1="634" x2="1092" y2="648" class="shared-connection"/>
+<line x1="1288" y1="634" x2="1288" y2="648" class="shared-connection"/>
+<path d="M 1092 506 C 1092 548, 308 548, 308 506" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<text x="700" y="542" text-anchor="middle" class="flow-label">repair / replan</text>
+</svg>

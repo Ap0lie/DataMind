@@ -37,9 +37,23 @@ RUN python -m pip install --no-deps --no-build-isolation . \
     && mkdir -p /data/datasets \
     && chown -R 10001:10001 /data
 
+# Keep build identity after dependency/model layers so a new source revision does
+# not invalidate the expensive, immutable runtime dependencies.
+ARG DATAMIND_BUILD_SHA=local
+LABEL org.opencontainers.image.revision=${DATAMIND_BUILD_SHA}
+ENV DATAMIND_BUILD_SHA=${DATAMIND_BUILD_SHA}
+
 EXPOSE 8000
 
 USER 10001:10001
 
 CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
 
+FROM runtime AS test
+
+USER root
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+RUN python -c "import subprocess,sys,tomllib; p=tomllib.load(open('pyproject.toml','rb')); d=p['project']['optional-dependencies']['dev']; subprocess.check_call([sys.executable,'-m','pip','install','--index-url','${PYPI_INDEX_URL}',*d])"
+USER 10001:10001
+
+FROM runtime AS production

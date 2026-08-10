@@ -1,263 +1,278 @@
 # DataMind
 
-DataMind is an AI data analysis copilot based on LangGraph and MCP.
-It focuses on the v1 PRD scope: upload structured datasets, profile data,
-ask questions in natural language, generate SQL or Python analysis, create
-visualizations, and produce structured web reports with Markdown export fallback.
+<div align="center">
+  <strong>Evidence-grounded AI data analysis, from raw files to auditable reports.</strong>
+  <br />
+  <br />
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
+  <br />
+  <br />
+  <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white" />
+  <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white" />
+  <img alt="LangGraph" src="https://img.shields.io/badge/Workflow-LangGraph-111827" />
+  <img alt="React 18" src="https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=111827" />
+  <img alt="Docker Compose" src="https://img.shields.io/badge/Deploy-Docker_Compose-2496ED?logo=docker&logoColor=white" />
+</div>
 
-The project is a local-first agent engineering application with an optional
-production profile. It is not a full BI platform or enterprise semantic layer.
+DataMind is a local-first data agent for importing structured files, cleaning and
+profiling data, understanding multi-table relationships, answering business
+questions with SQL and Python, and producing evidence-backed reports. LangGraph
+coordinates bounded cleaning, analysis, verification, and report loops; Kimi adds
+a permission-aware conversational workspace over the same DataMind assets.
 
-## V1 Scope
+> DataMind is under active development. It is designed as an auditable analytics
+> service, not as a replacement for enterprise BI governance or a general-purpose
+> code execution platform.
 
-- CSV and Excel dataset upload
-- DuckDB-oriented analysis workflow
-- Dataset preview, schema, type summary, missing values, duplicates, and basic statistics
-- Planner Agent for routing analysis tasks
-- SQL Agent for text-to-SQL, execution, and explanation
-- Python Agent for EDA, statistics, and chart generation
-- Structured web report generation with Markdown compatibility export
-- MCP boundary for Filesystem and Model Router capabilities
-- LangGraph checkpoint persistence and node execution harness
-- Redis/Celery durable analysis workers in the production profile
-- SQLite local persistence and PostgreSQL production persistence
-- Cookie sessions, CSRF protection, rate limits, and user-scoped data
-- Optional one-shot Docker sandbox for generated Python code
-- React + Vite + Tailwind CSS UI
-- Docker Compose deployment
+## Why DataMind
 
-Out of scope for the current version: enterprise RBAC/SSO, arbitrary multi-table
-SQL, automatic semantic-layer management, AutoML, and ML training.
+| Capability | What it provides |
+| --- | --- |
+| Data preparation | Drag-and-drop CSV, XLSX, JSON, and TXT imports; multi-file packages; cleaning versions, diffs, rollback, and drift detection |
+| Semantic understanding | Column roles, bilingual semantic ranking, versioned metric DSL, relationship graph, Join cardinality and grain checks |
+| Autonomous analysis | Planner, safe SQL, sandboxed Python, bounded repair loops, deterministic fallback, and resumable jobs |
+| Trustworthy output | Statistical verification, evidence IDs, lineage, adversarial review, report repair, and auditable commit |
+| Kimi workspace | User-scoped conversations, image/data attachments, asset retrieval, read/execute modes, grants, action logs, and recycle bin |
+| Production runtime | PostgreSQL, Redis, Celery, checkpoint recovery, SSE events, Cookie sessions, CSRF, rate limits, and Docker sandboxing |
 
-## Stack
+## Architecture
+
+The named agents are specialized LangGraph nodes with separate prompts and model
+routing. They share one durable workflow state; they are not independently
+deployed microservices.
+
+[![DataMind system architecture](docs/assets/datamind-architecture-en.png)](docs/assets/datamind-architecture-en.svg)
+
+<p align="center"><sub>Product experience → API and control plane → LangGraph agent runtime → durable services and execution boundaries. Select the image to open the vector version.</sub></p>
+
+The shared runtime-services boundary is bidirectional. LangGraph reads and writes
+data and checkpoints, invokes BGE, the Python Runner, governed tools, and model
+providers, and exchanges jobs and events through Redis/Celery. Solid horizontal
+arrows show workflow control; the dashed path shows bounded repair or replanning.
+
+## End-to-End Workflow
+
+```mermaid
+flowchart LR
+    Import["Import files"] --> Clean["Cleaning loop and quality gates"]
+    Clean --> Profile["Profile, drift and semantic model"]
+    Profile --> Plan["Planner and analysis contract"]
+    Plan --> Execute["SQL and Python tool loop"]
+    Execute --> Validate["Grain and statistical verification"]
+    Validate -->|"repair required"| Plan
+    Validate --> Review["Adversarial review"]
+    Review --> Report["Evidence-backed report loop"]
+    Report --> Assistant["Kimi retrieval and follow-up actions"]
+```
+
+The loops are bounded by tool, decision, token, retry, and wall-clock budgets.
+Failed generated Python code is returned to the model for at most two repairs;
+validated deterministic fallback keeps the job controlled when model execution
+cannot be trusted.
+
+## Core Features
+
+- Batch and drag-and-drop upload for CSV, XLSX, JSON, and TXT, including
+  single-Sheet selection and disk-backed staging for large files.
+- Dataset packages with rule-based and LLM-assisted relationship suggestions,
+  sample match rates, cardinality warnings, and automatic validated plans.
+- Versioned cleaning runs, field metadata, preview diffs, activation, rollback,
+  schema drift, data drift, and stale-asset propagation.
+- Versioned semantic models with stable field/entity IDs, metric DSL, Chinese
+  semantic matching through BAAI/bge-small-zh-v1.5, validation, and publishing.
+- Safe DuckDB SQL constrained to approved datasets, fields, and relationship paths.
+- Generated Python execution in a controlled subprocess or one-shot container,
+  with timeout, output limits, chart compaction, repair attempts, and fallback.
+- Statistical verification for requested metrics/dimensions, Join grain,
+  evidence coverage, comparison support, confidence intervals, and causal wording.
+- Structured web reports with charts, brief/standard/detailed views, versioning,
+  HTML/Markdown export, and browser-print PDF.
+- Persistent analysis, cleaning, and Assistant jobs with cancellation, retry,
+  checkpoint recovery, ordered events, and page-switch continuity.
+
+## Quick Start
+
+### Prerequisites
 
 - Python 3.12
-- FastAPI
-- LangGraph
-- Pydantic v2
-- DuckDB
-- SQLite / PostgreSQL
-- Redis / Celery
-- Alembic / SQLAlchemy Core
-- OpenTelemetry
-- Pandas
-- Plotly
-- React
-- Vite
-- Tailwind CSS
-- Docker Compose
+- Node.js 24 and npm
+- Docker Desktop or Docker Engine with Compose for the production profile
 
-## Directory Structure
-
-```text
-app/
-  api/          FastAPI adapters
-  agents/       Agent contracts and analysis helpers
-  core/         domain entities, enums, settings, ports
-  mcp/          MCP Runtime and Model Router/Data Analysis tools
-  harness/      LangGraph node reliability, validation, and trace boundary
-  python_runner/ controlled Docker sandbox runner
-  schemas/      HTTP schemas
-  workflows/    LangGraph workflow adapter
-frontend/
-  react/        React + Vite + Tailwind user interface
-docs/
-tests/
-```
-
-Some legacy architecture modules are still present while the codebase is being
-trimmed toward the new PRD. They should not be expanded for v1 unless they
-directly support the dataset analysis flow.
-
-## Local Development
+### Local development
 
 ```bash
-conda create -y -n datamind-py312 python=3.12
-conda activate datamind-py312
-pip install -e ".[dev]"
-uvicorn app.main:create_app --factory --reload --host 127.0.0.1 --port 8010
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
+
+python -m pip install -e ".[dev]"
+# Windows: copy .env.example .env
+# Linux/macOS: cp .env.example .env
+
+alembic upgrade head
+python -m uvicorn app.main:create_app --factory --reload --host 127.0.0.1 --port 8010
 ```
 
-Health checks:
+In another terminal:
 
 ```bash
-curl http://127.0.0.1:8010/api/v1/health
-curl http://127.0.0.1:8010/api/v1/health/live
-curl http://127.0.0.1:8010/api/v1/health/ready
+npm --prefix frontend/react ci
+npm --prefix frontend/react run dev
 ```
 
-Swagger UI:
+Open:
 
-```text
-http://127.0.0.1:8010/docs
-```
+- React workspace: <http://127.0.0.1:5173>
+- Swagger UI: <http://127.0.0.1:8010/docs>
+- Readiness: <http://127.0.0.1:8010/api/v1/health/ready>
 
-Run the React UI:
+Without provider keys, set `DATAMIND_LLM_PROVIDER=mock` for deterministic local
+development. Never commit `.env` or production credentials.
+
+### Production-like Docker deployment
 
 ```bash
-cd frontend/react
-npm install
-npm run dev
-```
+# Windows: copy .env.production.example .env.production
+# Linux/macOS: cp .env.production.example .env.production
 
-React dev server:
-
-```text
-http://127.0.0.1:5173
-```
-
-The product frontend is the React app. React pages load datasets, cleaned
-records, analysis summaries, job events, and reports from FastAPI. Local mode
-uses SQLite and a local executor; production uses PostgreSQL, Redis, and Celery.
-
-## LLM Configuration
-
-LLM access is exposed through Model Router MCP. DataMind currently supports
-layered provider routing; agents should not call provider APIs directly.
-
-Create `.env` from `.env.example`:
-
-```text
-DATAMIND_DEFAULT_LLM_PROVIDER=deepseek
-DATAMIND_PLANNER_LLM_PROVIDER=deepseek
-DATAMIND_SQL_LLM_PROVIDER=deepseek
-DATAMIND_REPORT_LLM_PROVIDER=kimi
-DATAMIND_DEEPSEEK_MODEL=deepseek-chat
-DATAMIND_KIMI_MODEL=moonshot-v1-32k
-DATAMIND_DEEPSEEK_BASE_URL=https://api.deepseek.com
-DATAMIND_KIMI_BASE_URL=https://api.moonshot.cn/v1
-DATAMIND_LLM_API_KEY=
-```
-
-Set `DATAMIND_LLM_PROVIDER=mock` to globally force mock model routing in tests or local no-key runs.
-
-### Kimi data assistant
-
-The sidebar Kimi workspace keeps user-scoped conversation history, accepts JPEG/PNG/WebP images and CSV/XLSX/JSON/TXT data packages, and retrieves existing DataMind analysis results and reports. Ask mode exposes only read and plan-preview tools. Execute mode can run cleaning, relationship, analysis, report, and semantic-model operations only for explicitly granted assets; every mutation is scope checked, idempotent, and audited. Kimi may attach bounded task preferences to the cleaning, Planner, SQL, Python, visualization, review, and report stages. These preferences are persisted for retry/recovery and are always treated as untrusted user instructions below immutable safety prompts. Soft deletion always requires a separate confirmation and keeps assets recoverable for 30 days.
-
-```env
-DATAMIND_ASSISTANT_ENABLED=true
-DATAMIND_ASSISTANT_LLM_PROVIDER=kimi
-DATAMIND_ASSISTANT_LLM_MODEL=kimi-k2.6
-DATAMIND_ASSISTANT_MAX_TOOL_CALLS=8
-DATAMIND_ASSISTANT_MAX_CONTEXT_CHARS=60000
-DATAMIND_ASSISTANT_TIMEOUT_SECONDS=300
-DATAMIND_ASSISTANT_IMAGE_MAX_BYTES=5242880
-DATAMIND_ASSISTANT_DATA_FILE_MAX_BYTES=209715200
-DATAMIND_ASSISTANT_DATA_FILE_MAX_COUNT=20
-DATAMIND_ASSISTANT_DATA_BATCH_MAX_BYTES=1073741824
-DATAMIND_ASSISTANT_RECYCLE_RETENTION_DAYS=30
-DATAMIND_ASSISTANT_RATE_LIMIT=30
-```
-
-Assistant attachments are streamed into the shared protected `assistant-attachments` directory and are served only through authenticated API routes. Multi-file imports parse one file at a time, create one dataset group, start `cleaning_strategy=auto`, save validated relationship suggestions, and grant Kimi management access to the new package. Local API lifespan and production Celery Beat purge expired recycle-bin assets. `DATAMIND_KIMI_API_KEY` is required when the assistant provider is Kimi; readiness reports `assistant_model=not_configured` otherwise.
-
-### Bounded autonomous analysis loop
-
-Loop Engineering is the default analysis path. The legacy workflow remains available as an explicit compatibility mode:
-
-```env
-DATAMIND_AGENT_LOOP_ENABLED=true
-DATAMIND_AGENT_LOOP_DEFAULT_MODE=loop
-DATAMIND_AGENT_LOOP_ALLOW_REQUEST_OVERRIDE=true
-DATAMIND_AGENT_LOOP_PROVIDER=deepseek
-DATAMIND_AGENT_LOOP_MODEL=deepseek-chat
-```
-
-The analysis request accepts `agent_mode: auto | legacy | loop`. `auto` resolves to Loop by default. Loop mode exposes only job-scoped, read-only analysis tools; each model decision can select one tool. SQL/Python/chart errors are classified and returned to the controller for bounded repair. Tool, decision, token and time budgets force a deterministic fallback instead of an unbounded retry cycle. Deployments can explicitly disable Loop or select `legacy` when compatibility is required.
-
-Cleaning uploads now use an asynchronous bounded Loop (`cleaning_strategy: auto | rules | llm | hybrid`). In `auto`, the model selects a strategy from aggregate schema/quality evidence; generated cleaning code runs only in the one-shot Python sandbox. Every candidate must pass row/column retention, missingness and duplicate quality gates before one cleaning version is committed and activated. Cancellation or failure preserves the previous active version.
-
-When analysis runs with `agent_mode=loop`, report generation also uses a bounded sub-loop: strategy selection, draft generation, deterministic evidence validation, at most two revisions, and at most one request back to the read-only analysis Loop. Only `report_commit` persists the report by job id. Configure these paths with `DATAMIND_CLEANING_LOOP_*` and `DATAMIND_REPORT_LOOP_*`; production Compose enables the cleaning, analysis, and report Loops by default. Compatibility modes remain available through explicit environment overrides.
-
-## Tests And Quality
-
-```bash
-# Fast unit suite (default, no Python subprocess)
-python -m pytest
-
-# Real LangGraph with mock model/Python execution boundaries
-python -m pytest -o addopts="" -m workflow
-
-# FastAPI + temporary SQLite + DuckDB + mocked services
-python -m pytest -o addopts="" -m integration
-
-# Explicit local subprocess/timeout/isolation checks
-python -m pytest -o addopts="" -m sandbox
-
-# Explicit project benchmark tests
-python -m pytest -o addopts="" -m benchmark
-
-# Deterministic PR release gate and optional benchmark tracks
-python -m app.evaluation.cli run --suite release
-python -m app.evaluation.cli run --suite provider --repeats 3
-python -m app.evaluation.cli run --suite performance --backend compose
-python -m app.evaluation.cli run --suite resilience --backend compose
-python -m app.evaluation.cli history --database data/datamind.db
-python -m app.evaluation.cli calibrate --runs run1.json run2.json run3.json run4.json run5.json --output baseline.json
-
-npm --prefix frontend/react run test:e2e
-ruff check .
-mypy app tests
-```
-
-Every backend test belongs to exactly one of `unit`, `workflow`, `integration`,
-`sandbox`, or `benchmark`. The Push/PR CI workflow runs unit, workflow, integration,
-the deterministic release benchmark, frontend build, and Playwright. The separate `production-smoke.yml` workflow
-runs manually or weekly against real PostgreSQL, Redis, Celery, Cookie auth,
-and the controlled Python Runner; local sandbox checks remain explicit.
-
-The scheduled `benchmarks.yml` workflow keeps real-provider and production-stack
-measurements outside PR CI. Benchmark artifacts include per-case JSONL, a Markdown
-summary, JUnit, environment/model identity, corpus checksum, latency and token
-availability. Missing telemetry is reported as `metric_unavailable`, never as zero.
-External public corpora are opt-in through `BENCHMARK_DATA_ROOT` and a SHA-256 manifest;
-DataMind never copies user database rows into benchmark artifacts.
-
-## Docker Compose
-
-Production Compose requires Docker Desktop/Engine and TLS termination for secure
-session cookies:
-
-```bash
-cp .env.production.example .env.production
+# Replace every change-me value and configure model keys first.
 docker compose --env-file .env.production config --quiet
 docker compose --env-file .env.production build --pull
 docker compose --env-file .env.production up -d
 ```
 
-The production stack serves React and `/api/v1` from the same HTTPS domain via
-Caddy and Nginx. Configure DNS, secrets and model keys in `.env.production`.
-See [docs/deployment.md](docs/deployment.md) for first deployment, upgrades,
-health checks, backups and SQLite migration.
+The Compose stack includes Caddy, Nginx/React, FastAPI, PostgreSQL, Redis, Celery
+Worker and Beat, the controlled Python Runner, and the no-network sandbox image.
+See the [Deployment Guide](docs/deployment.md) for DNS, HTTPS, upgrades, backup,
+health checks, and SQLite-to-PostgreSQL migration.
 
-After the stack is ready, run the same end-to-end acceptance used by the
-production Smoke workflow:
+## Configuration
+
+Copy `.env.example` for local development or `.env.production.example` for
+Compose. The most important settings are:
+
+| Variable | Purpose |
+| --- | --- |
+| `DATAMIND_DATABASE_URL` | SQLite locally or PostgreSQL in production |
+| `DATAMIND_REDIS_URL` | Celery broker and rate-limit storage |
+| `DATAMIND_EXECUTION_BACKEND` | `local` or `celery` |
+| `DATAMIND_AUTH_MODE` | `legacy` locally or `session` in production |
+| `DATAMIND_DEEPSEEK_API_KEY` | Planner, SQL, Python, and analysis Loop provider |
+| `DATAMIND_KIMI_API_KEY` | Reviewer, report, multimodal, and Assistant provider |
+| `DATAMIND_PYTHON_RUNNER_URL` | Controlled container runner endpoint |
+| `DATAMIND_AGENT_LOOP_DEFAULT_MODE` | Default `loop`; `legacy` is compatibility mode |
+| `DATAMIND_SEMANTIC_EMBEDDING_ENABLED` | Enables local semantic embedding ranking |
+
+Agent-level provider routing is configured independently. Kimi and DeepSeek are
+defaults, not hard requirements; tests use the mock provider.
+
+## Kimi Data Assistant
+
+Kimi can retrieve the current user's datasets, completed analysis results, and
+reports. Ask mode is read-only. Execute mode requires an asset grant and can run
+bounded cleaning, relationship, analysis, report, and semantic-model operations.
+Server-side scope checks inject user identity; the model cannot expand its own
+permissions. Mutations are idempotent and audited, while soft deletion always
+requires confirmation and remains recoverable for 30 days.
+
+Attachments support JPEG, PNG, WebP, CSV, XLSX, JSON, and TXT. Large data files are
+streamed to protected staging storage and parsed one file at a time. Final answers
+stream real provider tokens and may cite only assets actually read during the run.
+
+## MCP Status
+
+`app/mcp` currently provides an internal MCP-style runtime for tool registration,
+schema validation, retries, and model routing. The authenticated
+`/api/v1/mcp/invoke` endpoint is a project-specific REST boundary, **not a standard
+external MCP Server transport**. Standard MCP `stdio` or Streamable HTTP support is
+planned as a separate adapter; the internal tools can be reused behind it.
+
+## Tests and Benchmarks
 
 ```bash
-python scripts/production_smoke.py --base-url http://127.0.0.1:8010/api/v1
+# Fast unit suite; this is the default pytest layer.
+python -m pytest
+
+# Real LangGraph with mocked model and Python execution boundaries.
+python -m pytest -o addopts="" -m workflow
+
+# FastAPI, temporary SQLite, DuckDB, and mocked infrastructure.
+python -m pytest -o addopts="" -m integration
+
+# Explicit subprocess, timeout, and isolation checks.
+python -m pytest -o addopts="" -m sandbox
+
+# Project benchmark tests and deterministic release gate.
+python -m pytest -o addopts="" -m benchmark
+python -m app.evaluation.cli run --suite release
+
+npm --prefix frontend/react run build
+npm --prefix frontend/react run test:e2e
+ruff check .
+mypy app tests
 ```
 
-This verifies login/CSRF, dataset persistence, asynchronous autonomous cleaning,
-Celery analysis, Loop result retrieval, and persisted report delivery.
+Additional benchmark suites cover real providers, performance, resilience,
+frontend event latency, and claw-eval task adapters. Benchmark history stores
+aggregate latency, token, repair, and fallback metrics without prompts, messages,
+dataset rows, or report bodies.
 
-Services:
+## Project Layout
 
-- FastAPI: `http://localhost:8010`
-- PostgreSQL: internal service `postgres:5432`
-- Redis: internal service `redis:6379`
-- Celery analysis worker
-- Controlled Python Runner and one-shot no-network sandbox containers
-
-Run `alembic upgrade head` before a manual production deployment. Existing
-SQLite data can be copied with:
-
-```bash
-python -m app.storage.migrate_sqlite_to_postgres --source data/datamind.db --target POSTGRES_URL
+```text
+app/
+  analysis/          Planner, loops, SQL/Python, verification and lineage
+  assistant/         Kimi workflow, permissions, evidence and tools
+  data_reliability/  Profile snapshots and drift detection
+  semantic/          Semantic models, metric DSL, ranking and relationship graph
+  api/               FastAPI routes and authentication boundary
+  storage/           SQLite/PostgreSQL repositories and migration helpers
+  mcp/               Internal tool runtime and model router
+  harness/           Node timeout, retry, validation and trace boundary
+  evaluation/        Benchmark harness, corpus and release gates
+  python_runner/      Controlled container runner service
+frontend/react/       React, Vite, Tailwind and Playwright
+migrations/           Alembic migrations
+benchmarks/           Deterministic and claw-eval suites
+deploy/               Caddy and evaluation deployment assets
+docs/                 Development and deployment guides
+tests/                Unit, workflow, integration, sandbox and benchmark tests
 ```
+
+## Security Boundaries
+
+- Production uses HttpOnly Cookie sessions, CSRF and Origin checks, rate limits,
+  user-scoped repositories, and capability grants.
+- Analysis SQL is SELECT-only and constrained by the approved semantic scope.
+- Generated Python runs without network access in a disposable restricted container.
+- LLM output, report evidence, uploaded text, and image OCR are treated as
+  untrusted input and cannot override permissions or immutable safety policy.
+- Secrets belong in environment variables or a deployment secret manager, never Git.
+
+## Current Limitations
+
+- No enterprise RBAC, SSO, or organization-wide semantic governance.
+- No arbitrary user-authored multi-table SQL or unrestricted code execution.
+- No standard external MCP Server transport yet.
+- AutoML and model training are outside the current scope.
 
 ## Documentation
 
+- [Product Requirements](prd.md)
 - [Development Guide](docs/development.md)
 - [Deployment Guide](docs/deployment.md)
-- [MCP Tool Extension Guide](docs/mcp_tool_extension.md)
+- [Internal MCP Tool Extension Guide](docs/mcp_tool_extension.md)
+- [Benchmark Guide](benchmarks/README.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security Policy](SECURITY.md)
+
+After installing the frontend dependencies, regenerate the localized SVG and PNG
+architecture images whenever system boundaries change:
+
+```bash
+node scripts/render_readme_architecture.mjs
+```
+
+## License
+
+DataMind is currently proprietary and all rights are reserved. See [LICENSE](LICENSE).

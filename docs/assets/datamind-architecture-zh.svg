@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="795" viewBox="0 0 1400 795" role="img" aria-labelledby="title desc">
+  <title id="title">DataMind architecture</title>
+  <desc id="desc">DataMind product, API, data-agent workflow, and infrastructure architecture.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse" markerUnits="strokeWidth">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#64748b"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
+      .layer { font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .card-title { font-weight: 700; }
+      .card-detail { font-size: 15px; font-weight: 500; }
+      .arrow { stroke: #64748b; stroke-width: 2; fill: none; }
+      .arrow.muted { stroke: #94a3b8; stroke-width: 1.7; }
+      .shared-connection { stroke: #64748b; stroke-width: 1.7; fill: none; }
+      .flow-label { font-size: 14px; font-weight: 700; fill: #475569; }
+      .service-bus { font-size: 14px; font-weight: 700; fill: #334155; }
+    </style>
+  </defs>
+  <rect width="1400" height="795" fill="#ffffff"/>
+
+    <rect x="16" y="16" width="1368" height="150" rx="8" fill="#f8fffc" stroke="#dbe4ef"/>
+    <text x="34" y="43" class="layer">产品交互层</text>
+
+    <rect x="16" y="181" width="1368" height="140" rx="8" fill="#f8fbff" stroke="#dbe4ef"/>
+    <text x="34" y="208" class="layer">API 与控制平面</text>
+
+    <rect x="16" y="336" width="1368" height="220" rx="8" fill="#fbfdfc" stroke="#dbe4ef"/>
+    <text x="34" y="363" class="layer">LangGraph 数据智能体运行时</text>
+
+    <rect x="16" y="571" width="1368" height="208" rx="8" fill="#fafbfc" stroke="#dbe4ef"/>
+    <text x="34" y="598" class="layer">持久服务与执行边界</text>
+
+    <rect x="63" y="66" width="290" height="76" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+    <text x="208" y="102" text-anchor="middle" class="card-title" font-size="20" fill="#064e3b">数据工作台</text>
+    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="208" y="136">上传 · 清洗 · 关系</tspan></text>
+
+    <rect x="388" y="66" width="290" height="76" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+    <text x="533" y="102" text-anchor="middle" class="card-title" font-size="20" fill="#064e3b">分析任务</text>
+    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="533" y="136">Workflow · 历史 · Trace</tspan></text>
+
+    <rect x="713" y="66" width="290" height="76" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+    <text x="858" y="102" text-anchor="middle" class="card-title" font-size="20" fill="#064e3b">分析报告</text>
+    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="858" y="136">证据 · 版本 · 导出</tspan></text>
+
+    <rect x="1038" y="66" width="290" height="76" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+    <text x="1183" y="102" text-anchor="middle" class="card-title" font-size="20" fill="#064e3b">Kimi 助手</text>
+    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="1183" y="136">问答 · 执行 · 附件</tspan></text>
+
+    <rect x="63" y="221" width="290" height="76" rx="8" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+    <text x="208" y="257" text-anchor="middle" class="card-title" font-size="20" fill="#1e3a8a">FastAPI API</text>
+    <text text-anchor="middle" class="card-detail" fill="#1e3a8a"><tspan x="208" y="291">类型化 HTTP 契约</tspan></text>
+
+    <rect x="388" y="221" width="290" height="76" rx="8" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+    <text x="533" y="257" text-anchor="middle" class="card-title" font-size="20" fill="#1e3a8a">会话安全</text>
+    <text text-anchor="middle" class="card-detail" fill="#1e3a8a"><tspan x="533" y="291">Cookie · CSRF · 限流</tspan></text>
+
+    <rect x="713" y="221" width="290" height="76" rx="8" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+    <text x="858" y="257" text-anchor="middle" class="card-title" font-size="20" fill="#1e3a8a">权限服务</text>
+    <text text-anchor="middle" class="card-detail" fill="#1e3a8a"><tspan x="858" y="291">范围 · 授权 · 审计</tspan></text>
+
+    <rect x="1038" y="221" width="290" height="76" rx="8" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+    <text x="1183" y="257" text-anchor="middle" class="card-title" font-size="20" fill="#1e3a8a">任务控制</text>
+    <text text-anchor="middle" class="card-detail" fill="#1e3a8a"><tspan x="1183" y="291">SSE · 取消 · 重试 · 恢复</tspan></text>
+
+    <rect x="22" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="112" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">清洗 Loop</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="112" y="452">决策 · 执行</tspan><tspan x="112" y="473">门禁 · 提交</tspan></text>
+
+    <rect x="218" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="308" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Planner</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="308" y="452">画像 · 语义计划</tspan><tspan x="308" y="473">分析契约</tspan></text>
+
+    <rect x="414" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="504" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">分析 Loop</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="504" y="452">安全 SQL · Python</tspan><tspan x="504" y="473">修复 · 图表</tspan></text>
+
+    <rect x="610" y="386" width="180" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+    <text x="700" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#78350f">验证器</text>
+    <text text-anchor="middle" class="card-detail" fill="#78350f"><tspan x="700" y="452">粒度 · 统计</tspan><tspan x="700" y="473">证据</tspan></text>
+
+    <rect x="806" y="386" width="180" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+    <text x="896" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#78350f">Reviewer</text>
+    <text text-anchor="middle" class="card-detail" fill="#78350f"><tspan x="896" y="452">对抗</tspan><tspan x="896" y="473">审查</tspan></text>
+
+    <rect x="1002" y="386" width="180" height="120" rx="8" fill="#faf5ff" stroke="#c084fc" stroke-width="2"/>
+    <text x="1092" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#581c87">报告 Loop</text>
+    <text text-anchor="middle" class="card-detail" fill="#581c87"><tspan x="1092" y="452">草稿 · 修复</tspan><tspan x="1092" y="473">验证 · 提交</tspan></text>
+
+    <rect x="1198" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="1288" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Assistant Graph</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="1288" y="452">检索 · 工具</tspan><tspan x="1288" y="473">确认 · 回答</tspan></text>
+
+    <rect x="22" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="112" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">数据存储</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="112" y="714">PostgreSQL · SQLite</tspan><tspan x="112" y="735">资产 · 版本 · 报告</tspan></text>
+
+    <rect x="218" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="308" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">BGE Embedding</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="308" y="714">中文语义排序</tspan><tspan x="308" y="735">用户隔离缓存</tspan></text>
+
+    <rect x="414" y="648" width="180" height="124" rx="8" fill="#fff7ed" stroke="#fb923c" stroke-width="2"/>
+    <text x="504" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#7c2d12">Python Runner</text>
+    <text text-anchor="middle" class="card-detail" fill="#7c2d12"><tspan x="504" y="714">一次性容器</tspan><tspan x="504" y="735">禁止网络</tspan></text>
+
+    <rect x="610" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="700" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">Checkpoint</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="700" y="714">恢复 · 幂等</tspan><tspan x="700" y="735">有序事件</tspan></text>
+
+    <rect x="806" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="896" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">工具运行时</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="896" y="714">Schema · 策略</tspan><tspan x="896" y="735">调用控制</tspan></text>
+
+    <rect x="1002" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="1092" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">LLM Provider</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="1092" y="714">DeepSeek · Kimi</tspan><tspan x="1092" y="735">按角色路由</tspan></text>
+
+    <rect x="1198" y="648" width="180" height="124" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="1288" y="684" text-anchor="middle" class="card-title" font-size="17" fill="#334155">Redis + Celery</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="1288" y="714">Broker · Worker</tspan><tspan x="1288" y="735">Beat</tspan></text>
+<line x1="700" y1="166" x2="700" y2="221" class="arrow" marker-end="url(#arrow)"/>
+<text x="735" y="198" text-anchor="middle" class="flow-label">HTTPS</text>
+<line x1="700" y1="321" x2="700" y2="386" class="arrow" marker-end="url(#arrow)"/>
+<text x="750" y="357" text-anchor="middle" class="flow-label">任务调度</text>
+<line x1="202" y1="446" x2="218" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="398" y1="446" x2="414" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="594" y1="446" x2="610" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="790" y1="446" x2="806" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="986" y1="446" x2="1002" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="1182" y1="446" x2="1198" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<rect x="226" y="604" width="948" height="30" rx="8" fill="#eef2f7" stroke="#94a3b8"/>
+<text x="700" y="624" text-anchor="middle" class="service-bus">共享运行支撑 · 调用 · 状态 · 队列 · 事件</text>
+<line x1="700" y1="556" x2="700" y2="604" class="shared-connection" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+<line x1="112" y1="634" x2="112" y2="648" class="shared-connection"/>
+<line x1="308" y1="634" x2="308" y2="648" class="shared-connection"/>
+<line x1="504" y1="634" x2="504" y2="648" class="shared-connection"/>
+<line x1="700" y1="634" x2="700" y2="648" class="shared-connection"/>
+<line x1="896" y1="634" x2="896" y2="648" class="shared-connection"/>
+<line x1="1092" y1="634" x2="1092" y2="648" class="shared-connection"/>
+<line x1="1288" y1="634" x2="1288" y2="648" class="shared-connection"/>
+<path d="M 1092 506 C 1092 548, 308 548, 308 506" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<text x="700" y="542" text-anchor="middle" class="flow-label">修复 / 重规划</text>
+</svg>
