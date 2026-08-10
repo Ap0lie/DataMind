@@ -423,6 +423,10 @@ for (const submitMethod of ["click", "enter"] as const) {
 test("Kimi initialization disables manual creation and produces one active conversation", async ({ page }, testInfo) => {
   let initialConversationRead = true;
   let creationPosts = 0;
+  let releaseInitialConversationRead!: () => void;
+  const initialConversationReadGate = new Promise<void>((resolve) => {
+    releaseInitialConversationRead = resolve;
+  });
   page.on("request", (request) => {
     if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/assistant/conversations")) {
       creationPosts += 1;
@@ -433,7 +437,7 @@ test("Kimi initialization disables manual creation and produces one active conve
   await page.route("**/api/v1/assistant/conversations", async (route) => {
     if (route.request().method() === "GET" && initialConversationRead) {
       initialConversationRead = false;
-      await new Promise((resolve) => setTimeout(resolve, 350));
+      await initialConversationReadGate;
       await route.fulfill({ contentType: "application/json", body: JSON.stringify({ conversations: [] }) });
       return;
     }
@@ -448,6 +452,7 @@ test("Kimi initialization disables manual creation and produces one active conve
   const newConversation = page.getByRole("button", { name: "新建对话" });
   await expect(newConversation).toBeDisabled();
   await newConversation.evaluate((button) => button.click());
+  releaseInitialConversationRead();
 
   await expect.poll(() => creationPosts).toBe(1);
   await expect(page.locator(".assistant-conversation")).toHaveCount(1);
