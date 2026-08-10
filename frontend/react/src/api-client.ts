@@ -1,4 +1,7 @@
 const AUTH_STORAGE_KEY = "datamind.authUser.v1";
+export const AUTH_EXPIRED_EVENT = "datamind:auth-expired";
+const GET_RETRY_ATTEMPTS = 2;
+const GET_RETRY_DELAY_MS = 350;
 
 export const API_BASE_URL =
   import.meta.env.VITE_DATAMIND_API_BASE_URL ?? "http://127.0.0.1:8010/api/v1";
@@ -12,13 +15,30 @@ export type AuthUser = {
 };
 
 export async function apiGet<T>(path: string): Promise<T> {
-  try {
-    const response = await fetchApi(path);
-    if (!response.ok) throw new Error(await readableError(response));
-    return (await response.json()) as T;
-  } catch (error) {
-    throw normalizeFetchError(error);
+  let lastError: unknown = new Error("Request failed.");
+  for (let attempt = 0; attempt < GET_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetchApi(path);
+      if (!response.ok) {
+        const error = new Error(await readableError(response));
+        if (attempt + 1 < GET_RETRY_ATTEMPTS && isTransientGetStatus(response.status)) {
+          lastError = error;
+          await waitForGetRetry(attempt);
+          continue;
+        }
+        throw error;
+      }
+      return (await response.json()) as T;
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < GET_RETRY_ATTEMPTS && isFetchNetworkError(error)) {
+        await waitForGetRetry(attempt);
+        continue;
+      }
+      throw normalizeFetchError(error);
+    }
   }
+  throw normalizeFetchError(lastError);
 }
 
 export function apiFetch(path: string, init?: RequestInit): Promise<Response> {
@@ -105,9 +125,13 @@ export async function apiDelete(path: string): Promise<void> {
   }
 }
 
-export async function logoutSession(): Promise<void> {
+export async function logoutSession(): Promise<"logged_out" | "reauthenticate"> {
   const response = await fetchApi("/auth/logout", { method: "POST" });
-  if (!response.ok && response.status !== 401) throw new Error(await readableError(response));
+  if (response.ok) return "logged_out";
+  if (response.status === 401 || await isCsrfValidationFailure(response)) {
+    return "reauthenticate";
+  }
+  throw new Error(await readableError(response));
 }
 
 export type CleaningJobEvent = {
@@ -138,6 +162,8 @@ export type CleaningJob = {
   error?: string | null;
   cleaning_run_id?: string | null;
   last_event_sequence?: number;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
 export async function runDatasetCleaning(
@@ -190,6 +216,7 @@ function streamCleaningJob(
   return new Promise((resolve, reject) => {
     let settled = false;
     let refreshing = false;
+    let terminalEventReceived = false;
     let lastJob = initial;
     const cursor = initial.last_event_sequence ?? 0;
     const source = new EventSource(
@@ -218,8 +245,15 @@ function streamCleaningJob(
       }
     };
     source.addEventListener("cleaning", () => void refresh());
-    source.addEventListener("end", () => void refresh());
-    source.onerror = () => finish(new Error("Cleaning event stream disconnected."));
+    source.addEventListener("end", () => {
+      terminalEventReceived = true;
+      source.close();
+      void refresh();
+    });
+    source.onerror = () => {
+      if (terminalEventReceived) return;
+      finish(new Error("Cleaning event stream disconnected."));
+    };
   });
 }
 
@@ -257,10 +291,35 @@ export function saveAuthUser(user: AuthUser | null) {
 async function fetchApi(path: string, init?: RequestInit) {
   const requestInit = withAuthHeader(init);
   try {
-    return await fetch(`${API_BASE_URL}${path}`, requestInit);
+    const response = await fetch(`${API_BASE_URL}${path}`, requestInit);
+    await notifyAuthenticationFailure(path, response);
+    return response;
   } catch (error) {
     if (!isFetchNetworkError(error) || !API_FALLBACK_BASE_URL || requestInit.signal?.aborted) throw error;
-    return fetch(`${API_FALLBACK_BASE_URL}${path}`, requestInit);
+    const response = await fetch(`${API_FALLBACK_BASE_URL}${path}`, requestInit);
+    await notifyAuthenticationFailure(path, response);
+    return response;
+  }
+}
+
+async function notifyAuthenticationFailure(path: string, response: Response) {
+  if (path === "/auth/login") return;
+  if (response.status === 401) {
+    window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+    return;
+  }
+  if (response.status !== 403) return;
+  if (await isCsrfValidationFailure(response)) {
+    window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+  }
+}
+
+async function isCsrfValidationFailure(response: Response) {
+  try {
+    const payload = await response.clone().json() as { detail?: { code?: unknown } };
+    return payload.detail?.code === "csrf_validation_failed";
+  } catch {
+    return false;
   }
 }
 
@@ -280,7 +339,24 @@ function localApiFallback(baseUrl: string) {
 }
 
 function isFetchNetworkError(error: unknown) {
-  return error instanceof TypeError && error.message.toLowerCase().includes("failed to fetch");
+  if (!(error instanceof Error) || error.name !== "TypeError") return false;
+  const message = error.message.trim().toLowerCase();
+  return [
+    "failed to fetch",
+    "load failed",
+    "network request failed",
+    "networkerror",
+    "network error",
+    "type error",
+  ].some((fragment) => message.includes(fragment));
+}
+
+function isTransientGetStatus(status: number) {
+  return [408, 502, 503, 504].includes(status);
+}
+
+function waitForGetRetry(attempt: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, GET_RETRY_DELAY_MS * (attempt + 1)));
 }
 
 async function readableError(response: Response) {
@@ -301,6 +377,9 @@ function normalizeFetchError(error: unknown) {
     return new Error("请求超时：本次操作耗时较长，请稍后重试，或确认后端服务仍在运行。");
   }
   if (isFetchNetworkError(error)) {
+    if (API_BASE_URL.startsWith("/")) {
+      return new Error("数据同步暂时中断，请检查网络连接后重试。");
+    }
     const fallbackText = API_FALLBACK_BASE_URL ? `；也已尝试备用地址 ${API_FALLBACK_BASE_URL}` : "";
     return new Error(`无法连接后端服务：请确认 FastAPI 已启动，并且前端 API 地址为 ${API_BASE_URL}${fallbackText}。`);
   }

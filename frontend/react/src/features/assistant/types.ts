@@ -12,6 +12,17 @@ export const ASSISTANT_FULL_CAPABILITIES: AssistantCapability[] = [
   "asset_recycle",
 ];
 
+export const ASSISTANT_CAPABILITIES_BY_ASSET: Record<AssistantAssetType, AssistantCapability[]> = {
+  dataset: ["data_prepare", "analysis_manage", "report_manage", "semantic_manage", "asset_recycle"],
+  dataset_group: ASSISTANT_FULL_CAPABILITIES,
+  report: ["analysis_manage", "report_manage", "asset_recycle"],
+  semantic_model: ["semantic_manage", "asset_recycle"],
+};
+
+export function assistantCapabilitiesForAsset(assetType: AssistantAssetType): AssistantCapability[] {
+  return ASSISTANT_CAPABILITIES_BY_ASSET[assetType];
+}
+
 export type AssistantConversation = {
   conversation_id: string;
   title: string;
@@ -19,6 +30,7 @@ export type AssistantConversation = {
   scope_id?: string | null;
   summary: string;
   active_run_id?: string | null;
+  active_run_status?: string | null;
   created_at: string;
   updated_at: string;
   last_message_at?: string | null;
@@ -31,6 +43,10 @@ export type AssistantCitation = {
   excerpt: string;
   dataset_id?: string | null;
   artifact_role?: "evidence" | "deliverable";
+  reliability?: {
+    status: "verified" | "warning" | "rejected" | "unverified";
+    summary: string;
+  };
 };
 
 export type AssistantAttachment = {
@@ -94,7 +110,7 @@ export type AssistantEvent = {
   created_at: string;
 };
 
-export type AssistantScopeAsset = { id: string; name: string };
+export type AssistantScopeAsset = { id: string; name: string; description?: string };
 
 export type AssistantPermissionGrant = {
   grant_id: string;

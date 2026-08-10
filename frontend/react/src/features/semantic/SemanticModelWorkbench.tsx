@@ -35,11 +35,18 @@ type SemanticModel = {
 };
 
 type SemanticField = {
-  id: string;
-  name: string;
+  field_id?: string;
+  id?: string;
+  name?: string;
   source_name?: string;
   type?: string;
   role?: string;
+};
+
+type SemanticFieldOption = SemanticField & {
+  field_id: string;
+  entity_id: string;
+  entity_name: string;
 };
 
 type SemanticEntity = {
@@ -289,7 +296,17 @@ function VisualSemanticEditor({ definition, editable, onChange }: { definition: 
   const dimensions = definition.dimensions ?? [];
   const relationships = definition.relationships ?? [];
   const entityNames = useMemo(() => new Map(entities.map((item) => [item.id, item.name])), [entities]);
-  const fields = useMemo(() => entities.flatMap((entity) => (entity.fields ?? []).map((field) => ({ ...field, entity_id: entity.id, entity_name: entity.name }))), [entities]);
+  const fields = useMemo<SemanticFieldOption[]>(
+    () => entities.flatMap((entity) =>
+      (entity.fields ?? []).flatMap((field) => {
+        const fieldId = semanticFieldId(field);
+        return fieldId
+          ? [{ ...field, field_id: fieldId, entity_id: entity.id, entity_name: entity.name }]
+          : [];
+      }),
+    ),
+    [entities],
+  );
 
   const updateCollection = <T,>(key: "entities" | "metrics" | "dimensions" | "relationships", id: string, patch: Partial<T>) => {
     const collection = (definition[key] ?? []) as Array<T & { id: string }>;
@@ -338,11 +355,13 @@ function VisualSemanticEditor({ definition, editable, onChange }: { definition: 
             <thead className="bg-slate-50 text-xs font-black text-slate-500"><tr><th className="p-3">名称</th><th className="p-3">别名</th><th className="p-3">聚合</th><th className="p-3">来源字段</th><th className="p-3">单位</th><th className="p-3">格式</th></tr></thead>
             <tbody>{metrics.map((metric) => {
               const binding = metricBinding(metric);
+              const bindingValue = metricBindingValue(binding.entityId, binding.fieldId);
+              const bindingExists = fields.some((field) => metricBindingValue(field.entity_id, field.field_id) === bindingValue);
               return <tr key={metric.id} className="border-t border-slate-200 bg-white">
                 <td className="p-3"><input className="input py-2" value={metric.name} disabled={!editable} onChange={(event) => updateCollection<SemanticMetric>("metrics", metric.id, { name: event.target.value })} /></td>
                 <td className="p-3"><input className="input py-2" value={(metric.aliases ?? []).join("、")} disabled={!editable} onChange={(event) => updateCollection<SemanticMetric>("metrics", metric.id, { aliases: splitAliases(event.target.value) })} /></td>
                 <td className="p-3"><select className="input py-2" value={binding.op} disabled={!editable || !binding.fieldId} onChange={(event) => updateCollection<SemanticMetric>("metrics", metric.id, { formula: replaceMetricBinding(metric.formula, event.target.value, binding.entityId, binding.fieldId) })}>{AGGREGATIONS.map((item) => <option key={item}>{item}</option>)}</select></td>
-                <td className="p-3"><select className="input py-2" value={`${binding.entityId}:${binding.fieldId}`} disabled={!editable || !binding.fieldId} onChange={(event) => { const [entityId, fieldId] = event.target.value.split(":", 2); updateCollection<SemanticMetric>("metrics", metric.id, { formula: replaceMetricBinding(metric.formula, binding.op, entityId, fieldId) }); }}>{fields.map((field) => <option key={`${field.entity_id}:${field.id}`} value={`${field.entity_id}:${field.id}`}>{field.entity_name} · {field.source_name ?? field.name}</option>)}</select></td>
+                <td className="p-3"><select aria-label={`${metric.name} 来源字段`} className="input py-2" value={bindingExists ? bindingValue : ""} disabled={!editable} onChange={(event) => { const [entityId, fieldId] = parseMetricBindingValue(event.target.value); updateCollection<SemanticMetric>("metrics", metric.id, { formula: replaceMetricBinding(metric.formula, binding.op, entityId, fieldId) }); }}><option value="" disabled>未绑定</option>{fields.map((field) => { const optionValue = metricBindingValue(field.entity_id, field.field_id); return <option key={optionValue} value={optionValue}>{field.entity_name} · {field.source_name ?? field.name ?? field.field_id}</option>; })}</select></td>
                 <td className="p-3"><input className="input py-2" value={metric.unit ?? ""} disabled={!editable} onChange={(event) => updateCollection<SemanticMetric>("metrics", metric.id, { unit: event.target.value })} /></td>
                 <td className="p-3"><select className="input py-2" value={metric.format ?? "number"} disabled={!editable} onChange={(event) => updateCollection<SemanticMetric>("metrics", metric.id, { format: event.target.value })}><option value="number">数值</option><option value="currency">货币</option><option value="percent">百分比</option><option value="integer">整数</option></select></td>
               </tr>;
@@ -378,6 +397,26 @@ function metricBinding(metric: SemanticMetric) {
 function replaceMetricBinding(formula: Record<string, unknown> | undefined, op: string, entityId: string, fieldId: string) {
   if (!fieldId) return formula ?? {};
   return { op, expr: { op: "field", entity_id: entityId, field_id: fieldId } };
+}
+
+function semanticFieldId(field: SemanticField) {
+  return String(field.field_id ?? field.id ?? "");
+}
+
+function metricBindingValue(entityId: string, fieldId: string) {
+  return JSON.stringify([entityId, fieldId]);
+}
+
+function parseMetricBindingValue(value: string): [string, string] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (Array.isArray(parsed) && parsed.length === 2) {
+      return [String(parsed[0] ?? ""), String(parsed[1] ?? "")];
+    }
+  } catch {
+    // Invalid option values are treated as unbound instead of corrupting the DSL.
+  }
+  return ["", ""];
 }
 
 function isObject(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }

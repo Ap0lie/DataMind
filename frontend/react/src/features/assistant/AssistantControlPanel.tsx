@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArchiveRestore, History, Loader2, RotateCcw, ShieldCheck, Undo2, X } from "lucide-react";
 import { apiDelete, apiGet, apiPost } from "../../api-client";
-import { ASSISTANT_FULL_CAPABILITIES } from "./types";
+import { assistantCapabilitiesForAsset } from "./types";
 import type {
   AssistantAction,
   AssistantAssetType,
@@ -25,6 +25,8 @@ type Props = {
   open: boolean;
   onClose: () => void;
   onSummaryChange?: (summary: { grants: number; actions: number; recycled: number }) => void;
+  onAssetsChanged?: () => void | Promise<void>;
+  refreshToken?: number;
   scopeType: AssistantScopeType;
   scopeId?: string | null;
   datasets: AssistantScopeAsset[];
@@ -32,7 +34,7 @@ type Props = {
   reports: AssistantScopeAsset[];
 };
 
-export function AssistantControlPanel({ open, onClose, onSummaryChange, scopeType, scopeId, datasets, datasetGroups, reports }: Props) {
+export function AssistantControlPanel({ open, onClose, onSummaryChange, onAssetsChanged, refreshToken, scopeType, scopeId, datasets, datasetGroups, reports }: Props) {
   const [tab, setTab] = useState<"permissions" | "actions" | "recycle">("permissions");
   const [grants, setGrants] = useState<AssistantPermissionGrant[]>([]);
   const [actions, setActions] = useState<AssistantAction[]>([]);
@@ -55,9 +57,15 @@ export function AssistantControlPanel({ open, onClose, onSummaryChange, scopeTyp
   const effectiveGrant = scopedAsset
     ? grants.find((item) => item.status === "active" && item.asset_type === scopedAsset.type && item.asset_id === scopedAsset.id)
     : null;
+  const targetAssetType = scopedAsset?.type ?? (
+    effectiveTarget ? effectiveTarget.split(":", 1)[0] as AssistantAssetType : null
+  );
+  const targetCapabilities = targetAssetType
+    ? assistantCapabilitiesForAsset(targetAssetType)
+    : [];
   const missingCapabilities = scopedAsset
-    ? ASSISTANT_FULL_CAPABILITIES.filter((capability) => !effectiveGrant?.capabilities.includes(capability))
-    : ASSISTANT_FULL_CAPABILITIES;
+    ? targetCapabilities.filter((capability) => !effectiveGrant?.capabilities.includes(capability))
+    : targetCapabilities;
   const fullyAuthorized = Boolean(scopedAsset && missingCapabilities.length === 0);
 
   useEffect(() => {
@@ -91,7 +99,7 @@ export function AssistantControlPanel({ open, onClose, onSummaryChange, scopeTyp
   useEffect(() => {
     if (!open) return;
     void refresh().catch((cause) => setError(messageOf(cause)));
-  }, [open, scopeId, scopeType]);
+  }, [open, refreshToken, scopeId, scopeType]);
 
   const grant = async () => {
     if (!effectiveTarget) return;
@@ -99,7 +107,11 @@ export function AssistantControlPanel({ open, onClose, onSummaryChange, scopeTyp
     setBusyKey("grant");
     setError(null);
     try {
-      await apiPost("/assistant/permission-grants", { asset_type: assetType, asset_id: assetId, capabilities: ASSISTANT_FULL_CAPABILITIES });
+      await apiPost("/assistant/permission-grants", {
+        asset_type: assetType,
+        asset_id: assetId,
+        capabilities: assistantCapabilitiesForAsset(assetType),
+      });
       await refresh();
     } catch (cause) {
       setError(messageOf(cause));
@@ -124,7 +136,7 @@ export function AssistantControlPanel({ open, onClose, onSummaryChange, scopeTyp
     setBusyKey(`action:${actionId}`);
     try {
       await apiPost(`/assistant/actions/${actionId}/undo`, {});
-      await refresh();
+      await Promise.all([refresh(), onAssetsChanged?.()]);
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -136,7 +148,7 @@ export function AssistantControlPanel({ open, onClose, onSummaryChange, scopeTyp
     setBusyKey(`recycle:${asset.asset_type}:${asset.asset_id}`);
     try {
       await apiPost(`/assistant/recycle-bin/${asset.asset_type}/${asset.asset_id}/restore`, {});
-      await refresh();
+      await Promise.all([refresh(), onAssetsChanged?.()]);
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -164,12 +176,12 @@ export function AssistantControlPanel({ open, onClose, onSummaryChange, scopeTyp
             <section className="assistant-grant-form">
               <div className="assistant-grant-heading">
                 <div><h3>{scopedAsset ? "当前范围权限" : "执行权限"}</h3><p>{scopedAsset ? "读取范围与执行权限已对齐到同一资产。切换顶部范围后，这里会同步更新。" : "自动检索可以读取相关资产；执行修改前仍需选择一个具体资产授权。"}</p></div>
-                {scopedAsset && <span className={`assistant-grant-status ${fullyAuthorized ? "complete" : effectiveGrant ? "partial" : "missing"}`}>{fullyAuthorized ? "已完整授权" : effectiveGrant ? `缺少 ${missingCapabilities.length} 项` : "尚未授权"}</span>}
+                {scopedAsset && <span className={`assistant-grant-status ${fullyAuthorized ? "complete" : effectiveGrant ? "partial" : "missing"}`}>{fullyAuthorized ? "当前范围权限已齐备" : effectiveGrant ? `缺少 ${missingCapabilities.length} 项` : "尚未授权"}</span>}
               </div>
               {scopedAsset ? (
                 <div className="assistant-current-grant">
                   <div className="assistant-current-grant-asset"><span><ShieldCheck size={17} /></span><div><small>{formatType(scopedAsset.type)} · 当前对话范围</small><b>{scopedAsset.name}</b></div></div>
-                  <p>{fullyAuthorized ? "Kimi 可在质量门禁与确认规则内管理此资产。" : effectiveGrant ? `待补全：${missingCapabilities.map((value) => capabilityLabels[value]).join("、")}` : "当前仅可读取；授权后才能清洗、分析、修改报告或管理语义模型。"}</p>
+                  <p>{fullyAuthorized ? "Kimi 可使用该资产类型允许的全部能力，并继续受质量门禁与确认规则约束。" : effectiveGrant ? `待补全：${missingCapabilities.map((value) => capabilityLabels[value]).join("、")}` : "当前仅可读取；授权后才能使用该资产类型允许的执行能力。"}</p>
                   <button type="button" disabled={fullyAuthorized || busyKey === "grant"} onClick={() => void grant()}>{busyKey === "grant" ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />} {fullyAuthorized ? "已授权当前范围" : effectiveGrant ? "补全当前范围权限" : "授权当前范围"}</button>
                 </div>
               ) : (

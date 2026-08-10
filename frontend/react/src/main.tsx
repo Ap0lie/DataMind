@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -21,10 +21,12 @@ import {
   PanelLeftOpen,
   Play,
   Plus,
+  RefreshCw,
   Search,
   Sparkles,
   SquarePen,
   Table2,
+  TriangleAlert,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -32,6 +34,14 @@ import "./styles.css";
 import { AgentLoopPanel } from "./agent-loop-ui";
 import { CleaningLoopPanel } from "./cleaning-loop-ui";
 import { AssistantPage } from "./features/assistant/AssistantPage";
+import type { AssistantRun } from "./features/assistant/types";
+import {
+  AnalysisReliabilityPanel,
+  type AnalysisContract,
+  type AnalysisLineage,
+  type StatisticalVerification,
+} from "./features/analysis/AnalysisReliabilityPanel";
+import { DriftMonitorPanel } from "./features/data-reliability/DriftMonitorPanel";
 import { SemanticModelWorkbench } from "./features/semantic/SemanticModelWorkbench";
 import {
   CleaningRuleEditor as DatasetCleaningRuleEditor,
@@ -52,6 +62,7 @@ import {
 } from "./features/reports/report-templates";
 import {
   API_BASE_URL,
+  AUTH_EXPIRED_EVENT,
   apiDelete,
   apiGet,
   apiPatch,
@@ -69,6 +80,7 @@ import {
   agentStatusClass,
   buildWorkflowLogEntries,
   combinedWorkflowStatus,
+  deriveAnalysisComponents,
   deriveAgentWorkflowViews,
   isActiveAnalysisJob,
   jobStageLabel,
@@ -144,12 +156,20 @@ type DatasetJoinConfig = {
 };
 
 type DatasetRelationshipPlan = DatasetJoinConfig & {
+  relationship_id?: string | null;
   enabled?: boolean;
   confidence?: number;
   source?: string;
   reason?: string;
   relationship_type?: "one_to_one" | "one_to_many" | "many_to_one" | "many_to_many" | "unknown";
   risk_note?: string;
+  baseline_match_rate?: number | null;
+  last_match_rate?: number | null;
+  match_rate_drift?: number;
+  freshness_status?: "fresh" | "warning" | "stale";
+  stale_reason?: string;
+  last_validated_at?: string | null;
+  drift_event_id?: string | null;
 };
 
 type DatasetReference = {
@@ -364,6 +384,9 @@ type StructuredReport = {
     execution_result?: Record<string, unknown>;
     validation_status?: string;
   }[];
+  analysis_contract?: AnalysisContract | null;
+  statistical_verification?: StatisticalVerification | null;
+  analysis_lineage?: AnalysisLineage | null;
 };
 
 type AnalysisResponse = {
@@ -373,6 +396,9 @@ type AnalysisResponse = {
   question: string;
   multimodal_inputs?: MultimodalInput[];
   planner_metadata?: PlannerMetadata | null;
+  analysis_contract?: AnalysisContract | null;
+  statistical_verification?: StatisticalVerification | null;
+  analysis_lineage?: AnalysisLineage | null;
   multi_dataset_context?: MultiDatasetContext | null;
   sql_result?: { sql: string; rows: Record<string, unknown>[]; explanation: string } | null;
   python_result?: {
@@ -384,6 +410,7 @@ type AnalysisResponse = {
   structured_report?: Record<string, unknown> | null;
   html_report?: string | null;
   report_markdown: string;
+  sql_source?: string | null;
   python_source?: string | null;
   python_generated_code?: string | null;
   python_execution_error?: string | null;
@@ -485,8 +512,19 @@ type ApiState<T> = {
   error: string | null;
 };
 
+type ActiveTask = {
+  id: string;
+  kind: "analysis" | "cleaning" | "assistant";
+  page: Page;
+  title: string;
+  stage: string;
+  progress: number;
+  updatedAt: string;
+};
+
 function App() {
   const [authUser, setAuthUser] = useState<AuthUser | null>(() => loadAuthUser());
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
   const [page, setPage] = useState<Page>("首页");
   const [datasets, setDatasets] = useState<ApiState<Dataset[]>>({
     data: null,
@@ -513,6 +551,11 @@ function App() {
     loading: true,
     error: null,
   });
+  const [cleaningJobs, setCleaningJobs] = useState<ApiState<CleaningJob[]>>({
+    data: null,
+    loading: true,
+    error: null,
+  });
   const [activeDatasetId, setActiveDatasetId] = useState<string | null>(null);
   const [datasetWorkspaceView, setDatasetWorkspaceView] = useState<DatasetWorkspaceView>("assets");
   const [selectedAnalysisJobId, setSelectedAnalysisJobId] = useState<string | null>(null);
@@ -520,10 +563,26 @@ function App() {
     loadLatestAnalysisResult(),
   );
   const [assistantActiveRuns, setAssistantActiveRuns] = useState(0);
+  const [assistantActiveRun, setAssistantActiveRun] = useState<{
+    run: AssistantRun;
+    progress: number;
+  } | null>(null);
+  const handleAssistantActiveRunChange = useCallback(
+    (run: AssistantRun | null, progress: number) =>
+      setAssistantActiveRun(run ? { run, progress } : null),
+    [],
+  );
 
   const refresh = async () => {
     if (!authUser) return;
-    await Promise.all([loadDatasets(), loadDatasetGroups(), loadReportSummaries(), loadReports(), loadAnalysisJobs()]);
+    await Promise.all([
+      loadDatasets(),
+      loadDatasetGroups(),
+      loadReportSummaries(),
+      loadReports(),
+      loadAnalysisJobs(),
+      loadCleaningJobs(),
+    ]);
   };
 
   const loadDatasets = async () => {
@@ -537,7 +596,7 @@ function App() {
           : payload.datasets[0]?.dataset_id ?? null,
       );
     } catch (error) {
-      setDatasets({ data: null, loading: false, error: errorMessage(error) });
+      setDatasets((state) => ({ data: state.data, loading: false, error: errorMessage(error) }));
     }
   };
 
@@ -547,7 +606,7 @@ function App() {
       const payload = await apiGet<{ groups: DatasetGroup[] }>("/store/dataset-groups");
       setDatasetGroups({ data: payload.groups, loading: false, error: null });
     } catch (error) {
-      setDatasetGroups({ data: null, loading: false, error: errorMessage(error) });
+      setDatasetGroups((state) => ({ data: state.data, loading: false, error: errorMessage(error) }));
     }
   };
 
@@ -557,7 +616,7 @@ function App() {
       const payload = await apiGet<{ reports: Report[] }>("/store/reports?include_content=false");
       setReportSummaries({ data: payload.reports, loading: false, error: null });
     } catch (error) {
-      setReportSummaries({ data: null, loading: false, error: errorMessage(error) });
+      setReportSummaries((state) => ({ data: state.data, loading: false, error: errorMessage(error) }));
     }
   };
 
@@ -567,7 +626,7 @@ function App() {
       const payload = await apiGet<{ reports: Report[] }>("/store/reports");
       setReports({ data: payload.reports, loading: false, error: null });
     } catch (error) {
-      setReports({ data: null, loading: false, error: errorMessage(error) });
+      setReports((state) => ({ data: state.data, loading: false, error: errorMessage(error) }));
     }
   };
 
@@ -582,7 +641,20 @@ function App() {
         setAnalysisJobs({ data: [], loading: false, error: null });
         return;
       }
-      setAnalysisJobs({ data: null, loading: false, error: errorMessage(error) });
+      setAnalysisJobs((state) => ({ data: state.data, loading: false, error: message }));
+    }
+  };
+
+  const loadCleaningJobs = async () => {
+    try {
+      const payload = await apiGet<{ jobs: CleaningJob[] }>("/store/cleaning-jobs?limit=100");
+      setCleaningJobs({ data: payload.jobs, loading: false, error: null });
+    } catch (error) {
+      setCleaningJobs((state) => ({
+        data: state.data,
+        loading: false,
+        error: errorMessage(error),
+      }));
     }
   };
 
@@ -597,13 +669,19 @@ function App() {
     });
   };
 
-  useEffect(() => {
-    if (authUser) void refresh();
-  }, [authUser?.user_id]);
-
-  useEffect(() => {
-    saveLatestAnalysisResult(latestAnalysisResult);
-  }, [latestAnalysisResult]);
+  const updateCleaningJob = (job: CleaningJob) => {
+    setCleaningJobs((state) => {
+      const current = state.data ?? [];
+      const exists = current.some((item) => item.job_id === job.job_id);
+      return {
+        data: exists
+          ? current.map((item) => (item.job_id === job.job_id ? job : item))
+          : [job, ...current],
+        loading: false,
+        error: state.error,
+      };
+    });
+  };
 
   const login = async (username: string, password: string) => {
     const user = await apiPost<AuthUser & { created: boolean }>("/auth/login", { username, password });
@@ -614,17 +692,13 @@ function App() {
       expires_at: user.expires_at ?? null,
     };
     saveAuthUser(nextUser);
+    setSessionNotice(null);
     setAuthUser(nextUser);
     setActiveDatasetId(null);
     setLatestAnalysisResult(loadLatestAnalysisResult());
   };
 
-  const logout = async () => {
-    try {
-      await logoutSession();
-    } catch (error) {
-      console.warn("Server logout failed; clearing the local session.", error);
-    }
+  const clearLocalSession = () => {
     saveAuthUser(null);
     saveLatestAnalysisResult(null);
     setAuthUser(null);
@@ -637,21 +711,98 @@ function App() {
     setReports({ data: null, loading: false, error: null });
     setReportSummaries({ data: null, loading: false, error: null });
     setAnalysisJobs({ data: null, loading: false, error: null });
+    setCleaningJobs({ data: null, loading: false, error: null });
+    setAssistantActiveRun(null);
     setPage("首页");
   };
+
+  const logout = async () => {
+    try {
+      const result = await logoutSession();
+      if (result === "logged_out") setSessionNotice(null);
+    } catch (error) {
+      console.warn("Server logout failed; clearing the local session.", error);
+    }
+    clearLocalSession();
+  };
+
+  useEffect(() => {
+    if (authUser) void refresh();
+  }, [authUser?.user_id]);
+
+  useEffect(() => {
+    saveLatestAnalysisResult(latestAnalysisResult);
+  }, [latestAnalysisResult]);
+
+  useEffect(() => {
+    if (!authUser) return;
+    const hasActiveCleaning = (cleaningJobs.data ?? []).some((job) =>
+      ["queued", "running", "cancel_requested"].includes(job.status),
+    );
+    if (!hasActiveCleaning && assistantActiveRuns === 0) return;
+    const timer = window.setInterval(() => void loadCleaningJobs(), 2500);
+    return () => window.clearInterval(timer);
+  }, [authUser?.user_id, assistantActiveRuns, cleaningJobs.data]);
+
+  useEffect(() => {
+    const handleExpiredSession = () => {
+      setSessionNotice("登录状态已过期，请重新登录。");
+      clearLocalSession();
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, handleExpiredSession);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handleExpiredSession);
+  }, []);
 
   const datasetList = datasets.data ?? [];
   const datasetGroupList = datasetGroups.data ?? [];
   const reportList = reports.data ?? [];
   const summaryList = reportSummaries.data ?? [];
   const jobList = analysisJobs.data ?? [];
+  const cleaningJobList = cleaningJobs.data ?? [];
   const activeJobList = jobList
     .filter((job) => isActiveAnalysisJob(job))
     .sort((left, right) => String(right.updated_at ?? right.created_at ?? "").localeCompare(String(left.updated_at ?? left.created_at ?? "")));
-  const floatingJob = activeJobList[0] ?? null;
+  const activeCleaningJobList = cleaningJobList.filter((job) =>
+    ["queued", "running", "cancel_requested"].includes(job.status),
+  );
+  const activeTasks: ActiveTask[] = [
+    ...activeJobList.map((job) => ({
+      id: job.job_id,
+      kind: "analysis" as const,
+      page: "分析任务" as const,
+      title: job.question,
+      stage: jobStageLabel(job.current_stage),
+      progress: job.progress,
+      updatedAt: String(job.updated_at ?? job.created_at ?? ""),
+    })),
+    ...activeCleaningJobList.map((job) => ({
+      id: job.job_id,
+      kind: "cleaning" as const,
+      page: "数据集" as const,
+      title: `${datasetList.find((dataset) => dataset.dataset_id === job.dataset_id)?.name ?? "数据集"} 正在清洗`,
+      stage: cleaningStageLabel(job.current_stage),
+      progress: job.progress,
+      updatedAt: String(job.updated_at ?? job.created_at ?? ""),
+    })),
+  ];
+  if (assistantActiveRuns > 0) {
+    activeTasks.push({
+      id: assistantActiveRun?.run.run_id ?? "assistant-active",
+      kind: "assistant",
+      page: "Kimi",
+      title: "Kimi 正在处理当前任务",
+      stage: assistantActiveRun
+        ? assistantStageLabel(assistantActiveRun.run.current_stage)
+        : "Kimi 正在后台运行",
+      progress: assistantActiveRun?.progress ?? 8,
+      updatedAt: assistantActiveRun?.run.updated_at ?? "",
+    });
+  }
+  activeTasks.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const floatingTask = activeTasks.find((task) => task.page !== page) ?? null;
 
   if (!authUser) {
-    return <LoginPage onLogin={login} />;
+    return <LoginPage notice={sessionNotice} onLogin={login} />;
   }
 
   return (
@@ -677,6 +828,7 @@ function App() {
                 setLatestAnalysisResult(null);
                 setPage("分析任务");
               }}
+              onRetry={refresh}
             />
           )}
           <div className={page === "数据集" ? "" : "hidden"} aria-hidden={page !== "数据集"}>
@@ -690,6 +842,7 @@ function App() {
               error={datasets.error}
               workspaceView={datasetWorkspaceView}
               onWorkspaceViewChange={setDatasetWorkspaceView}
+              onCleaningJobUpdate={updateCleaningJob}
             />
           </div>
           <div className={page === "分析任务" ? "" : "hidden"} aria-hidden={page !== "分析任务"}>
@@ -715,6 +868,7 @@ function App() {
           {page === "报告" && (
             <ReportsPage
               datasets={datasetList}
+              datasetGroups={datasetGroupList}
               reports={reportList}
               loading={reports.loading}
               error={reports.error}
@@ -725,9 +879,14 @@ function App() {
             <AssistantPage
               datasets={datasetList.map((dataset) => ({ id: dataset.dataset_id, name: dataset.name }))}
               datasetGroups={datasetGroupList.map((group) => ({ id: group.group_id, name: group.name }))}
-              reports={summaryList.map((report) => ({ id: report.id, name: report.title }))}
+              reports={summaryList.map((report) => ({
+                id: report.id,
+                name: report.title,
+                description: `v${report.version ?? 1} · ${formatTime(report.created_at)}`,
+              }))}
               onActiveRunsChange={setAssistantActiveRuns}
-              onAssetsChanged={() => void refresh()}
+              onActiveRunChange={handleAssistantActiveRunChange}
+              onAssetsChanged={refresh}
               onOpenDataset={(datasetId) => {
                 setActiveDatasetId(datasetId);
                 setDatasetWorkspaceView("detail");
@@ -742,13 +901,15 @@ function App() {
           </div>
         </div>
       </main>
-      {page !== "分析任务" && floatingJob && (
+      {floatingTask && (
         <FloatingTaskProgress
-          job={floatingJob}
-          activeCount={activeJobList.length}
+          task={floatingTask}
+          activeCount={activeTasks.length}
           onOpen={() => {
-            setSelectedAnalysisJobId(floatingJob.job_id);
-            setPage("分析任务");
+            if (floatingTask.kind === "analysis") {
+              setSelectedAnalysisJobId(floatingTask.id);
+            }
+            setPage(floatingTask.page);
           }}
         />
       )}
@@ -756,7 +917,13 @@ function App() {
   );
 }
 
-function LoginPage({ onLogin }: { onLogin: (username: string, password: string) => Promise<void> }) {
+function LoginPage({
+  notice,
+  onLogin,
+}: {
+  notice?: string | null;
+  onLogin: (username: string, password: string) => Promise<void>;
+}) {
   const [username, setUsername] = useState("default");
   const [password, setPassword] = useState("");
   const [focus, setFocus] = useState<"idle" | "username" | "password">("idle");
@@ -843,7 +1010,11 @@ function LoginPage({ onLogin }: { onLogin: (username: string, password: string) 
             aria-invalid={!!error}
             aria-describedby={error ? "login-error" : undefined}
           />
-          {error && <div id="login-error"><Alert tone="error">{error}</Alert></div>}
+          {(error || notice) && (
+            <div id="login-error">
+              <Alert tone={error ? "error" : "info"}>{error ?? notice}</Alert>
+            </div>
+          )}
           <button type="submit" disabled={busy} className="login-button mt-6">
             <span>{busy ? "登录中" : "Log in"}</span>
             {busy ? <Loader2 className="animate-spin" size={18} /> : <span aria-hidden="true">→</span>}
@@ -943,11 +1114,17 @@ function Sidebar({
           退出
         </button>
       </nav>
-      <div className="mt-auto hidden space-y-4 text-center md:block">
+      <div className="mt-auto hidden w-full min-w-0 space-y-4 overflow-hidden text-center md:block">
         <div className="mx-auto grid h-10 w-10 place-items-center rounded-full border border-line bg-slate-100 text-sm font-black">
           {user.display_name.slice(0, 1).toUpperCase()}
         </div>
-        <div className="text-sm font-black">{user.display_name}</div>
+        <div
+          className="w-full min-w-0 truncate px-1 text-sm font-black"
+          data-testid="sidebar-account-name"
+          title={user.display_name}
+        >
+          {user.display_name}
+        </div>
         <button
           type="button"
           onClick={onLogout}
@@ -978,30 +1155,37 @@ function Topbar({ user }: { user: AuthUser }) {
 }
 
 function FloatingTaskProgress({
-  job,
+  task,
   activeCount,
   onOpen,
 }: {
-  job: AnalysisJob;
+  task: ActiveTask;
   activeCount: number;
   onOpen: () => void;
 }) {
-  const progress = Math.max(0, Math.min(job.progress, 100));
+  const progress = Math.max(0, Math.min(task.progress, 100));
+  const Icon = task.kind === "cleaning" ? Database : task.kind === "assistant" ? Sparkles : Loader2;
+  const motionClass = task.kind === "analysis" ? "animate-spin" : "animate-pulse";
+  const accessibleLabel = task.kind === "analysis"
+    ? `查看运行中的分析：${task.title}，${progress}%`
+    : task.kind === "cleaning"
+      ? `查看后台清洗进度，${progress}%`
+      : `查看后台助手进度，${progress}%`;
   return (
     <button
       type="button"
       className="floating-task-progress"
       onClick={onOpen}
-      aria-label={`查看运行中的分析：${job.question}，${progress}%`}
-      title="返回当前分析任务"
+      aria-label={accessibleLabel}
+      title={`前往${task.page}`}
     >
-      <span className="floating-task-icon"><Loader2 className="animate-spin" size={18} /></span>
+      <span className="floating-task-icon"><Icon className={motionClass} size={18} /></span>
       <span className="floating-task-copy">
         <span>
-          {activeCount > 1 ? `${activeCount} 个任务运行中` : jobStageLabel(job.current_stage)}
+          {activeCount > 1 ? `${activeCount} 个任务运行中` : task.stage}
           <b>{progress}%</b>
         </span>
-        <strong>{job.question}</strong>
+        <strong>{task.title}</strong>
       </span>
       <ArrowRight className="floating-task-arrow" size={17} />
       <span className="floating-task-track" aria-hidden="true">
@@ -1009,6 +1193,31 @@ function FloatingTaskProgress({
       </span>
     </button>
   );
+}
+
+function cleaningStageLabel(stage: string) {
+  const labels: Record<string, string> = {
+    queued: "等待清洗",
+    cleaning_bootstrap: "准备数据范围",
+    cleaning_decision: "选择清洗策略",
+    cleaning_execution: "执行清洗",
+    cleaning_validation: "验证清洗质量",
+    cleaning_repair: "修复清洗规则",
+    cleaning_commit: "保存清洗版本",
+  };
+  return labels[stage] ?? "自主清洗运行中";
+}
+
+function assistantStageLabel(stage: string) {
+  const labels: Record<string, string> = {
+    queued: "等待 Kimi 处理",
+    retrieve_context: "检索 DataMind 证据",
+    decide_tools: "规划工具调用",
+    execute_tool: "执行 DataMind 工具",
+    wait_analysis: "等待分析完成",
+    compose_answer: "整理最终回答",
+  };
+  return labels[stage] ?? "Kimi 正在后台运行";
 }
 
 function Dashboard({
@@ -1020,6 +1229,7 @@ function Dashboard({
   onNavigate,
   onOpenAnalysis,
   onStartAnalysis,
+  onRetry,
 }: {
   datasets: Dataset[];
   reports: Report[];
@@ -1029,16 +1239,24 @@ function Dashboard({
   onNavigate: (page: Page) => void;
   onOpenAnalysis: (jobId: string) => void;
   onStartAnalysis: () => void;
+  onRetry: () => Promise<void>;
 }) {
-  const sqlCount = reports.filter((report) => report.metadata?.route === "sql").length;
-  const pythonCount = reports.filter((report) =>
-    ["python", "hybrid"].includes(String(report.metadata?.route ?? "")),
-  ).length;
-  const hybridCount = reports.filter((report) => report.metadata?.route === "hybrid").length;
   const datasetById = new Map(datasets.map((dataset) => [dataset.dataset_id, dataset]));
+  const reportById = new Map(reports.map((report) => [report.id, report]));
   const recentJobs = jobs.slice(0, 8);
   const activeJobs = jobs.filter((job) => isActiveAnalysisJob(job));
   const completedJobs = jobs.filter((job) => job.status === "completed");
+  const completedComponents = completedJobs.map((job) =>
+    deriveAnalysisComponents(
+      job,
+      job.report_id ? reportById.get(job.report_id)?.metadata : undefined,
+    ),
+  );
+  const sqlCount = completedComponents.filter((components) => components.sql).length;
+  const pythonCount = completedComponents.filter((components) => components.python).length;
+  const hybridCount = completedComponents.filter(
+    (components) => components.sql && components.python,
+  ).length;
   const failedJobs = jobs.filter((job) => ["failed", "interrupted"].includes(job.status));
   const cleanedDatasets = datasets.filter((dataset) => dataset.status === "cleaned");
   const readiness = datasets.length ? Math.round((cleanedDatasets.length / datasets.length) * 100) : 0;
@@ -1064,7 +1282,19 @@ function Dashboard({
           </button>
         </div>
       </div>
-      {error && <Alert tone="error">{error}</Alert>}
+      {error && (
+        <div className="dashboard-sync-alert" role="alert" aria-live="assertive">
+          <span className="dashboard-sync-alert-icon"><TriangleAlert size={18} /></span>
+          <span className="dashboard-sync-alert-copy">
+            <strong>部分数据暂时未同步</strong>
+            <small>{dashboardSyncErrorMessage(error)}</small>
+          </span>
+          <button type="button" disabled={loading} onClick={() => void onRetry()}>
+            <RefreshCw className={loading ? "animate-spin" : ""} size={16} />
+            {loading ? "同步中" : "重新同步"}
+          </button>
+        </div>
+      )}
       <div className="dashboard-metrics">
         <Metric icon={<Database size={18} />} label="数据资产" value={datasets.length} caption={`${cleanedDatasets.length} 个已清洗`} />
         <Metric icon={<BarChart3 size={18} />} label="已完成分析" value={completedJobs.length} caption={`SQL ${sqlCount} · Python ${pythonCount}`} />
@@ -1144,7 +1374,7 @@ function Dashboard({
             <div className="dashboard-panel-heading">
               <div>
                 <h3>分析构成</h3>
-                <p>{hybridCount} 次混合路线分析</p>
+                <p>{hybridCount} 次同时使用 SQL 与 Python</p>
               </div>
             </div>
             <div className="dashboard-route-list">
@@ -1168,6 +1398,7 @@ function DatasetsPage({
   error,
   workspaceView,
   onWorkspaceViewChange,
+  onCleaningJobUpdate,
 }: {
   datasets: Dataset[];
   datasetGroups: DatasetGroup[];
@@ -1178,6 +1409,7 @@ function DatasetsPage({
   error: string | null;
   workspaceView: DatasetWorkspaceView;
   onWorkspaceViewChange: (view: DatasetWorkspaceView) => void;
+  onCleaningJobUpdate: (job: CleaningJob) => void;
 }) {
   const [requirement, setRequirement] = useState("");
   const [uploadItems, setUploadItems] = useState<UploadQueueItem[]>([]);
@@ -1386,7 +1618,10 @@ function DatasetsPage({
             {
               requirement,
               strategy: "auto",
-              onJob: setCurrentCleaningJob,
+              onJob: (job) => {
+                setCurrentCleaningJob(job);
+                onCleaningJobUpdate(job);
+              },
             },
           );
           setPreview(cleaning.preview_records ?? payload.preview_records);
@@ -2038,7 +2273,7 @@ function DatasetGroupList({ groups, onRefresh }: { groups: DatasetGroup[]; onRef
           const confirmedRelationships = hydratedGroup.relationships.filter((relationship) => relationship.enabled !== false);
           const isBusy = busyGroupId === group.group_id;
           return (
-            <div key={group.group_id} className="surface-card">
+            <div key={group.group_id} className="surface-card min-w-0">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <h4 className="text-lg font-black text-slate-950">{hydratedGroup.name}</h4>
@@ -2096,8 +2331,22 @@ function DatasetGroupList({ groups, onRefresh }: { groups: DatasetGroup[]; onRef
                 ))}
               </div>
               {!!confirmedRelationships.length && (
-                <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm font-bold text-emerald-950">
-                  已确认关系：{confirmedRelationships.map(formatRelationship).join("；")}
+                <div className="mt-4 grid gap-2">
+                  {confirmedRelationships.map((relationship) => (
+                    <div
+                      key={relationshipKey(relationship)}
+                      className={`rounded-lg border px-3 py-2 text-sm font-bold ${
+                        relationship.freshness_status === "stale"
+                          ? "border-rose-200 bg-rose-50 text-rose-900"
+                          : "border-emerald-200 bg-emerald-50 text-emerald-950"
+                      }`}
+                    >
+                      {formatRelationship(relationship, group.tables)}
+                      {relationship.freshness_status === "stale"
+                        ? ` · 已失效：${relationship.stale_reason || "匹配率或字段发生变化"}`
+                        : ` · ${formatRelationshipMetrics(relationship)}`}
+                    </div>
+                  ))}
                 </div>
               )}
               {messageByGroup[group.group_id] && (
@@ -2116,9 +2365,9 @@ function DatasetGroupList({ groups, onRefresh }: { groups: DatasetGroup[]; onRef
                     <div key={relationshipKey(candidate)} className="rounded-xl border border-line bg-white p-3">
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <div>
-                          <b>{formatRelationship(candidate)}</b>
+                          <b>{formatRelationship(candidate, group.tables)}</b>
                           <p className="mt-1 text-xs font-bold text-slate-500">
-                            {candidate.source} · {(candidate.confidence * 100).toFixed(0)}% · 匹配率 {(candidate.estimated_match_rate * 100).toFixed(0)}% · {candidate.relationship_type ?? "unknown"}
+                            {candidate.source} · 推荐置信度 {(candidate.confidence * 100).toFixed(0)}% · 样本匹配率 {(candidate.estimated_match_rate * 100).toFixed(0)}% · {candidate.relationship_type ?? "unknown"}
                           </p>
                           <p className="mt-1 text-sm font-semibold text-slate-600">{candidate.reason}</p>
                           {candidate.risk_note && <p className="mt-1 text-xs font-black text-amber-700">{candidate.risk_note}</p>}
@@ -2133,6 +2382,16 @@ function DatasetGroupList({ groups, onRefresh }: { groups: DatasetGroup[]; onRef
                   ))}
                 </div>
               )}
+              <DriftMonitorPanel
+                groupId={hydratedGroup.group_id}
+                datasetNames={Object.fromEntries(
+                  hydratedGroup.tables.map((table) => [
+                    table.dataset.dataset_id,
+                    table.dataset.name,
+                  ]),
+                )}
+                onScanned={onRefresh}
+              />
               <SemanticModelWorkbench group={hydratedGroup} />
             </div>
           );
@@ -2744,7 +3003,12 @@ function AnalysisPage({
                 ) : (
                   <div className="analysis-confirmed-relationships">
                     {selectedGroupRelationships.map((relationship) => (
-                      <div key={relationshipKey(relationship)}>{formatRelationship(relationship)} · {(Number(relationship.confidence ?? 0) * 100).toFixed(0)}%</div>
+                      <div key={relationshipKey(relationship)}>
+                        {formatRelationship(relationship, selectedDatasetGroup.tables)} · 推荐置信度 {(Number(relationship.confidence ?? 0) * 100).toFixed(0)}%
+                        {relationshipMatchRate(relationship) != null
+                          ? ` · 样本匹配率 ${(relationshipMatchRate(relationship)! * 100).toFixed(0)}%`
+                          : ""}
+                      </div>
                     ))}
                   </div>
                 )}
@@ -3053,7 +3317,7 @@ function MultiDatasetJoinPanel({
                   <div className="rounded-lg border border-line bg-white px-3 py-2 text-xs leading-5 text-slate-600">
                     <b className="block text-slate-950">推荐</b>
                     {candidates[0]
-                      ? `${candidates[0].left_column} -> ${candidates[0].right_column} · ${(candidates[0].score * 100).toFixed(0)}%`
+                      ? `${candidates[0].left_column} -> ${candidates[0].right_column} · 推荐置信度 ${(candidates[0].score * 100).toFixed(0)}% · 样本匹配率 ${(candidates[0].estimated_match_rate * 100).toFixed(0)}%`
                       : "暂无推荐"}
                   </div>
                 </div>
@@ -3076,7 +3340,7 @@ function MultiDatasetJoinPanel({
                           })
                         }
                       >
-                        {candidate.left_column} {"->"} {candidate.right_column} · {(candidate.estimated_match_rate * 100).toFixed(0)}%
+                        {candidate.left_column} {"->"} {candidate.right_column} · 推荐置信度 {(candidate.score * 100).toFixed(0)}% · 样本匹配率 {(candidate.estimated_match_rate * 100).toFixed(0)}%
                         {candidate.left_value_mode === "delimited" || candidate.right_value_mode === "delimited" ? " · 列表键" : ""}
                       </button>
                     ))}
@@ -3208,11 +3472,18 @@ function AnalysisSessionSidebar({
 function DynamicAgentPlan({ job }: { job: AnalysisJob | null }) {
   const workflowSteps = useMemo(() => deriveAgentWorkflowViews(job), [job]);
   const statusByKey = new Map(workflowSteps.map((step) => [step.key, step.status]));
+  const planSteps = job?.agent_mode === "loop"
+    ? [
+        { key: "analyze", label: "按需分析", workflowKeys: ["sql", "python"] },
+        { key: "visualize", label: "可视化", workflowKeys: ["visualization"] },
+        { key: "report", label: "报告", workflowKeys: ["reviewer", "report"] },
+      ]
+    : AGENT_PLAN_STEPS;
   return (
     <div>
       <div className="mb-2 text-xs font-black uppercase tracking-wide text-slate-500">智能体计划</div>
       <div className="flex flex-wrap gap-2">
-        {AGENT_PLAN_STEPS.map((plan) => {
+        {planSteps.map((plan) => {
           const status = combinedWorkflowStatus(
             plan.workflowKeys.map((key) => statusByKey.get(key as AgentWorkflowStepKey) ?? "waiting"),
           );
@@ -3316,9 +3587,12 @@ function AnalysisJobStatusPanel({
       </div>
       <div className="mt-2 text-xs font-bold text-slate-500">{job.progress}%</div>
       {!!job.events.length && (
-        <div className="mt-4">
-          <div className="mb-2 text-xs font-black uppercase tracking-wide text-slate-500">运行日志</div>
-          <div ref={logRef} className="max-h-56 space-y-2 overflow-auto rounded-xl border border-slate-200 bg-slate-950 p-3">
+        <details className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2" open={active}>
+          <summary className="cursor-pointer text-sm font-black text-slate-700">
+            <span>运行日志</span>
+            <span className="ml-1 text-xs font-bold text-slate-400">· {logEntries.length} 条</span>
+          </summary>
+          <div ref={logRef} className="mt-2 max-h-56 space-y-2 overflow-auto rounded-xl border border-slate-200 bg-slate-950 p-3">
             {logEntries.map((entry, index) => (
               <div key={`${entry.createdAt}-${index}`} className={`workflow-log-line ${entry.kind}`}>
                 <span>{entry.icon}</span>
@@ -3327,15 +3601,15 @@ function AnalysisJobStatusPanel({
               </div>
             ))}
           </div>
-        </div>
+        </details>
       )}
       {!!job.events.length && (
         <details className="mt-3 rounded-xl border border-line bg-slate-50 px-4 py-3">
-          <summary className="cursor-pointer text-sm font-black text-slate-800">原始事件</summary>
+          <summary className="cursor-pointer text-sm font-black text-slate-800">诊断事件（高级）</summary>
           <div className="mt-3 grid gap-2">
             {job.events.map((event, index) => (
               <div key={`${event.created_at}-${index}`} className="break-words rounded-lg bg-white px-3 py-2 text-xs leading-5 text-slate-600 [overflow-wrap:anywhere]">
-                <b>{jobStageLabel(event.stage)}</b> · {event.message}
+                <b>{jobStageLabel(event.stage)}</b> · {translateWorkflowEventMessage(event)}
                 <span className="ml-2 text-slate-400">{event.progress}%</span>
               </div>
             ))}
@@ -3369,10 +3643,18 @@ function AnalysisResult({ result }: { result: AnalysisResponse }) {
       <MultimodalContextPanel inputs={result.multimodal_inputs ?? []} />
       <MultiDatasetContextPanel context={result.multi_dataset_context ?? null} />
       <PlannerMetadataPanel metadata={result.planner_metadata ?? null} />
+      {!structuredReport && (
+        <AnalysisReliabilityPanel
+          contract={result.analysis_contract}
+          verification={result.statistical_verification}
+          lineage={result.analysis_lineage}
+        />
+      )}
       <WorkflowDebugger trace={result.workflow_trace ?? []} />
       {result.sql_result && (
         <section>
           <h3 className="section-title">生成的 SQL</h3>
+          <p className="text-sm text-slate-500">执行来源: {result.sql_source ?? "rules"}</p>
           <pre className="code-block">{result.sql_result.sql}</pre>
           <DataTable rows={result.sql_result.rows} emptyText="SQL 没有返回行。" />
         </section>
@@ -3553,13 +3835,21 @@ function MultiDatasetContextPanel({ context }: { context: MultiDatasetContext | 
 
 function PlannerMetadataPanel({ metadata }: { metadata: PlannerMetadata | null }) {
   if (!metadata) return null;
+  const rulesExecution = metadata.route_reason.includes("确定性规则");
   return (
     <section className="rounded-xl border border-emerald-100 bg-emerald-50/40 p-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h3 className="section-title mb-0">Planner 元数据</h3>
-        <span className="rounded-full bg-white px-3 py-1 text-xs font-black text-emerald-800">
-          confidence {(metadata.confidence * 100).toFixed(0)}%
-        </span>
+        <div className="flex flex-wrap gap-2">
+          {rulesExecution && (
+            <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-black text-amber-800">
+              规则执行
+            </span>
+          )}
+          <span className="rounded-full bg-white px-3 py-1 text-xs font-black text-emerald-800">
+            置信度 {(metadata.confidence * 100).toFixed(0)}%
+          </span>
+        </div>
       </div>
       <p className="mt-2 text-sm leading-6 text-slate-700">{metadata.route_reason}</p>
       <div className="mt-3 grid gap-2 md:grid-cols-4">
@@ -3689,18 +3979,20 @@ function MetricPill({ label, value }: { label: string; value: string }) {
 
 function ReportsPage({
   datasets,
+  datasetGroups,
   reports,
   loading,
   error,
   onRefresh,
 }: {
   datasets: Dataset[];
+  datasetGroups: DatasetGroup[];
   reports: Report[];
   loading: boolean;
   error: string | null;
   onRefresh: () => Promise<void>;
 }) {
-  const [datasetId, setDatasetId] = useState("");
+  const [dataScopeId, setDataScopeId] = useState("");
   const [question, setQuestion] = useState("分析数据中的主要变化和异常");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -3719,7 +4011,50 @@ function ReportsPage({
   const reportHistoryListRef = useRef<HTMLDivElement | null>(null);
   const reportCreatePanelRef = useRef<HTMLDetailsElement | null>(null);
   const reportDatasetSelectRef = useRef<HTMLSelectElement | null>(null);
-  const selectedDatasetId = datasetId || datasets[0]?.dataset_id || "";
+  const defaultDataScopeId = datasetGroups[0]
+    ? `group:${datasetGroups[0].group_id}`
+    : datasets[0]
+      ? `dataset:${datasets[0].dataset_id}`
+      : "";
+  const selectedDataScopeId = dataScopeId || defaultDataScopeId;
+  const selectedDatasetGroup = selectedDataScopeId.startsWith("group:")
+    ? datasetGroups.find((group) => group.group_id === selectedDataScopeId.slice("group:".length)) ?? null
+    : null;
+  const selectedStandaloneDatasetId = selectedDataScopeId.startsWith("dataset:")
+    ? selectedDataScopeId.slice("dataset:".length)
+    : "";
+  const selectedGroupRelationships = (selectedDatasetGroup?.relationships ?? []).filter(
+    (relationship) => relationship.enabled !== false,
+  );
+  const relationshipRightDatasetIds = new Set(
+    selectedGroupRelationships.map((relationship) => relationship.right_dataset_id),
+  );
+  const groupPrimaryDatasetId =
+    selectedGroupRelationships.find(
+      (relationship) => !relationshipRightDatasetIds.has(relationship.left_dataset_id),
+    )?.left_dataset_id
+    ?? selectedGroupRelationships[0]?.left_dataset_id
+    ?? selectedDatasetGroup?.tables[0]?.dataset.dataset_id
+    ?? null;
+  const selectedDatasetId = groupPrimaryDatasetId || selectedStandaloneDatasetId || datasets[0]?.dataset_id || "";
+  const groupJoinPlan: DatasetJoinConfig[] = selectedGroupRelationships.map((relationship) => ({
+    left_dataset_id: relationship.left_dataset_id,
+    right_dataset_id: relationship.right_dataset_id,
+    left_column: relationship.left_column,
+    right_column: relationship.right_column,
+    join_type: relationship.join_type,
+    left_value_mode: relationship.left_value_mode,
+    right_value_mode: relationship.right_value_mode,
+    left_delimiter: relationship.left_delimiter,
+    right_delimiter: relationship.right_delimiter,
+  }));
+  const groupAdditionalDatasetIds = Array.from(
+    new Set(
+      groupJoinPlan
+        .flatMap((relationship) => [relationship.left_dataset_id, relationship.right_dataset_id])
+        .filter((candidateId) => candidateId !== selectedDatasetId),
+    ),
+  );
   const filteredReports = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     if (!normalizedQuery) return reports;
@@ -3813,11 +4148,19 @@ function ReportsPage({
       setMessage("请先上传数据集。");
       return;
     }
+    if (selectedDatasetGroup && !groupJoinPlan.length) {
+      setMessage("当前数据包还没有通过自动校验的关系，请先在数据集页重新运行关系识别。");
+      return;
+    }
     setBusy(true);
     setMessage(null);
     try {
       const job = await apiPost<AnalysisJob>("/analysis/jobs", {
         dataset_id: selectedDatasetId,
+        dataset_group_id: selectedDatasetGroup?.group_id ?? null,
+        additional_dataset_ids: selectedDatasetGroup ? groupAdditionalDatasetIds : [],
+        join_plan: selectedDatasetGroup ? groupJoinPlan : [],
+        relationship_plan: selectedDatasetGroup ? groupJoinPlan : [],
         question,
         multimodal_inputs: [],
         prompt_overrides: {
@@ -3884,20 +4227,33 @@ function ReportsPage({
           <span className="report-create-icon"><Plus size={18} /></span>
           <span className="min-w-0">
             <b>生成新报告</b>
-            <small>选择数据集并输入分析问题</small>
+            <small>选择数据包或数据集并输入分析问题</small>
           </span>
           <span className="report-create-toggle">展开</span>
         </summary>
         <div className="report-create-body">
           <div className="report-create-fields">
             <label>
-              <span>数据集</span>
-              <select ref={reportDatasetSelectRef} value={selectedDatasetId} onChange={(event) => setDatasetId(event.target.value)} className="input">
-                {datasets.map((dataset) => (
-                  <option key={dataset.dataset_id} value={dataset.dataset_id}>
-                    {dataset.name}
-                  </option>
-                ))}
+              <span>数据范围</span>
+              <select ref={reportDatasetSelectRef} value={selectedDataScopeId} onChange={(event) => setDataScopeId(event.target.value)} className="input">
+                {!!datasetGroups.length && (
+                  <optgroup label="数据包（支持跨表分析）">
+                    {datasetGroups.map((group) => (
+                      <option key={group.group_id} value={`group:${group.group_id}`}>
+                        {group.name} · {group.tables.length} 张表
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {!!datasets.length && (
+                  <optgroup label="单个数据集">
+                    {datasets.map((dataset) => (
+                      <option key={dataset.dataset_id} value={`dataset:${dataset.dataset_id}`}>
+                        {dataset.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
               </select>
             </label>
             <label>
@@ -4225,6 +4581,7 @@ function ChartList({ charts }: { charts: Chart[] }) {
 
 function ChartCard({ chart }: { chart: Chart }) {
   const cardRef = useRef<HTMLDivElement | null>(null);
+  const displayScopeMessage = chartDisplayScopeMessage(chart);
   return (
     <div ref={cardRef} className="chart-card">
       <div className="chart-card-header">
@@ -4239,6 +4596,7 @@ function ChartCard({ chart }: { chart: Chart }) {
         </div>
       </div>
       <div className="chart-visualization"><ChartVisualization chart={chart} /></div>
+      {displayScopeMessage && <p className="chart-explanation">{displayScopeMessage}</p>}
       {chart.explanation && <p className="chart-explanation">{chart.explanation}</p>}
       <details className="chart-data-disclosure"><summary>查看图表数据</summary><DataTable rows={chart.data} emptyText="图表没有数据。" /></details>
     </div>
@@ -4250,6 +4608,11 @@ function StructuredReportPreview({ report }: { report: StructuredReport }) {
   return (
     <div className="mt-5 space-y-5">
       <section className="rounded-xl border border-sky-200 bg-sky-50 p-5 text-sm leading-7 text-slate-950">{report.executive_summary}</section>
+      <AnalysisReliabilityPanel
+        contract={report.analysis_contract}
+        verification={report.statistical_verification}
+        lineage={report.analysis_lineage}
+      />
       {report.analysis_context && (
         <section className="rounded-xl border border-line bg-white p-4 text-sm leading-6 text-slate-700">
           <p className="font-black text-slate-950">分析上下文</p>
@@ -4393,7 +4756,10 @@ function CartesianChartSvg({ chart, mode }: { chart: Chart; mode: "bar" | "line"
   const xKey = String(chart.spec.x ?? Object.keys(chart.data[0] ?? {})[0] ?? "x");
   const cartesianKeys = Object.keys(chart.data[0] ?? {});
   const yKey = String(chart.spec.y ?? cartesianKeys[cartesianKeys.length - 1] ?? "y");
-  const points = chart.data
+  const visibleRows = mode === "bar" && chart.data.length > 24
+    ? [...chart.data].sort((leftRow, rightRow) => numberValue(rightRow[yKey]) - numberValue(leftRow[yKey]))
+    : chart.data;
+  const points = visibleRows
     .slice(0, 24)
     .map((row) => ({ label: String(row[xKey] ?? ""), value: numberValue(row[yKey]) }))
     .filter((point) => Number.isFinite(point.value));
@@ -4729,7 +5095,10 @@ function htmlReportForDownload(title: string, report: StructuredReport) {
     .map((finding) => `<section class="card"><h2>${escapeHtml(finding.title)}</h2><p>${escapeHtml(finding.content)}</p>${finding.evidence ? `<p class="muted">证据：${escapeHtml(finding.evidence)}</p>` : ""}${finding.recommended_action ? `<p class="muted">建议：${escapeHtml(finding.recommended_action)}</p>` : ""}</section>`)
     .join("");
   const charts = (report.charts ?? [])
-    .map((chart) => `<section class="card"><h2>${escapeHtml(chart.title)}</h2><p class="muted">${escapeHtml(chart.chart_type)}</p>${chartSvgMarkup(chart)}${chart.explanation ? `<p>${escapeHtml(chart.explanation)}</p>` : ""}</section>`)
+    .map((chart) => {
+      const displayScopeMessage = chartDisplayScopeMessage(chart);
+      return `<section class="card"><h2>${escapeHtml(chart.title)}</h2><p class="muted">${escapeHtml(chart.chart_type)}</p>${chartSvgMarkup(chart)}${displayScopeMessage ? `<p>${escapeHtml(displayScopeMessage)}</p>` : ""}${chart.explanation ? `<p>${escapeHtml(chart.explanation)}</p>` : ""}</section>`;
+    })
     .join("");
   const sql = rowsTableMarkup(report.sql_results ?? []);
   const gaps = (report.data_gaps ?? []).map((gap) => `<li>${escapeHtml(gap)}</li>`).join("");
@@ -4794,7 +5163,10 @@ function cartesianSvgMarkup(chart: Chart, mode: "bar" | "line") {
   const keys = Object.keys(chart.data[0] ?? {});
   const xKey = String(chart.spec.x ?? keys[0] ?? "x");
   const yKey = String(chart.spec.y ?? keys[keys.length - 1] ?? "y");
-  const points = chart.data
+  const visibleRows = mode === "bar" && chart.data.length > 24
+    ? [...chart.data].sort((leftRow, rightRow) => numberValue(rightRow[yKey]) - numberValue(leftRow[yKey]))
+    : chart.data;
+  const points = visibleRows
     .slice(0, 24)
     .map((row) => ({ label: String(row[xKey] ?? ""), value: numberValue(row[yKey]) }))
     .filter((point) => Number.isFinite(point.value));
@@ -4833,6 +5205,13 @@ function cartesianSvgMarkup(chart: Chart, mode: "bar" | "line") {
     .map((point, index) => `<text x="${pad + step * index + step / 2}" y="${height - 14}" text-anchor="middle" font-size="11" fill="#475569">${escapeHtml(shortLabel(point.label))}</text>`)
     .join("");
   return svgMarkup(width, height, body);
+}
+
+function chartDisplayScopeMessage(chart: Chart) {
+  if (chart.chart_type !== "bar" || chart.data.length <= 24) return "";
+  const keys = Object.keys(chart.data[0] ?? {});
+  const yKey = String(chart.spec.y ?? keys[keys.length - 1] ?? "指标");
+  return `图中按 ${yKey} 从高到低展示前 24 / ${chart.data.length} 个类别；完整结果见“查看图表数据”。`;
 }
 
 function pieSvgMarkup(chart: Chart) {
@@ -5047,6 +5426,8 @@ function streamAnalysisJob(
   return new Promise((resolve, reject) => {
     let settled = false;
     let refreshing = false;
+    let terminalEventReceived = false;
+    let pollTimer: number | null = null;
     let lastJob = initial;
     const afterSequence = initial.last_event_sequence ?? 0;
     const streamUrl = `${API_BASE_URL}/analysis/jobs/${jobId}/events?after_sequence=${afterSequence}`;
@@ -5058,6 +5439,7 @@ function streamAnalysisJob(
       settled = true;
       source.close();
       window.clearTimeout(timeout);
+      if (pollTimer !== null) window.clearInterval(pollTimer);
       if (error) reject(error);
       else resolve(lastJob);
     };
@@ -5077,8 +5459,16 @@ function streamAnalysisJob(
     };
 
     source.addEventListener("workflow", () => void refreshJob());
-    source.addEventListener("end", () => void refreshJob());
-    source.onerror = () => finish(new Error("Workflow event stream disconnected."));
+    source.addEventListener("end", () => {
+      terminalEventReceived = true;
+      source.close();
+      void refreshJob();
+    });
+    source.onerror = () => {
+      if (terminalEventReceived) return;
+      finish(new Error("Workflow event stream disconnected."));
+    };
+    pollTimer = window.setInterval(() => void refreshJob(), 2000);
   });
 }
 
@@ -5140,12 +5530,16 @@ function loadLatestAnalysisResult(): AnalysisResponse | null {
       question: parsed.question,
       multimodal_inputs: Array.isArray(parsed.multimodal_inputs) ? parsed.multimodal_inputs : [],
       planner_metadata: parsed.planner_metadata ?? null,
+      analysis_contract: parsed.analysis_contract ?? null,
+      statistical_verification: parsed.statistical_verification ?? null,
+      analysis_lineage: parsed.analysis_lineage ?? null,
       multi_dataset_context: parsed.multi_dataset_context ?? null,
       sql_result: parsed.sql_result ?? null,
       python_result: parsed.python_result ?? null,
       structured_report: parsed.structured_report ?? null,
       html_report: null,
       report_markdown: typeof parsed.report_markdown === "string" ? parsed.report_markdown : "",
+      sql_source: parsed.sql_source ?? null,
       python_source: parsed.python_source ?? null,
       python_generated_code: parsed.python_generated_code ?? null,
       python_execution_error: parsed.python_execution_error ?? null,
@@ -5215,14 +5609,51 @@ function relationshipKey(
   return `${relationship.left_dataset_id}:${relationship.left_column}->${relationship.right_dataset_id}:${relationship.right_column}`;
 }
 
-function formatRelationship(relationship: Pick<DatasetRelationshipPlan, "left_column" | "right_column" | "join_type">) {
-  return `${relationship.left_column} -> ${relationship.right_column} (${relationship.join_type})`;
+function formatRelationship(
+  relationship: Pick<DatasetRelationshipPlan, "left_dataset_id" | "right_dataset_id" | "left_column" | "right_column" | "join_type">,
+  tables: DatasetGroupTable[] = [],
+) {
+  const names = new Map(
+    tables.map((table) => [table.dataset.dataset_id, compactDatasetName(table.dataset.name)]),
+  );
+  const left = names.get(relationship.left_dataset_id);
+  const right = names.get(relationship.right_dataset_id);
+  return `${left ? `${left}.` : ""}${relationship.left_column} -> ${right ? `${right}.` : ""}${relationship.right_column} (${relationship.join_type})`;
+}
+
+function compactDatasetName(name: string) {
+  return name.replace(/\.(csv|xlsx|json|txt)$/i, "").replace(/_dataset$/i, "");
+}
+
+function relationshipMatchRate(
+  relationship: Pick<DatasetRelationshipPlan, "last_match_rate" | "baseline_match_rate">,
+) {
+  return relationship.last_match_rate ?? relationship.baseline_match_rate ?? null;
+}
+
+function formatRelationshipMetrics(
+  relationship: Pick<DatasetRelationshipPlan, "confidence" | "last_match_rate" | "baseline_match_rate">,
+) {
+  const confidence = relationship.confidence;
+  const matchRate = relationshipMatchRate(relationship);
+  const metrics = [
+    confidence == null ? null : `推荐置信度 ${(confidence * 100).toFixed(0)}%`,
+    matchRate == null ? null : `样本匹配率 ${(matchRate * 100).toFixed(0)}%`,
+  ].filter(Boolean);
+  return metrics.length ? metrics.join(" · ") : "已自动确认";
 }
 
 function errorMessage(error: unknown) {
   if (error instanceof DOMException && error.name === "AbortError") return "请求超时，请稍后重试。";
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+function dashboardSyncErrorMessage(error: string) {
+  if (/type error|failed to fetch|load failed|network|无法连接后端|数据同步暂时中断/i.test(error)) {
+    return "网络连接出现短暂波动，已有数据不会受影响。";
+  }
+  return error;
 }
 
 function loginErrorMessage(error: unknown) {

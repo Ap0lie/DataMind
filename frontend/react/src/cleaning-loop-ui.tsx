@@ -52,7 +52,7 @@ function CleaningEventRow({ event }: { event: CleaningJobEvent }) {
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <b className="text-slate-800">{LABELS[event.event_type ?? ""] ?? event.event_type}</b>
           {event.strategy && <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-bold text-slate-700">{strategyLabel(event.strategy)}</span>}
-          {event.iteration != null && <span className="text-slate-400">第 {event.iteration} 轮</span>}
+          {(event.iteration ?? 0) > 0 && <span className="text-slate-400">第 {event.iteration} 轮</span>}
         </div>
         <p className="mt-1 break-words text-xs leading-5 text-slate-600 [overflow-wrap:anywhere]">{event.message}</p>
       </div>

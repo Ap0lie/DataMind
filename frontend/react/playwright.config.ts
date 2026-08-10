@@ -1,26 +1,44 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { defineConfig, devices } from "@playwright/test";
+
+const backendPort = process.env.DATAMIND_E2E_BACKEND_PORT ?? "18110";
+const frontendPort = process.env.DATAMIND_E2E_FRONTEND_PORT ?? "15173";
+const backendURL = `http://127.0.0.1:${backendPort}`;
+const managedFrontendURL = `http://127.0.0.1:${frontendPort}`;
+const externalFrontendURL = process.env.DATAMIND_FRONTEND_URL;
+const reuseExistingServer = process.env.DATAMIND_E2E_REUSE_SERVER === "true";
+const projectPython = path.resolve(
+  "../..",
+  process.platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python",
+);
+const pythonCommand = fs.existsSync(projectPython) ? `"${projectPython}"` : "python";
+const isolatedDataRoot = path.join(
+  os.tmpdir(),
+  "datamind-playwright",
+  process.env.DATAMIND_E2E_RUN_ID ?? String(process.pid),
+);
 
 export default defineConfig({
   testDir: "./e2e",
   outputDir: path.join(os.tmpdir(), "datamind-playwright-results"),
   reporter: "line",
   timeout: 60_000,
-  webServer: [
+  webServer: externalFrontendURL ? [] : [
     {
       command:
         process.env.DATAMIND_E2E_BACKEND_COMMAND ??
-        "python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8010 --log-level warning",
+        `${pythonCommand} -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port ${backendPort} --log-level warning`,
       cwd: path.resolve("../.."),
-      url: "http://127.0.0.1:8010/api/v1/health/ready",
-      reuseExistingServer: true,
+      url: `${backendURL}/api/v1/health/ready`,
+      reuseExistingServer,
       timeout: 120_000,
       env: {
         ...process.env,
         DATAMIND_DATABASE_URL: "",
-        DATAMIND_DATASET_STORE_PATH: path.join(os.tmpdir(), "datamind-playwright", "datasets"),
-        DATAMIND_AUTH_MODE: "legacy",
+        DATAMIND_DATASET_STORE_PATH: path.join(isolatedDataRoot, "datasets"),
+        DATAMIND_AUTH_MODE: "session",
         DATAMIND_SESSION_COOKIE_SECURE: "false",
         DATAMIND_EXECUTION_BACKEND: "local",
         DATAMIND_DEFAULT_LLM_PROVIDER: "mock",
@@ -35,17 +53,22 @@ export default defineConfig({
         DATAMIND_ASSISTANT_LLM_PROVIDER: "mock",
         DATAMIND_ASSISTANT_LLM_MODEL: "mock-assistant",
         DATAMIND_SEMANTIC_EMBEDDING_ENABLED: "false",
+        DATAMIND_CORS_ORIGINS: managedFrontendURL,
       },
     },
     {
-      command: "npm run dev",
-      url: "http://127.0.0.1:5173",
-      reuseExistingServer: true,
+      command: `npm run dev -- --port ${frontendPort} --strictPort`,
+      url: managedFrontendURL,
+      reuseExistingServer,
       timeout: 120_000,
+      env: {
+        ...process.env,
+        VITE_DATAMIND_API_BASE_URL: `${backendURL}/api/v1`,
+      },
     },
   ],
   use: {
-    baseURL: process.env.DATAMIND_FRONTEND_URL ?? "http://127.0.0.1:5173",
+    baseURL: externalFrontendURL ?? managedFrontendURL,
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
   },
