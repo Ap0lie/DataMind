@@ -397,7 +397,6 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
   };
 
   const uploadFiles = async (files: File[]) => {
-    if (!currentId) return;
     if (files.length > 20) {
       setError("一次最多选择 20 个文件。");
       return;
@@ -405,11 +404,17 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
     setUploading(true);
     setError(null);
     try {
+      const createdConversation = currentIdRef.current
+        ? null
+        : await (createConversationPromiseRef.current ?? createConversation());
+      const targetConversationId = currentIdRef.current ?? createdConversation?.conversation_id;
+      if (!targetConversationId) throw new Error("当前对话尚未准备好，请稍后重试。");
+
       const uploaded: AssistantAttachment[] = [];
       for (const file of files) {
         const form = new FormData();
         form.append("file", file);
-        uploaded.push(await apiPostForm<AssistantAttachment>(`/assistant/conversations/${currentId}/attachments`, form, 240000));
+        uploaded.push(await apiPostForm<AssistantAttachment>(`/assistant/conversations/${targetConversationId}/attachments`, form, 240000));
       }
       setAttachments((items) => [...items, ...uploaded]);
       setImportBatch(null);

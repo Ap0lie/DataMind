@@ -615,7 +615,7 @@ test("Enter does not send while a data file is waiting for import", async ({ pag
   });
 
   const composer = page.getByPlaceholder("向 Kimi 询问你的数据、分析结果或报告...");
-  await expect(page.getByText("pending-import.csv", { exact: true }).first()).toBeVisible();
+  await expect(page.locator(".assistant-attachment-strip")).toContainText("pending-import.csv");
   await composer.fill("分析这份文件");
   await expect(page.getByRole("button", { name: "发送" })).toBeDisabled();
   await composer.press("Enter");
@@ -1462,7 +1462,7 @@ test("relationship recommendation communicates progress and saved readiness", as
   await expect(page.getByText(/1 项待确认变化（0 项严重、1 项警告）/)).toBeVisible();
   await page.getByRole("button", { name: "重新检测" }).click();
   await expect(page.getByText("需要处理", { exact: true })).toBeVisible();
-  await expect(page.getByText("customer_id 缺失率发生明显变化。", { exact: true })).toBeVisible();
+  await expect(persistedWarnings).toContainText("customer_id 缺失率发生明显变化。");
   await expect(page.getByTitle("关系匹配率下降。")).toHaveText("重新识别关系");
 });
 

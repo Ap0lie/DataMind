@@ -8,6 +8,7 @@ test("semantic model toolbar stays usable at a narrow viewport", async ({ page }
   const groupId = "20202020-2020-4020-8020-202020202020";
   const firstModelId = "21212121-2121-4121-8121-212121212121";
   const secondModelId = "22222222-2222-4222-8222-222222222222";
+  const conversationId = "24242424-2424-4424-8424-242424242424";
   const datasets = [
     { dataset_id: ordersId, name: "orders.csv", source_type: "csv", status: "cleaned", source_metadata: {} },
     { dataset_id: customersId, name: "customers.csv", source_type: "csv", status: "cleaned", source_metadata: {} },
@@ -69,6 +70,35 @@ test("semantic model toolbar stays usable at a narrow viewport", async ({ page }
 
   await page.route("**/api/v1/**", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+  });
+  await page.route("**/api/v1/assistant/**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    if (route.request().method() === "GET" && pathname.endsWith("/assistant/conversations")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversations: [{
+            conversation_id: conversationId,
+            title: "语义模型测试对话",
+            scope_type: "auto",
+            scope_id: null,
+            summary: "",
+            active_run_id: null,
+            active_run_status: null,
+            created_at: "2026-08-08T00:00:00Z",
+            updated_at: "2026-08-08T00:00:00Z",
+            last_message_at: null,
+          }],
+        }),
+      });
+      return;
+    }
+    if (route.request().method() === "GET" && pathname.endsWith(`/assistant/conversations/${conversationId}/messages`)) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ messages: [] }) });
+      return;
+    }
+    await route.fallback();
   });
   await page.route("**/api/v1/auth/login", async (route) => {
     await route.fulfill({
@@ -141,7 +171,16 @@ test("semantic model toolbar stays usable at a narrow viewport", async ({ page }
   await page.goto("/");
   await page.getByLabel("用户名").fill("qa_semantic_responsive");
   await page.getByLabel("密码").fill("qa-reliability-password");
+  const datasetsLoaded = page.waitForResponse((response) =>
+    response.request().method() === "GET"
+    && new URL(response.url()).pathname === "/api/v1/store/datasets",
+  );
+  const groupsLoaded = page.waitForResponse((response) =>
+    response.request().method() === "GET"
+    && new URL(response.url()).pathname === "/api/v1/store/dataset-groups",
+  );
   await page.getByRole("button", { name: /Log in|登录/ }).click();
+  await Promise.all([datasetsLoaded, groupsLoaded]);
   await page.getByRole("button", { name: "数据集" }).click();
   await page.getByRole("tab", { name: /关系管理/ }).click();
 
@@ -171,7 +210,7 @@ test("semantic model toolbar stays usable at a narrow viewport", async ({ page }
   await workbench.getByRole("button", { name: "高级 JSON", exact: true }).click();
   await expect(workbench.getByLabel("语义模型 DSL JSON")).toBeVisible();
   await workbench.getByRole("button", { name: "可视化", exact: true }).click();
-  await expect(workbench.getByRole("heading", { name: "指标", exact: true })).toBeVisible();
+  await expect(workbench.getByRole("heading", { name: /^指标(?:\s+\d+)?$/ })).toBeVisible();
   await workbench.getByRole("button", { name: "发布", exact: true }).click();
   await expect(workbench.getByText("语义模型已发布，后续 Planner 将固定引用该版本。", { exact: true })).toBeVisible();
   expect({ createCalls, saveCalls, validateCalls, publishCalls }).toEqual({ createCalls: 1, saveCalls: 3, validateCalls: 2, publishCalls: 1 });
