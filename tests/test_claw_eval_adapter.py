@@ -191,7 +191,20 @@ def test_summary_rejects_provider_error_and_missing_judge(tmp_path: Path) -> Non
 
 
 @pytest.mark.integration
-def test_adapter_lifespan_starts_isolated_datamind_and_exposes_control_endpoints() -> None:
+def test_adapter_lifespan_starts_isolated_datamind_and_exposes_control_endpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_dir = tmp_path / "claw-eval"
+    fixture_dir = runtime_dir / "fixtures"
+    fixture_dir.mkdir(parents=True)
+    (fixture_dir / "scenarios.json").write_text(
+        '{"version":"test","generated":{},"scenarios":[]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATAMIND_EVAL_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setenv("DATAMIND_EVAL_LLM_PROVIDER", "mock")
+
     adapter = _load("datamind_claw_adapter_integration", "deploy/claw-eval/adapter.py")
 
     with TestClient(adapter.app) as client:
