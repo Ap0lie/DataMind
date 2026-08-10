@@ -51,3 +51,45 @@ async def test_semantic_model_api_publish_plan_and_low_confidence_gate(tmp_path,
         assert blocked.status_code == 400
         assert "requires confirmation" in blocked.json()["detail"]
     get_settings.cache_clear()
+
+
+async def test_data_drift_api_exposes_latest_event_and_history(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = tmp_path / "store"
+    monkeypatch.setenv("DATAMIND_DATASET_STORE_PATH", str(store))
+    get_settings.cache_clear()
+    repository = DatasetStoreRepository(str(store), user_id="default")
+    dataset = repository.create_dataset(
+        name="sales.csv",
+        source_type="csv",
+        source_metadata={},
+    )
+    repository.append_raw_records(
+        dataset_id=dataset.id,
+        records=[{"amount": 10}, {"amount": 20}],
+    )
+    repository.replace_raw_record_batches(
+        dataset_id=dataset.id,
+        batches=iter(([{"sales_amount": 10}, {"sales_amount": 20}],)),
+    )
+
+    app = create_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        latest = await client.get(
+            f"/api/v1/store/datasets/{dataset.id}/drift"
+        )
+        history = await client.get(
+            f"/api/v1/store/datasets/{dataset.id}/drift/history"
+        )
+
+    assert latest.status_code == 200
+    assert latest.json()["status"] == "critical"
+    assert latest.json()["event_id"]
+    assert history.status_code == 200
+    assert len(history.json()["events"]) == 1
+    get_settings.cache_clear()

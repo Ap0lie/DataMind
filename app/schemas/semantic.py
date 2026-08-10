@@ -86,6 +86,8 @@ class PlannerDecisionResponse(ApiModel):
     semantic_model_version: int | None = None
     semantic_source: str = "legacy"
     semantic_plan: dict[str, Any] = Field(default_factory=dict)
+    relationship_graph: dict[str, Any] = Field(default_factory=dict)
+    grain_plan: dict[str, Any] = Field(default_factory=dict)
     confidence_breakdown: PlannerConfidenceBreakdown
     raw_confidence: float = Field(ge=0, le=1)
     calibrated_confidence: float = Field(ge=0, le=1)

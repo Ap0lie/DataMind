@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from app.analysis.query_intent import negated_grouping_columns, strip_negated_clauses
 from app.schemas.analysis import ChartResponse, TextAnalysisResultResponse
 
 _TEXT_COLUMN_HINTS = (
@@ -83,13 +84,21 @@ def run_text_analysis_toolbox(
     *,
     question: str,
 ) -> tuple[TextAnalysisResultResponse, ...]:
-    text_columns = _candidate_text_columns(df, question)
+    semantic_question = strip_negated_clauses(question)
+    text_columns = _candidate_text_columns(df, semantic_question)
     if not text_columns:
         return ()
 
+    excluded_group_columns = set(
+        negated_grouping_columns(question, tuple(str(column) for column in df.columns))
+    )
     results: list[TextAnalysisResultResponse] = []
     for text_column in text_columns[:2]:
-        group_column = _candidate_group_column(df, text_column)
+        group_column = _candidate_group_column(
+            df,
+            text_column,
+            excluded_columns=excluded_group_columns,
+        )
         results.append(_analyze_text_column(df, text_column=text_column, group_column=group_column))
     return tuple(results)
 
@@ -100,6 +109,8 @@ def _candidate_text_columns(df: pd.DataFrame, question: str) -> list[str]:
 
     candidates: list[tuple[int, str]] = []
     for column in df.columns:
+        if _looks_like_identifier_column(str(column)):
+            continue
         series = df[column].dropna()
         if series.empty:
             continue
@@ -123,11 +134,16 @@ def _candidate_text_columns(df: pd.DataFrame, question: str) -> list[str]:
     return [column for _, column in candidates]
 
 
-def _candidate_group_column(df: pd.DataFrame, text_column: str) -> str | None:
+def _candidate_group_column(
+    df: pd.DataFrame,
+    text_column: str,
+    *,
+    excluded_columns: set[str],
+) -> str | None:
     candidates: list[tuple[int, str]] = []
     row_count = max(len(df), 1)
     for column in df.columns:
-        if str(column) == text_column:
+        if str(column) == text_column or str(column) in excluded_columns:
             continue
         series = df[column].dropna()
         if series.empty:
@@ -285,6 +301,14 @@ def _question_requests_text_analysis(question: str) -> bool:
 
 def _has_obvious_text_column(df: pd.DataFrame) -> bool:
     return any(any(hint in str(column).lower() for hint in _TEXT_COLUMN_HINTS) for column in df.columns)
+
+
+def _looks_like_identifier_column(column: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", column.casefold()).strip("_")
+    leaf = normalized.rsplit("__", 1)[-1]
+    return leaf in {"id", "uuid", "guid", "hash", "code"} or leaf.endswith(
+        ("_id", "_uuid", "_guid", "_hash", "_code")
+    )
 
 
 def _histogram_buckets(values: list[float], bucket_count: int = 10) -> list[dict[str, Any]]:

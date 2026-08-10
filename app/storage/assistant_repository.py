@@ -4,9 +4,10 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, ClassVar
 from uuid import UUID, uuid4
 
 from app.core.settings import get_settings
@@ -43,6 +44,13 @@ class StoredAssistantRun:
     current_action_id: UUID | None
     required_permission: str | None
     error: str | None
+    cancel_requested: bool
+    broker_task_id: str | None
+    attempt_count: int
+    lease_owner: str | None
+    lease_expires_at: str | None
+    heartbeat_at: str | None
+    checkpoint_thread_id: str | None
     last_event_sequence: int
     created_at: str
     updated_at: str
@@ -52,14 +60,18 @@ class StoredAssistantRun:
 class AssistantRepository:
     """User-scoped persistence for Kimi conversations and runs."""
 
+    _initialization_lock = Lock()
+    _initialized_stores: ClassVar[set[str]] = set()
+
     def __init__(self, root_path: str, *, user_id: str) -> None:
         self.root = Path(root_path)
         self.root.mkdir(parents=True, exist_ok=True)
         self.user_id = user_id
-        self.database_url = get_settings().database_url
+        settings = get_settings()
+        self.database_url = settings.database_url
         self.db_path = self.root.parent / "datamind.db" if self.root.name == "datasets" else self.root / "datamind.db"
         DatasetStoreRepository(root_path, user_id=user_id)
-        self._initialize()
+        self._initialize_store_once(environment=settings.environment)
 
     @property
     def attachment_root(self) -> Path:
@@ -76,6 +88,37 @@ class AssistantRepository:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def _initialize_store_once(self, *, environment: str) -> None:
+        key = self.database_url or str(self.db_path.resolve())
+        if key in self._initialized_stores:
+            return
+        with self._initialization_lock:
+            if key in self._initialized_stores:
+                return
+            if self.database_url and environment.lower() == "production":
+                self._verify_migrated_schema()
+            else:
+                self._initialize()
+            self._initialized_stores.add(key)
+
+    def _verify_migrated_schema(self) -> None:
+        """Fail fast in production; Alembic owns PostgreSQL schema changes."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                SELECT next_event_sequence
+                FROM assistant_runs
+                WHERE 1 = 0
+                """
+            )
+            connection.execute(
+                """
+                SELECT id
+                FROM assistant_permission_grants
+                WHERE 1 = 0
+                """
+            )
+
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(_ASSISTANT_SCHEMA)
@@ -84,12 +127,34 @@ class AssistantRepository:
                 ("assistant_runs", "execution_plan", "TEXT NOT NULL DEFAULT '{}'"),
                 ("assistant_runs", "current_action_id", "TEXT"),
                 ("assistant_runs", "required_permission", "TEXT"),
+                ("assistant_runs", "next_event_sequence", "INTEGER NOT NULL DEFAULT 1"),
                 ("assistant_attachments", "attachment_kind", "TEXT NOT NULL DEFAULT 'image'"),
                 ("assistant_attachments", "import_status", "TEXT"),
                 ("assistant_attachments", "dataset_id", "TEXT"),
                 ("assistant_attachments", "import_batch_id", "TEXT"),
             ):
                 _ensure_column(connection, table, column, definition)
+            connection.execute(
+                """
+                UPDATE assistant_runs
+                SET next_event_sequence = COALESCE(
+                    (
+                        SELECT MAX(event.sequence) + 1
+                        FROM assistant_run_events event
+                        WHERE event.run_id = assistant_runs.id
+                    ),
+                    1
+                )
+                WHERE next_event_sequence <= COALESCE(
+                    (
+                        SELECT MAX(event.sequence)
+                        FROM assistant_run_events event
+                        WHERE event.run_id = assistant_runs.id
+                    ),
+                    0
+                )
+                """
+            )
 
     def create_conversation(self, *, title: str, scope_type: str, scope_id: UUID | None) -> dict[str, Any]:
         self._validate_scope(scope_type, scope_id)
@@ -109,7 +174,9 @@ class AssistantRepository:
             rows = connection.execute(
                 """SELECT c.*,
                    (SELECT id FROM assistant_runs r WHERE r.conversation_id=c.id AND r.user_id=c.user_id
-                    AND r.status IN ('queued','running','awaiting_confirmation') ORDER BY r.created_at DESC LIMIT 1) active_run_id
+                    AND r.status IN ('queued','running','pause_requested','paused','awaiting_confirmation') ORDER BY r.created_at DESC LIMIT 1) active_run_id,
+                   (SELECT status FROM assistant_runs r WHERE r.conversation_id=c.id AND r.user_id=c.user_id
+                    AND r.status IN ('queued','running','pause_requested','paused','awaiting_confirmation') ORDER BY r.created_at DESC LIMIT 1) active_run_status
                    FROM assistant_conversations c WHERE c.user_id=? AND c.deleted_at IS NULL
                    ORDER BY COALESCE(c.last_message_at,c.created_at) DESC""",
                 (self.user_id,),
@@ -121,7 +188,9 @@ class AssistantRepository:
             row = connection.execute(
                 """SELECT c.*,
                    (SELECT id FROM assistant_runs r WHERE r.conversation_id=c.id AND r.user_id=c.user_id
-                    AND r.status IN ('queued','running','awaiting_confirmation') ORDER BY r.created_at DESC LIMIT 1) active_run_id
+                    AND r.status IN ('queued','running','pause_requested','paused','awaiting_confirmation') ORDER BY r.created_at DESC LIMIT 1) active_run_id,
+                   (SELECT status FROM assistant_runs r WHERE r.conversation_id=c.id AND r.user_id=c.user_id
+                    AND r.status IN ('queued','running','pause_requested','paused','awaiting_confirmation') ORDER BY r.created_at DESC LIMIT 1) active_run_status
                    FROM assistant_conversations c WHERE c.id=? AND c.user_id=? AND c.deleted_at IS NULL""",
                 (str(conversation_id), self.user_id),
             ).fetchone()
@@ -145,7 +214,21 @@ class AssistantRepository:
         self.get_conversation(conversation_id)
         now = _now()
         with self._connect() as connection:
-            connection.execute("UPDATE assistant_runs SET cancel_requested=1,updated_at=? WHERE conversation_id=? AND user_id=? AND status IN ('queued','running','awaiting_confirmation')", (now, str(conversation_id), self.user_id))
+            rows = connection.execute(
+                """
+                SELECT id
+                FROM assistant_runs
+                WHERE conversation_id=? AND user_id=?
+                  AND status IN (
+                    'queued','running','pause_requested','paused',
+                    'awaiting_confirmation','interrupted'
+                  )
+                """,
+                (str(conversation_id), self.user_id),
+            ).fetchall()
+        for row in rows:
+            self.request_cancel(UUID(str(row["id"])))
+        with self._connect() as connection:
             connection.execute("UPDATE assistant_conversations SET deleted_at=?,updated_at=? WHERE id=? AND user_id=?", (now, now, str(conversation_id), self.user_id))
 
     def create_message(self, *, conversation_id: UUID, role: str, content: str, status: str = "completed", provider: str | None = None, model: str | None = None, citations: tuple[dict[str, Any], ...] = (), metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -297,7 +380,129 @@ class AssistantRepository:
         if row is None:
             raise RuntimeError("Assistant run was not found.")
         return StoredAssistantRun(
-            id=UUID(str(row["id"])), conversation_id=UUID(str(row["conversation_id"])), user_message_id=UUID(str(row["user_message_id"])), assistant_message_id=UUID(str(row["assistant_message_id"])), status=str(row["status"]), current_stage=str(row["current_stage"]), analysis_job_id=UUID(str(row["analysis_job_id"])) if row["analysis_job_id"] else None, pending_confirmation=_loads(row["pending_confirmation"], {}), execution_mode=str(row["execution_mode"] or "ask"), execution_plan=_loads(row["execution_plan"], {}), current_action_id=UUID(str(row["current_action_id"])) if row["current_action_id"] else None, required_permission=str(row["required_permission"]) if row["required_permission"] else None, error=str(row["error"]) if row["error"] else None, last_event_sequence=int(row["last_event_sequence"] or 0), created_at=str(row["created_at"]), updated_at=str(row["updated_at"]), completed_at=str(row["completed_at"]) if row["completed_at"] else None,
+            id=UUID(str(row["id"])), conversation_id=UUID(str(row["conversation_id"])), user_message_id=UUID(str(row["user_message_id"])), assistant_message_id=UUID(str(row["assistant_message_id"])), status=str(row["status"]), current_stage=str(row["current_stage"]), analysis_job_id=UUID(str(row["analysis_job_id"])) if row["analysis_job_id"] else None, pending_confirmation=_loads(row["pending_confirmation"], {}), execution_mode=str(row["execution_mode"] or "ask"), execution_plan=_loads(row["execution_plan"], {}), current_action_id=UUID(str(row["current_action_id"])) if row["current_action_id"] else None, required_permission=str(row["required_permission"]) if row["required_permission"] else None, error=str(row["error"]) if row["error"] else None, cancel_requested=bool(row["cancel_requested"]), broker_task_id=str(row["broker_task_id"]) if row["broker_task_id"] else None, attempt_count=int(row["attempt_count"] or 0), lease_owner=str(row["lease_owner"]) if row["lease_owner"] else None, lease_expires_at=str(row["lease_expires_at"]) if row["lease_expires_at"] else None, heartbeat_at=str(row["heartbeat_at"]) if row["heartbeat_at"] else None, checkpoint_thread_id=str(row["checkpoint_thread_id"]) if row["checkpoint_thread_id"] else None, last_event_sequence=int(row["last_event_sequence"] or 0), created_at=str(row["created_at"]), updated_at=str(row["updated_at"]), completed_at=str(row["completed_at"]) if row["completed_at"] else None,
+        )
+
+    def claim_run(
+        self,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> StoredAssistantRun | None:
+        now = datetime.now(UTC)
+        expires_at = (now + timedelta(seconds=max(30, lease_seconds))).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE assistant_runs
+                SET status='running',
+                    current_stage=CASE WHEN current_stage='resuming' THEN 'resuming' ELSE 'starting' END,
+                    attempt_count=attempt_count+1, lease_owner=?,
+                    lease_expires_at=?, heartbeat_at=?,
+                    checkpoint_thread_id=COALESCE(checkpoint_thread_id,id),
+                    updated_at=?
+                WHERE id=? AND user_id=? AND cancel_requested=0
+                  AND (
+                    status IN ('queued','interrupted')
+                    OR (
+                        status='running'
+                        AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at < ?
+                    )
+                  )
+                """,
+                (
+                    worker_id,
+                    expires_at,
+                    now.isoformat(),
+                    now.isoformat(),
+                    str(run_id),
+                    self.user_id,
+                    now.isoformat(),
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_run(run_id)
+
+    def heartbeat_run(
+        self,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> bool:
+        now = datetime.now(UTC)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE assistant_runs
+                SET heartbeat_at=?, lease_expires_at=?, updated_at=?
+                WHERE id=? AND user_id=? AND status='running' AND lease_owner=?
+                """,
+                (
+                    now.isoformat(),
+                    (now + timedelta(seconds=max(30, lease_seconds))).isoformat(),
+                    now.isoformat(),
+                    str(run_id),
+                    self.user_id,
+                    worker_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def release_run_lease(self, run_id: UUID, *, worker_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE assistant_runs
+                SET lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                    updated_at=?
+                WHERE id=? AND user_id=? AND lease_owner=?
+                """,
+                (_now(), str(run_id), self.user_id, worker_id),
+            )
+
+    def list_all_recoverable_runs(
+        self,
+        *,
+        limit: int = 500,
+    ) -> tuple[dict[str, Any], ...]:
+        now = _now()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id,user_id,status,broker_task_id,updated_at,lease_expires_at
+                FROM assistant_runs
+                WHERE cancel_requested=0
+                  AND (
+                    status IN ('queued','interrupted')
+                    OR (
+                        status='running'
+                        AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at < ?
+                    )
+                  )
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (now, max(1, min(limit, 2000))),
+            ).fetchall()
+        return tuple(
+            {
+                "run_id": UUID(str(row["id"])),
+                "user_id": str(row["user_id"]),
+                "status": str(row["status"]),
+                "broker_task_id": (
+                    str(row["broker_task_id"]) if row["broker_task_id"] else None
+                ),
+                "updated_at": str(row["updated_at"]),
+                "lease_expires_at": (
+                    str(row["lease_expires_at"]) if row["lease_expires_at"] else None
+                ),
+            }
+            for row in rows
         )
 
     def update_run(self, run_id: UUID, *, status: str | None = None, current_stage: str | None = None, analysis_job_id: UUID | None = None, pending_confirmation: dict[str, Any] | None = None, execution_plan: dict[str, Any] | None = None, current_action_id: UUID | None = None, required_permission: str | None = None, error: str | None = None, completed: bool = False) -> StoredAssistantRun:
@@ -311,10 +516,188 @@ class AssistantRepository:
         return self.get_run(run_id)
 
     def request_cancel(self, run_id: UUID) -> StoredAssistantRun:
-        self.get_run(run_id)
+        current = self.get_run(run_id)
+        if current.status in {"completed", "failed", "canceled"}:
+            return current
+        now = _now()
         with self._connect() as connection:
-            connection.execute("UPDATE assistant_runs SET cancel_requested=1,status='cancel_requested',updated_at=? WHERE id=? AND user_id=?", (_now(), str(run_id), self.user_id))
+            changed = connection.execute(
+                """
+                UPDATE assistant_runs
+                SET cancel_requested=1,status='canceled',current_stage='canceled',
+                    completed_at=?,updated_at=?
+                WHERE id=? AND user_id=?
+                  AND status NOT IN ('completed','failed','canceled')
+                RETURNING id
+                """,
+                (
+                    now,
+                    now,
+                    str(run_id),
+                    self.user_id,
+                ),
+            ).fetchone()
+        if changed is None:
+            return self.get_run(run_id)
+        self.update_message(
+            current.assistant_message_id,
+            content="已结束本次 Kimi 任务，已完成的步骤和事件仍会保留。",
+            status="canceled",
+            metadata={"canceled": True},
+        )
+        self.append_event(
+            run_id,
+            event_type="run.canceled",
+            status="canceled",
+            message="Kimi 任务已结束。",
+        )
         return self.get_run(run_id)
+
+    def complete_run_answer(
+        self,
+        run_id: UUID,
+        *,
+        content: str,
+        provider: str | None,
+        model: str | None,
+        citations: tuple[dict[str, Any], ...],
+        token_usage: dict[str, int],
+        metadata: dict[str, Any],
+        event_payload: dict[str, Any],
+    ) -> bool:
+        """Atomically commit an answer only while the run is still active."""
+        now = _now()
+        with self._connect() as connection:
+            run = connection.execute(
+                """
+                UPDATE assistant_runs
+                SET status='completed',current_stage='complete',
+                    completed_at=?,updated_at=?
+                WHERE id=? AND user_id=? AND status='running'
+                  AND cancel_requested=0
+                RETURNING assistant_message_id
+                """,
+                (now, now, str(run_id), self.user_id),
+            ).fetchone()
+            if run is None:
+                return False
+            connection.execute(
+                """
+                UPDATE assistant_messages
+                SET content=?,status='completed',provider=?,model=?,
+                    citations=?,token_usage=?,metadata=?
+                WHERE id=? AND user_id=?
+                """,
+                (
+                    content,
+                    provider,
+                    model,
+                    _json(citations),
+                    _json(token_usage),
+                    _json(metadata),
+                    str(run["assistant_message_id"]),
+                    self.user_id,
+                ),
+            )
+            event = connection.execute(
+                """
+                UPDATE assistant_runs
+                SET next_event_sequence=next_event_sequence+1
+                WHERE id=? AND user_id=?
+                RETURNING next_event_sequence-1 AS sequence
+                """,
+                (str(run_id), self.user_id),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO assistant_run_events
+                    (run_id,sequence,event_type,status,message,tool_name,payload,created_at)
+                VALUES (?,?,'message.completed','completed',?,NULL,?,?)
+                """,
+                (
+                    str(run_id),
+                    int(event["sequence"]),
+                    "Kimi 已完成回答。",
+                    _json(event_payload),
+                    now,
+                ),
+            )
+        return True
+
+    def request_pause(self, run_id: UUID) -> StoredAssistantRun:
+        current = self.get_run(run_id)
+        if current.status in {"paused", "pause_requested"}:
+            return current
+        if current.status not in {"queued", "running", "interrupted"}:
+            raise RuntimeError("Assistant run cannot be paused in its current state.")
+        immediate = current.status in {"queued", "interrupted"}
+        status = "paused" if immediate else "pause_requested"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE assistant_runs
+                SET status=?,current_stage=?,updated_at=?
+                WHERE id=? AND user_id=?
+                """,
+                (
+                    status,
+                    "paused" if immediate else current.current_stage,
+                    _now(),
+                    str(run_id),
+                    self.user_id,
+                ),
+            )
+        self.append_event(
+            run_id,
+            event_type="run.paused" if immediate else "run.pause_requested",
+            status=status,
+            message="Kimi 任务已暂停。" if immediate else "将在当前安全步骤结束后暂停。",
+        )
+        return self.get_run(run_id)
+
+    def mark_paused(self, run_id: UUID) -> StoredAssistantRun:
+        current = self.get_run(run_id)
+        if current.status == "paused":
+            return current
+        paused = self.update_run(run_id, status="paused", current_stage="paused")
+        self.append_event(
+            run_id,
+            event_type="run.paused",
+            status="paused",
+            message="Kimi 任务已暂停，可稍后继续。",
+        )
+        return paused
+
+    def resume_run(self, run_id: UUID) -> StoredAssistantRun:
+        current = self.get_run(run_id)
+        if current.status != "paused":
+            raise RuntimeError("Assistant run is not paused.")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE assistant_runs
+                SET status='queued',current_stage='resuming',cancel_requested=0,
+                    broker_task_id=NULL,lease_owner=NULL,lease_expires_at=NULL,
+                    heartbeat_at=NULL,error=NULL,updated_at=?
+                WHERE id=? AND user_id=?
+                """,
+                (_now(), str(run_id), self.user_id),
+            )
+        self.append_event(
+            run_id,
+            event_type="run.resumed",
+            status="queued",
+            message="Kimi 任务正在从已保存进度继续。",
+        )
+        return self.get_run(run_id)
+
+    def pause_requested(self, run_id: UUID) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM assistant_runs WHERE id=? AND user_id=?",
+                (str(run_id), self.user_id),
+            ).fetchone()
+        return bool(row and str(row["status"]) in {"pause_requested", "paused"})
 
     def cancel_requested(self, run_id: UUID) -> bool:
         with self._connect() as connection:
@@ -325,7 +708,18 @@ class AssistantRepository:
         self.get_run(run_id) if event_type != "run.started" else None
         now = _now()
         with self._connect() as connection:
-            sequence = int(connection.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM assistant_run_events WHERE run_id=?", (str(run_id),)).fetchone()[0])
+            row = connection.execute(
+                """
+                UPDATE assistant_runs
+                SET next_event_sequence=next_event_sequence+1
+                WHERE id=? AND user_id=?
+                RETURNING next_event_sequence-1 AS sequence
+                """,
+                (str(run_id), self.user_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Assistant run was not found.")
+            sequence = int(row["sequence"])
             connection.execute("INSERT INTO assistant_run_events (run_id,sequence,event_type,status,message,tool_name,payload,created_at) VALUES (?,?,?,?,?,?,?,?)", (str(run_id), sequence, event_type, status, message, tool_name, _json(payload or {}), now))
         return {"sequence": sequence, "event_type": event_type, "status": status, "message": message, "tool_name": tool_name, "payload": payload or {}, "created_at": now}
 
@@ -535,7 +929,7 @@ class AssistantRepository:
 
     @staticmethod
     def _conversation(row: Any) -> dict[str, Any]:
-        return {"conversation_id": UUID(str(row["id"])), "title": str(row["title"]), "scope_type": str(row["scope_type"]), "scope_id": UUID(str(row["scope_id"])) if row["scope_id"] else None, "summary": str(row["summary"] or ""), "active_run_id": UUID(str(row["active_run_id"])) if row["active_run_id"] else None, "created_at": str(row["created_at"]), "updated_at": str(row["updated_at"]), "last_message_at": str(row["last_message_at"]) if row["last_message_at"] else None}
+        return {"conversation_id": UUID(str(row["id"])), "title": str(row["title"]), "scope_type": str(row["scope_type"]), "scope_id": UUID(str(row["scope_id"])) if row["scope_id"] else None, "summary": str(row["summary"] or ""), "active_run_id": UUID(str(row["active_run_id"])) if row["active_run_id"] else None, "active_run_status": str(row["active_run_status"]) if row["active_run_status"] else None, "created_at": str(row["created_at"]), "updated_at": str(row["updated_at"]), "last_message_at": str(row["last_message_at"]) if row["last_message_at"] else None}
 
     @staticmethod
     def _message(row: Any) -> dict[str, Any]:
@@ -545,7 +939,7 @@ class AssistantRepository:
 _ASSISTANT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS assistant_conversations (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,title TEXT NOT NULL,scope_type TEXT NOT NULL,scope_id TEXT,summary TEXT NOT NULL DEFAULT '',deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,last_message_at TEXT);
 CREATE TABLE IF NOT EXISTS assistant_messages (id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,status TEXT NOT NULL,provider TEXT,model TEXT,token_usage TEXT NOT NULL DEFAULT '{}',citations TEXT NOT NULL DEFAULT '[]',metadata TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS assistant_runs (id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,user_id TEXT NOT NULL,user_message_id TEXT NOT NULL,assistant_message_id TEXT NOT NULL,status TEXT NOT NULL,current_stage TEXT NOT NULL,analysis_job_id TEXT,pending_confirmation TEXT NOT NULL DEFAULT '{}',error TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0,broker_task_id TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,lease_owner TEXT,lease_expires_at TEXT,heartbeat_at TEXT,checkpoint_thread_id TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,execution_mode TEXT NOT NULL DEFAULT 'ask',execution_plan TEXT NOT NULL DEFAULT '{}',current_action_id TEXT,required_permission TEXT);
+CREATE TABLE IF NOT EXISTS assistant_runs (id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,user_id TEXT NOT NULL,user_message_id TEXT NOT NULL,assistant_message_id TEXT NOT NULL,status TEXT NOT NULL,current_stage TEXT NOT NULL,analysis_job_id TEXT,pending_confirmation TEXT NOT NULL DEFAULT '{}',error TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0,broker_task_id TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,lease_owner TEXT,lease_expires_at TEXT,heartbeat_at TEXT,checkpoint_thread_id TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,execution_mode TEXT NOT NULL DEFAULT 'ask',execution_plan TEXT NOT NULL DEFAULT '{}',current_action_id TEXT,required_permission TEXT,next_event_sequence INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS assistant_run_events (run_id TEXT NOT NULL,sequence INTEGER NOT NULL,event_type TEXT NOT NULL,status TEXT NOT NULL,message TEXT NOT NULL,tool_name TEXT,payload TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL,PRIMARY KEY(run_id,sequence));
 CREATE TABLE IF NOT EXISTS assistant_attachments (id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,message_id TEXT,user_id TEXT NOT NULL,file_name TEXT NOT NULL,media_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,width INTEGER NOT NULL,height INTEGER NOT NULL,storage_path TEXT NOT NULL,created_at TEXT NOT NULL,attachment_kind TEXT NOT NULL DEFAULT 'image',import_status TEXT,dataset_id TEXT,import_batch_id TEXT);
 CREATE TABLE IF NOT EXISTS assistant_permission_grants (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,asset_type TEXT NOT NULL,asset_id TEXT NOT NULL,capabilities TEXT NOT NULL DEFAULT '[]',status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,revoked_at TEXT);

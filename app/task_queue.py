@@ -93,7 +93,12 @@ if celery_app is not None:
         from app.observability import configure_observability
 
         configure_observability("datamind-worker")
-        run_assistant_run(UUID(run_id), user_id, dataset_store_path)
+        run_assistant_run(
+            UUID(run_id),
+            user_id,
+            dataset_store_path,
+            worker_id=str(self.request.id or "celery-worker"),
+        )
 
     @celery_app.task(name="datamind.assets.purge_expired")
     def purge_expired_assets_task() -> int:

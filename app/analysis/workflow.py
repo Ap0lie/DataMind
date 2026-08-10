@@ -4,6 +4,7 @@ import base64
 import binascii
 import io
 import json
+import math
 import operator
 import re
 import time
@@ -23,9 +24,14 @@ from app.analysis.agent_loop import (
     AgentToolRuntime,
     LoopErrorType,
     canonical_action_hash,
+    canonical_result_hash,
     error_fingerprint,
+    load_evidence_result,
 )
+from app.analysis.analysis_contract import build_analysis_contract
 from app.analysis.checkpoints import get_analysis_checkpointer
+from app.analysis.dataset_scope import resolve_analysis_dataset_scope
+from app.analysis.lineage import build_analysis_lineage
 from app.analysis.model_router import AnalysisModelRouter, MCPAnalysisModelRouter
 from app.analysis.multidataset import prepare_multi_dataset_context
 from app.analysis.prompt_utils import compact_prompt_columns, compact_prompt_records
@@ -33,17 +39,27 @@ from app.analysis.python_execution import PythonAnalysisExecutor
 from app.analysis.python_sandbox import run_generated_python_analysis
 from app.analysis.services import (
     PlannedAnalysis,
+    _apply_plan_filters,
     _build_final_insights,
+    _build_intent_query,
     _build_validation_issues,
     _dataframe,
     _format_report_charts,
     _framework_from_profile,
+    _looks_like_identifier_column,
     _plan,
     _records,
     _run_python,
     _run_sql,
     _structured_report,
     render_structured_report_html,
+)
+from app.analysis.statistical_verifier import (
+    analysis_contract_gaps,
+    qualify_observational_findings,
+    reportable_findings,
+    statistical_validation_issues,
+    verify_statistical_analysis,
 )
 from app.analysis.validators import validate_analysis_plan
 from app.analysis.workflow_prompt_context import (
@@ -56,10 +72,12 @@ from app.analysis.workflow_prompt_context import (
     prompt_system as _prompt_system,
 )
 from app.core.settings import get_settings
-from app.harness.node import NodeExecutionHarness
+from app.harness.node import NodeExecutionHarness, NodeHarnessPolicy
 from app.schemas.analysis import (
+    AnalysisContractResponse,
     AnalysisFrameworkResponse,
     AnalysisHypothesisResponse,
+    AnalysisLineageResponse,
     AnalysisPlanResponse,
     AnalysisReflectionResponse,
     AnalysisRoundPlanResponse,
@@ -75,6 +93,7 @@ from app.schemas.analysis import (
     PythonAnalysisResponse,
     PythonCodeAttemptResponse,
     SQLAnalysisResponse,
+    StatisticalVerificationResponse,
     StructuredReportResponse,
     ValidationIssueResponse,
     WorkflowTraceNodeResponse,
@@ -93,6 +112,7 @@ ROUND_REFLECT_NODE = "iterative_reflect_and_merge"
 INTEGRATE_INSIGHTS_NODE = "integrate_insights"
 ADVERSARIAL_VALIDATE_NODE = "adversarial_validate"
 FORMAT_CHARTS_NODE = "format_charts"
+STATISTICAL_VERIFY_NODE = "statistical_verify"
 REPORT_NODE = "report_agent"
 REPORT_DECIDE_NODE = "report_decide"
 REPORT_EXECUTE_NODE = "report_execute"
@@ -196,6 +216,10 @@ class AnalysisWorkflowState(TypedDict):
     dataframe_artifact_id: NotRequired[UUID]
     profile: NotRequired[DatasetProfileResponse]
     analysis_framework: NotRequired[AnalysisFrameworkResponse]
+    analysis_contract: NotRequired[AnalysisContractResponse]
+    statistical_verification: NotRequired[StatisticalVerificationResponse]
+    statistical_validation_issues: NotRequired[tuple[ValidationIssueResponse, ...]]
+    analysis_lineage: NotRequired[AnalysisLineageResponse]
     planned_analysis: NotRequired[PlannedAnalysis]
     planner_metadata: NotRequired[PlannerMetadataResponse]
     multi_dataset_context: NotRequired[MultiDatasetProfileResponse | None]
@@ -218,6 +242,7 @@ class AnalysisWorkflowState(TypedDict):
     workflow_trace: NotRequired[tuple[WorkflowTraceNodeResponse, ...]]
     executed_nodes: NotRequired[tuple[str, ...]]
     planner_source: NotRequired[str]
+    analysis_fast_path: NotRequired[bool]
     report_source: NotRequired[str]
     python_source: NotRequired[str]
     python_generated_code: NotRequired[str | None]
@@ -239,7 +264,12 @@ class AnalysisWorkflowState(TypedDict):
     loop_terminal_reason: NotRequired[str | None]
     loop_pending_call: NotRequired[dict[str, Any] | None]
     loop_last_execution: NotRequired[dict[str, Any] | None]
+    loop_duplicate_action: NotRequired[dict[str, Any] | None]
+    loop_duplicate_decision_count: NotRequired[int]
+    loop_action_counts: NotRequired[dict[str, int]]
+    loop_deferred_calls: NotRequired[tuple[dict[str, Any], ...]]
     loop_repair_context: NotRequired[dict[str, Any] | None]
+    loop_preflight_verification: NotRequired[StatisticalVerificationResponse]
     loop_summary: NotRequired[dict[str, Any]]
     adversarial_repair_count: NotRequired[int]
     report_strategy: NotRequired[str]
@@ -312,6 +342,19 @@ class AnalysisWorkflowRunner:
             additional_dataset_ids,
             effective_join_plan,
             primary_dataset_id=dataset_id,
+        )
+        dataset_scope = resolve_analysis_dataset_scope(
+            self._repository,
+            question=question,
+            dataset_id=dataset_id,
+            additional_dataset_ids=effective_additional_dataset_ids,
+            join_plan=effective_join_plan,
+        )
+        dataset_id = dataset_scope.dataset_id
+        effective_join_plan = dataset_scope.join_plan
+        effective_additional_dataset_ids = dataset_scope.additional_dataset_ids
+        prepared_relationship_plan = (
+            effective_join_plan if prepared_relationship_plan else ()
         )
         if progress_callback is not None:
             progress_callback("queued", 0, "Analysis request accepted.")
@@ -391,8 +434,16 @@ def build_analysis_workflow(
     python_executor: PythonAnalysisExecutor | None = None,
 ) -> Any:
     resolved_python_executor = python_executor or run_generated_python_analysis
+    settings = get_settings()
     graph: Any = StateGraph(AnalysisWorkflowState)
-    harness = NodeExecutionHarness(event_callback=_notify_node_event)
+    harness = NodeExecutionHarness(
+        NodeHarnessPolicy(timeout_seconds=settings.agent_loop_timeout_seconds),
+        event_callback=_notify_node_event,
+    )
+    report_harness = NodeExecutionHarness(
+        NodeHarnessPolicy(timeout_seconds=settings.report_loop_timeout_seconds + 5.0),
+        event_callback=_notify_node_event,
+    )
     nodes = {
         PLANNER_NODE: _planner_node(repository, model_router),
         DESIGN_FRAMEWORK_NODE: _design_framework_node(model_router),
@@ -407,15 +458,16 @@ def build_analysis_workflow(
         INTEGRATE_INSIGHTS_NODE: _integrate_insights_node(model_router),
         ADVERSARIAL_VALIDATE_NODE: _adversarial_validate_node(model_router),
         FORMAT_CHARTS_NODE: _format_charts_node(model_router),
+        STATISTICAL_VERIFY_NODE: _statistical_verify_node(repository),
         REPORT_NODE: _report_node(repository, model_router),
-        REPORT_DECIDE_NODE: _report_decide_node(model_router),
+        REPORT_DECIDE_NODE: _report_decide_node(),
         REPORT_EXECUTE_NODE: _report_execute_node(model_router),
         REPORT_VERIFY_NODE: _report_verify_node(),
         REPORT_REPAIR_NODE: _report_repair_node(),
         REPORT_FALLBACK_NODE: _report_fallback_node(),
         REPORT_COMMIT_NODE: _report_commit_node(repository),
         LOOP_BOOTSTRAP_NODE: _loop_bootstrap_node(),
-        LOOP_DECIDE_NODE: _loop_decide_node(model_router),
+        LOOP_DECIDE_NODE: _loop_decide_node(repository, model_router),
         LOOP_EXECUTE_NODE: _loop_execute_node(repository, resolved_python_executor),
         LOOP_OBSERVE_NODE: _loop_observe_node(repository),
         LOOP_VERIFY_NODE: _loop_verify_node(),
@@ -424,8 +476,18 @@ def build_analysis_workflow(
         LOOP_FINALIZE_NODE: _loop_finalize_node(repository),
         LOOP_ADVERSARIAL_REPAIR_NODE: _loop_adversarial_repair_node(),
     }
+    report_nodes = {
+        REPORT_NODE,
+        REPORT_DECIDE_NODE,
+        REPORT_EXECUTE_NODE,
+        REPORT_VERIFY_NODE,
+        REPORT_REPAIR_NODE,
+        REPORT_FALLBACK_NODE,
+        REPORT_COMMIT_NODE,
+    }
     for node_name, handler in nodes.items():
-        graph.add_node(node_name, harness.wrap(node_name, handler))
+        node_harness = report_harness if node_name in report_nodes else harness
+        graph.add_node(node_name, node_harness.wrap(node_name, handler))
 
     graph.add_edge(START, PLANNER_NODE)
     graph.add_edge(PLANNER_NODE, DESIGN_FRAMEWORK_NODE)
@@ -463,7 +525,14 @@ def build_analysis_workflow(
     )
     graph.add_edge(LOOP_REPAIR_NODE, LOOP_DECIDE_NODE)
     graph.add_edge(LOOP_FALLBACK_NODE, LOOP_FINALIZE_NODE)
-    graph.add_edge(LOOP_FINALIZE_NODE, INTEGRATE_INSIGHTS_NODE)
+    graph.add_conditional_edges(
+        LOOP_FINALIZE_NODE,
+        _route_after_loop_preflight,
+        {
+            INTEGRATE_INSIGHTS_NODE: INTEGRATE_INSIGHTS_NODE,
+            LOOP_ADVERSARIAL_REPAIR_NODE: LOOP_ADVERSARIAL_REPAIR_NODE,
+        },
+    )
     graph.add_edge(LOOP_ADVERSARIAL_REPAIR_NODE, LOOP_DECIDE_NODE)
     graph.add_edge(SQL_NODE, PYTHON_NODE)
     graph.add_edge(PYTHON_NODE, ROUND_PREPARE_NODE)
@@ -476,7 +545,8 @@ def build_analysis_workflow(
     graph.add_edge(ROUND_FANOUT_NODE, ROUND_REFLECT_NODE)
     graph.add_edge(ROUND_REFLECT_NODE, INTEGRATE_INSIGHTS_NODE)
     graph.add_edge(INTEGRATE_INSIGHTS_NODE, FORMAT_CHARTS_NODE)
-    graph.add_edge(FORMAT_CHARTS_NODE, ADVERSARIAL_VALIDATE_NODE)
+    graph.add_edge(FORMAT_CHARTS_NODE, STATISTICAL_VERIFY_NODE)
+    graph.add_edge(STATISTICAL_VERIFY_NODE, ADVERSARIAL_VALIDATE_NODE)
     graph.add_conditional_edges(
         ADVERSARIAL_VALIDATE_NODE,
         _route_after_adversarial_validate,
@@ -634,7 +704,11 @@ def _planner_node(
                 )
                 if plan_validation_issues:
                     raise ValueError(_plan_validation_summary(plan_validation_issues))
-                planned_analysis = _sanitize_model_plan(model_plan, profile)
+                planned_analysis = _sanitize_model_plan(
+                    model_plan,
+                    profile,
+                    allow_time=planned_analysis.time_column is not None,
+                )
                 planner_source = "model_router"
                 model_router_provider = response.provider
                 model_router_model = response.model
@@ -650,6 +724,15 @@ def _planner_node(
         )
         semantic_decision = state.get("planner_decision")
         if semantic_decision:
+            if semantic_decision.get("semantic_source") == "published":
+                from app.semantic.service import SemanticLayerService
+
+                semantic_decision = SemanticLayerService(
+                    repository
+                ).reconcile_planner_decision(
+                    semantic_decision,
+                    question=state["question"],
+                )
             semantic_plan = (
                 semantic_decision.get("semantic_plan")
                 if isinstance(semantic_decision.get("semantic_plan"), dict)
@@ -673,6 +756,20 @@ def _planner_node(
                     "requires_confirmation": bool(semantic_decision.get("requires_confirmation")),
                 }
             )
+        analysis_dataframe = _apply_plan_filters(
+            _dataframe(records),
+            planned_analysis.filters,
+        )
+        analysis_contract = build_analysis_contract(
+            question=state["question"],
+            dataset_id=dataset_id,
+            additional_dataset_ids=state.get("additional_dataset_ids", ()),
+            profile=profile,
+            plan=planned_analysis,
+            planner_metadata=planner_metadata,
+            multi_dataset_context=multi_dataset_context,
+            analysis_row_count=len(analysis_dataframe),
+        )
         executed_nodes = (*state.get("executed_nodes", ()),)
         if multi_dataset_context is not None:
             executed_nodes = (*executed_nodes, JOIN_PREPARE_NODE)
@@ -689,8 +786,16 @@ def _planner_node(
             "multi_dataset_context": multi_dataset_context,
             "planned_analysis": planned_analysis,
             "planner_metadata": planner_metadata,
+            "planner_decision": semantic_decision,
+            "analysis_contract": analysis_contract,
             "plan_validation_issues": plan_validation_issues,
             "planner_source": planner_source,
+            "analysis_fast_path": _analysis_fast_path_eligible(
+                profile=profile,
+                planned_analysis=planned_analysis,
+                multi_dataset_context=multi_dataset_context,
+                multimodal_inputs=state.get("multimodal_inputs", ()),
+            ),
             "model_router_provider": model_router_provider,
             "model_router_model": model_router_model,
             "model_router_error": model_router_error,
@@ -714,7 +819,7 @@ def _design_framework_node(model_router: AnalysisModelRouter | None) -> Any:
         model_router_provider = state.get("model_router_provider")
         model_router_model = state.get("model_router_model")
         model_router_error = state.get("model_router_error")
-        if model_router is not None:
+        if model_router is not None and not state.get("analysis_fast_path", False):
             try:
                 response = model_router.complete(
                     messages=_framework_messages(
@@ -794,7 +899,7 @@ def _sql_node(
                 "executed_nodes": (*state.get("executed_nodes", ()), SQL_NODE),
             }
 
-        if model_router is not None:
+        if model_router is not None and not state.get("analysis_fast_path", False):
             try:
                 response = model_router.complete(
                     messages=_sql_messages(
@@ -1205,18 +1310,19 @@ def _integrate_insights_node(model_router: AnalysisModelRouter | None) -> Any:
             progress=82,
             message="Integrating final insights.",
         )
-        python_result = _require(
-            state.get("python_result"),
-            "Python Agent did not produce analysis results.",
-        )
-        final_insights = _build_final_insights(
-            python_result=python_result,
-            sql_result=state.get("sql_result"),
+        python_result = state.get("python_result")
+        final_insights = _merge_report_findings(
+            _mandatory_evidence_findings(state),
+            _build_final_insights(
+                question=state["question"],
+                python_result=python_result,
+                sql_result=state.get("sql_result"),
+            ),
         )
         model_router_provider = state.get("model_router_provider")
         model_router_model = state.get("model_router_model")
         model_router_error = state.get("model_router_error")
-        if model_router is not None:
+        if model_router is not None and not state.get("analysis_fast_path", False):
             try:
                 response = model_router.complete(
                     messages=_integrate_messages(
@@ -1236,6 +1342,7 @@ def _integrate_insights_node(model_router: AnalysisModelRouter | None) -> Any:
                     metadata={
                         "agent": "integrate",
                         "dataset_id": str(state["dataset_id"]),
+                        "optional_stage": True,
                     },
                 )
                 try:
@@ -1288,19 +1395,16 @@ def _adversarial_validate_node(model_router: AnalysisModelRouter | None) -> Any:
             progress=93,
             message="Reviewing analysis quality and gaps.",
         )
-        mandatory_findings = _mandatory_evidence_findings(state)
-        final_insights = _merge_report_findings(
-            mandatory_findings,
-            state.get("final_insights", ()),
-        )
-        python_result = _require(
-            state.get("python_result"),
-            "Python Agent did not produce analysis results.",
-        )
+        final_insights = state.get("final_insights", ())
+        python_result = state.get("python_result")
+        charts = state.get("report_charts", python_result.charts if python_result else ())
         validation_issues = _build_validation_issues(
             findings=final_insights,
-            charts=python_result.charts,
-            extra_issues=state.get("plan_validation_issues", ()),
+            charts=charts,
+            extra_issues=(
+                *state.get("plan_validation_issues", ()),
+                *state.get("statistical_validation_issues", ()),
+            ),
         )
         if state.get("python_execution_error") and len(state.get("python_attempts", ())) >= 3:
             validation_issues = (
@@ -1315,22 +1419,27 @@ def _adversarial_validate_node(model_router: AnalysisModelRouter | None) -> Any:
         model_router_provider = state.get("model_router_provider")
         model_router_model = state.get("model_router_model")
         model_router_error = state.get("model_router_error")
-        if model_router is not None:
+        if model_router is not None and not state.get("analysis_fast_path", False):
             try:
                 response = model_router.complete(
                     messages=_review_messages(
                         question=state["question"],
                         final_insights=final_insights,
-                        charts=python_result.charts,
+                        charts=charts,
                         sql_result=state.get("sql_result"),
                         multimodal_inputs=state.get("multimodal_inputs", ()),
                         multi_dataset_context=state.get("multi_dataset_context"),
+                        analysis_contract=state.get("analysis_contract"),
+                        statistical_verification=state.get(
+                            "statistical_verification"
+                        ),
                     ),
                     temperature=0.1,
                     max_tokens=1000,
                     metadata={
                         "agent": "review",
                         "dataset_id": str(state["dataset_id"]),
+                        "optional_stage": True,
                     },
                 )
                 validation_issues = (
@@ -1369,18 +1478,26 @@ def _format_charts_node(model_router: AnalysisModelRouter | None) -> Any:
             progress=88,
             message="Formatting report charts.",
         )
-        python_result = _require(
-            state.get("python_result"),
-            "Python Agent did not produce analysis results.",
+        python_result = state.get("python_result")
+        charts = (
+            *(python_result.charts if python_result else ()),
+            *state.get("report_charts", ()),
         )
         report_charts = _format_report_charts(
-            charts=python_result.charts,
+            question=state["question"],
+            sql_result=state.get("sql_result"),
+            charts=charts,
             findings=state.get("final_insights", ()),
+            plan=state.get("planned_analysis"),
         )
         model_router_provider = state.get("model_router_provider")
         model_router_model = state.get("model_router_model")
         model_router_error = state.get("model_router_error")
-        if model_router is not None and report_charts:
+        if (
+            model_router is not None
+            and report_charts
+            and not state.get("analysis_fast_path", False)
+        ):
             try:
                 response = model_router.complete(
                     messages=_chart_refine_messages(
@@ -1395,6 +1512,7 @@ def _format_charts_node(model_router: AnalysisModelRouter | None) -> Any:
                     metadata={
                         "agent": "chart_refine",
                         "dataset_id": str(state["dataset_id"]),
+                        "optional_stage": True,
                     },
                 )
                 report_charts = _apply_model_chart_explanations(response.content, report_charts)
@@ -1413,28 +1531,105 @@ def _format_charts_node(model_router: AnalysisModelRouter | None) -> Any:
     return run
 
 
-_REPORT_STRATEGY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "select_report_strategy",
-        "description": "Select a report generation strategy from the available verified evidence.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "strategy": {
-                    "type": "string",
-                    "enum": ["template", "llm", "request_evidence", "fallback"],
-                },
-                "reason": {"type": "string"},
+def _statistical_verify_node(repository: DatasetStoreRepository) -> Any:
+    def run(state: AnalysisWorkflowState) -> dict[str, Any]:
+        _notify_progress(
+            state,
+            stage=STATISTICAL_VERIFY_NODE,
+            progress=91,
+            message="Checking evidence, statistical support and analysis grain.",
+        )
+        contract = _require(
+            state.get("analysis_contract"),
+            "Planner did not produce an analysis contract.",
+        )
+        findings = _merge_report_findings(
+            _mandatory_evidence_findings(state),
+            state.get("final_insights", ()),
+        )
+        findings = _attach_finding_evidence_ids(
+            findings,
+            state.get("tool_evidence", ()),
+        )
+        findings = qualify_observational_findings(findings, contract)
+        planned_analysis = _require(
+            state.get("planned_analysis"),
+            "Planner did not produce an analysis plan.",
+        )
+        analysis_dataframe = _apply_plan_filters(
+            _workflow_dataframe(repository, state),
+            planned_analysis.filters,
+        )
+        verification_kwargs = {
+            "contract": contract,
+            "profile": _require(state.get("profile"), "Missing dataset profile."),
+            "dataframe": analysis_dataframe,
+            "evidence": state.get("tool_evidence", ()),
+            "sql_result": state.get("sql_result"),
+            "python_result": state.get("python_result"),
+            "multi_dataset_context": state.get("multi_dataset_context"),
+        }
+        verification = verify_statistical_analysis(
+            findings=findings,
+            **verification_kwargs,
+        )
+        verified_findings = reportable_findings(findings, verification)
+        if verified_findings and len(verified_findings) < len(findings):
+            sanitized_verification = verify_statistical_analysis(
+                findings=verified_findings,
+                **verification_kwargs,
+            )
+            if not sanitized_verification.requires_replan:
+                findings = verified_findings
+                verification = sanitized_verification
+        issues = statistical_validation_issues(verification)
+        lineage = build_analysis_lineage(
+            contract=contract,
+            planner_metadata=state.get("planner_metadata"),
+            multi_dataset_context=state.get("multi_dataset_context"),
+            findings=findings,
+            charts=state.get("report_charts", ()),
+            report_id=str(state["run_id"]),
+        )
+        _emit_loop_event(
+            state,
+            event_type="statistical_validation",
+            status="completed" if verification.status != "failed" else "failed",
+            message=verification.summary,
+            iteration=state.get("adversarial_repair_count", 0),
+            payload={
+                "status": verification.status,
+                "requires_replan": verification.requires_replan,
+                "numeric_evidence_coverage": verification.numeric_evidence_coverage,
             },
-            "required": ["strategy", "reason"],
-            "additionalProperties": False,
-        },
-    },
-}
+        )
+        return {
+            "final_insights": findings,
+            "statistical_verification": verification,
+            "statistical_validation_issues": issues,
+            "analysis_lineage": lineage,
+            "executed_nodes": (
+                *state.get("executed_nodes", ()),
+                STATISTICAL_VERIFY_NODE,
+            ),
+        }
+
+    return run
 
 
-def _report_decide_node(model_router: AnalysisModelRouter | None) -> Any:
+def _remaining_report_timeout(
+    state: AnalysisWorkflowState,
+    *,
+    started_epoch: float | None = None,
+) -> float:
+    started = started_epoch or state.get("report_started_epoch") or time.time()
+    remaining = get_settings().report_loop_timeout_seconds - (time.time() - float(started))
+    if remaining <= 0:
+        raise TimeoutError("Report loop time budget exhausted.")
+    return remaining
+
+
+def _report_decide_node() -> Any:
     def run(state: AnalysisWorkflowState) -> dict[str, Any]:
         settings = get_settings()
         count = state.get("report_decision_count", 0) + 1
@@ -1457,72 +1652,19 @@ def _report_decide_node(model_router: AnalysisModelRouter | None) -> Any:
             strategy, reason = "rules_fallback", "Report time budget exhausted."
         elif state.get("report_used_tokens", 0) >= settings.report_loop_max_tokens:
             strategy, reason = "rules_fallback", "Report token budget exhausted."
+        elif evidence_gaps and not any(
+            item.evidence or item.data_source for item in findings
+        ):
+            strategy, reason = "evidence_gap", "Findings lack traceable evidence."
         else:
-            strategy, reason = "llm", "Default structured LLM report strategy."
-            if model_router is not None:
-                try:
-                    response = model_router.complete(
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": "你是 DataMind 报告策略控制器。根据已验证证据选择 template、llm、request_evidence 或 fallback。不得生成事实，只选择策略。证据不足才 request_evidence，且只能请求一次。",
-                            },
-                            {
-                                "role": "user",
-                                "content": json.dumps(
-                                    {
-                                        "question": state["question"],
-                                        "finding_count": len(findings),
-                                        "evidence_gaps": evidence_gaps,
-                                        "chart_count": len(state.get("report_charts", ())),
-                                        "analysis_return_used": state.get(
-                                            "report_evidence_return_count", 0
-                                        )
-                                        > 0,
-                                        "validation_issues": [
-                                            item.model_dump(mode="json")
-                                            for item in state.get("validation_issues", ())[:8]
-                                        ],
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                            },
-                        ],
-                        temperature=0.0,
-                        max_tokens=500,
-                        metadata={"agent": "report_decide", "job_id": str(state["run_id"])},
-                        tools=[_REPORT_STRATEGY_TOOL],
-                        tool_choice="auto",
-                    )
-                    arguments: dict[str, Any] = {}
-                    if len(response.tool_calls) == 1:
-                        function = response.tool_calls[0].get("function") or {}
-                        raw = function.get("arguments") or {}
-                        arguments = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                    elif response.content:
-                        arguments = json.loads(response.content)
-                    selected = str(arguments.get("strategy") or "llm")
-                    reason = str(arguments.get("reason") or reason)[:400]
-                    strategy = {
-                        "template": "template",
-                        "llm": "llm",
-                        "fallback": "rules_fallback",
-                        "request_evidence": "evidence_gap",
-                    }.get(selected, "llm")
-                    used_tokens = state.get("report_used_tokens", 0) + int(
-                        response.token_usage.get("total_tokens") or 0
-                    )
-                except Exception as exc:
-                    reason = f"Report strategy provider fallback: {type(exc).__name__}."
-                    used_tokens = state.get("report_used_tokens", 0)
-            else:
-                used_tokens = state.get("report_used_tokens", 0)
+            strategy, reason = "llm", "Verified evidence is ready for report generation."
+        used_tokens = state.get("report_used_tokens", 0)
         evidence_returns = state.get("report_evidence_return_count", 0)
         result: dict[str, Any] = {
             "report_decision_count": count,
             "report_strategy": strategy,
             "report_started_epoch": started_epoch,
-            "report_used_tokens": locals().get("used_tokens", state.get("report_used_tokens", 0)),
+            "report_used_tokens": used_tokens,
         }
         if strategy == "evidence_gap":
             if evidence_returns >= 1:
@@ -1569,6 +1711,33 @@ def _report_decide_node(model_router: AnalysisModelRouter | None) -> Any:
     return run
 
 
+def _native_grain_report_evidence_ids(
+    state: AnalysisWorkflowState,
+) -> set[str]:
+    evidence = state.get("tool_evidence", ())
+    native_ids = {
+        str(item.get("evidence_id"))
+        for item in evidence
+        if item.get("evidence_id")
+        and (
+            item.get("source_guard") is True
+            or (item.get("result") or {}).get("native_grain") is True
+        )
+    }
+    if not native_ids:
+        return set()
+    relationship_risk = any(
+        relationship.get("relationship_type") == "many_to_many"
+        for item in evidence
+        if item.get("relationship_guard") is True
+        for relationship in (item.get("result") or {}).get("relationships", ())
+        if isinstance(relationship, dict)
+    )
+    context = state.get("multi_dataset_context")
+    expansion = float((context.join_summary if context else {}).get("row_expansion_ratio") or 1)
+    return native_ids if relationship_risk or expansion > 1 else set()
+
+
 def _build_report_draft(
     state: AnalysisWorkflowState,
     model_router: AnalysisModelRouter | None,
@@ -1578,20 +1747,47 @@ def _build_report_draft(
 ) -> dict[str, Any]:
     question = state["question"]
     profile = _require(state.get("profile"), "Planner did not produce a dataset profile.")
-    python_result = _require(
-        state.get("python_result"), "Python Agent did not produce analysis results."
-    )
+    python_result = state.get("python_result")
     sql_result = state.get("sql_result")
     rounds = state.get("rounds", ())
     findings = _attach_finding_evidence_ids(
         state.get("final_insights", ()), state.get("tool_evidence", ())
     )
-    mandatory_findings = _mandatory_evidence_findings(state)
+    native_evidence_ids = _native_grain_report_evidence_ids(state)
+    if native_evidence_ids:
+        findings = tuple(
+            finding
+            for finding in findings
+            if not (
+                "sql_result" in finding.data_source.casefold()
+                and _numeric_claim_tokens(finding.content)
+                and not any(
+                    f"evidence_id:{evidence_id}" in finding.evidence
+                    for evidence_id in native_evidence_ids
+                )
+            )
+        )
+        if sql_result is not None:
+            sql_result = sql_result.model_copy(
+                update={
+                    "rows": tuple(
+                        row
+                        for row in sql_result.rows
+                        if str(row.get("evidence_id") or "") in native_evidence_ids
+                    )
+                }
+            )
+    verification = state.get("statistical_verification")
+    findings = reportable_findings(findings, verification)
+    mandatory_findings = reportable_findings(
+        _mandatory_evidence_findings(state),
+        verification,
+    )
     findings = _merge_report_findings(mandatory_findings, findings)
     issues = state.get("validation_issues", ())
-    charts = state.get("report_charts", python_result.charts)
+    charts = state.get("report_charts", python_result.charts if python_result else ())
     framework = state.get("analysis_framework")
-    structured = _structured_report(
+    baseline_structured = _structured_report(
         question=question,
         profile=profile,
         sql_result=sql_result,
@@ -1602,6 +1798,7 @@ def _build_report_draft(
         analysis_framework=framework,
         charts=charts,
     )
+    structured = baseline_structured
     source = "rules"
     provider = state.get("model_router_provider")
     model = state.get("model_router_model")
@@ -1624,14 +1821,17 @@ def _build_report_draft(
                         + json.dumps(state["report_validation"], ensure_ascii=False),
                     }
                 )
+            fast_path = bool(state.get("analysis_fast_path", False))
             response = model_router.complete(
                 messages=report_messages,
                 temperature=0.2,
-                max_tokens=2200,
+                max_tokens=1400 if fast_path else 2200,
                 metadata={
                     "agent": agent,
                     "dataset_id": str(state["dataset_id"]),
                     "revision": state.get("report_revision_count", 0) + 1,
+                    "timeout_seconds": _remaining_report_timeout(state),
+                    "optional_stage": fast_path,
                 },
             )
             token_usage = int(response.token_usage.get("total_tokens") or 0)
@@ -1657,12 +1857,14 @@ def _build_report_draft(
                             ),
                         ),
                         temperature=0.0,
-                        max_tokens=2200,
+                        max_tokens=1400 if fast_path else 2200,
                         metadata={
                             "agent": agent,
                             "dataset_id": str(state["dataset_id"]),
                             "revision": state.get("report_revision_count", 0) + 1,
                             "structured_repair": True,
+                            "timeout_seconds": _remaining_report_timeout(state),
+                            "optional_stage": fast_path,
                         },
                     )
                     token_usage += int(
@@ -1694,6 +1896,51 @@ def _build_report_draft(
             error = str(exc)
             source = "rules"
     structured = _preserve_mandatory_report_findings(structured, mandatory_findings)
+    structured = _preserve_verified_report_findings(
+        structured,
+        findings,
+        verification,
+    )
+    structured, cardinality_sanitized = _sanitize_report_cardinality_claims(
+        report=structured,
+        fallback=baseline_structured,
+        verified_findings=findings,
+    )
+    if cardinality_sanitized and source != "rules":
+        source = f"{source}_cardinality_sanitized"
+    unsupported_summary_numbers = _unsupported_summary_numbers(
+        state,
+        structured,
+        profile,
+        findings=findings,
+    )
+    if unsupported_summary_numbers:
+        structured = structured.model_copy(
+            update={
+                "executive_summary": baseline_structured.executive_summary,
+                "validation_issues": (
+                    *structured.validation_issues,
+                    ValidationIssueResponse(
+                        severity="warning",
+                        finding_ref="executive_summary",
+                        issue=(
+                            "模型摘要包含无已验证证据支持的数值："
+                            f"{', '.join(unsupported_summary_numbers)}；已使用确定性摘要。"
+                        ),
+                        suggestion="仅从已通过统计审查的结论生成摘要。",
+                    ),
+                ),
+            }
+        )
+        if source != "rules":
+            source = f"{source}_numeric_sanitized"
+    structured = structured.model_copy(
+        update={
+            "analysis_contract": state.get("analysis_contract"),
+            "statistical_verification": verification,
+            "analysis_lineage": state.get("analysis_lineage"),
+        }
+    )
     markdown = _markdown_from_structured_report(structured)
     if augmented_model_content:
         markdown = _merge_model_report(
@@ -1751,6 +1998,137 @@ def _report_execute_node(model_router: AnalysisModelRouter | None) -> Any:
     return run
 
 
+_NUMERIC_CLAIM_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?"
+)
+
+_CARDINALITY_CLAIM_PATTERNS = {
+    "1:1": re.compile(r"(?:1\s*:\s*1|一对一|one[- ]to[- ]one)", re.IGNORECASE),
+    "1:N": re.compile(r"(?:1\s*:\s*[Nn]|一对多|one[- ]to[- ]many)", re.IGNORECASE),
+    "N:1": re.compile(r"(?:[Nn]\s*:\s*1|多对一|many[- ]to[- ]one)", re.IGNORECASE),
+    "M:N": re.compile(r"(?:[Mm]\s*:\s*[Nn]|多对多|many[- ]to[- ]many)", re.IGNORECASE),
+}
+
+
+def _numeric_claim_tokens(value: Any) -> set[str]:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    text = (
+        value
+        if isinstance(value, str)
+        else json.dumps(value, ensure_ascii=False, default=str)
+    )
+    return {match.group(0).replace(",", "") for match in _NUMERIC_CLAIM_RE.finditer(text)}
+
+
+def _cardinality_claims(value: str) -> set[str]:
+    return {
+        label
+        for label, pattern in _CARDINALITY_CLAIM_PATTERNS.items()
+        if pattern.search(value)
+    }
+
+
+def _sanitize_report_cardinality_claims(
+    *,
+    report: StructuredReportResponse,
+    fallback: StructuredReportResponse,
+    verified_findings: tuple[InsightFindingResponse, ...],
+) -> tuple[StructuredReportResponse, bool]:
+    relationship_findings = tuple(
+        finding
+        for finding in verified_findings
+        if "relationship" in finding.data_source.casefold()
+        or "关系" in finding.title
+        or "基数" in finding.title
+    )
+    trusted_claims = {
+        claim
+        for finding in relationship_findings
+        for claim in _cardinality_claims(finding.content)
+    }
+    summary_claims = _cardinality_claims(report.executive_summary)
+    unsupported_summary = bool(summary_claims - trusted_claims)
+    filtered_findings = tuple(
+        finding
+        for finding in report.key_findings
+        if not (
+            (claims := _cardinality_claims(finding.content))
+            and claims - trusted_claims
+        )
+    )
+    changed = unsupported_summary or len(filtered_findings) != len(report.key_findings)
+    if not changed:
+        return report, False
+    trusted_summary = fallback.executive_summary
+    if relationship_findings and relationship_findings[0].content not in trusted_summary:
+        trusted_summary = (
+            f"{trusted_summary.strip()} {relationship_findings[0].content}"
+        ).strip()
+    return (
+        report.model_copy(
+            update={
+                "executive_summary": (
+                    trusted_summary if unsupported_summary else report.executive_summary
+                ),
+                "key_findings": filtered_findings,
+                "validation_issues": (
+                    *report.validation_issues,
+                    ValidationIssueResponse(
+                        severity="warning",
+                        finding_ref="join_cardinality",
+                        issue=(
+                            "模型报告包含未被关系画像支持的 Join 基数声明；"
+                            "已恢复为确定性关系方向和基数。"
+                        ),
+                        suggestion="仅引用关系证据中的表方向与 1:1、1:N、N:1 或 M:N。",
+                    ),
+                ),
+            }
+        ),
+        True,
+    )
+
+
+def _unsupported_summary_numbers(
+    state: AnalysisWorkflowState,
+    report: StructuredReportResponse,
+    profile: DatasetProfileResponse,
+    *,
+    findings: tuple[InsightFindingResponse, ...] | None = None,
+) -> list[str]:
+    verification = state.get("statistical_verification")
+    verified_titles = {
+        verdict.title
+        for verdict in verification.finding_verdicts
+        if verdict.status != "failed"
+    } if verification else set()
+    allowed: set[str] = set()
+    for finding in (
+        findings if findings is not None else state.get("final_insights", ())
+    ):
+        if finding.title in verified_titles:
+            allowed.update(_numeric_claim_tokens(finding.content))
+    summary = report.executive_summary
+    question = str(state.get("question") or "")
+    if question:
+        summary = summary.replace(question, "", 1)
+    python_result = state.get("python_result")
+    row_value = (
+        python_result.statistics.get("rows")
+        if isinstance(python_result, PythonAnalysisResponse)
+        else None
+    )
+    analysis_rows = (
+        max(0, int(row_value))
+        if isinstance(row_value, (int, float)) and not isinstance(row_value, bool)
+        else profile.row_count
+    )
+    trusted_profile_phrase = f"基于 {analysis_rows} 行、{profile.column_count} 列数据"
+    summary = summary.replace(trusted_profile_phrase, "基于数据", 1)
+    return sorted(_numeric_claim_tokens(summary) - allowed)
+
+
 def _report_verify_node() -> Any:
     def run(state: AnalysisWorkflowState) -> dict[str, Any]:
         settings = get_settings()
@@ -1769,7 +2147,7 @@ def _report_verify_node() -> Any:
             if item.get("evidence_id")
         }
         for finding in structured.key_findings:
-            has_number = bool(re.search(r"(?<![\w])[-+]?\d+(?:\.\d+)?%?", finding.content))
+            has_number = bool(_numeric_claim_tokens(finding.content))
             cited_ids = {
                 evidence_id for evidence_id in known_evidence_ids if evidence_id in finding.evidence
             }
@@ -1777,6 +2155,15 @@ def _report_verify_node() -> Any:
                 unsupported.append(finding.title)
             if not finding.evidence and not finding.data_source:
                 evidence_gaps.append(finding.title)
+        profile = _require(
+            state.get("profile"),
+            "Planner did not produce a dataset profile.",
+        )
+        unsupported_summary_numbers = _unsupported_summary_numbers(
+            state,
+            structured,
+            profile,
+        )
         chart_titles = {chart.title for chart in state.get("report_charts", ())}
         missing_chart_refs = [
             chart.title for chart in structured.charts if chart.title not in chart_titles
@@ -1792,15 +2179,18 @@ def _report_verify_node() -> Any:
             outcome = "fallback"
         elif evidence_gaps and evidence_returns < 1:
             outcome = "evidence_gap"
-        elif (unsupported or missing_chart_refs) and revision < settings.report_loop_max_revisions:
+        elif (
+            unsupported or unsupported_summary_numbers or missing_chart_refs
+        ) and revision < settings.report_loop_max_revisions:
             outcome = "report_issue"
-        elif unsupported or missing_chart_refs:
+        elif unsupported or unsupported_summary_numbers or missing_chart_refs:
             outcome = "fallback"
         else:
             outcome = "sufficient"
         validation = {
             "outcome": outcome,
             "unsupported_numeric_findings": unsupported,
+            "unsupported_summary_numbers": unsupported_summary_numbers,
             "evidence_gaps": evidence_gaps,
             "missing_chart_references": missing_chart_refs,
         }
@@ -1908,6 +2298,7 @@ def _report_fallback_node() -> Any:
 
 def _report_commit_node(repository: DatasetStoreRepository) -> Any:
     def run(state: AnalysisWorkflowState) -> dict[str, Any]:
+        _require_reportable_verification(state)
         _notify_progress(
             state,
             stage=REPORT_COMMIT_NODE,
@@ -1919,13 +2310,11 @@ def _report_commit_node(repository: DatasetStoreRepository) -> Any:
             state.get("planned_analysis"), "Planner did not produce an analysis plan."
         )
         profile = _require(state.get("profile"), "Planner did not produce a dataset profile.")
-        python_result = _require(
-            state.get("python_result"), "Python Agent did not produce analysis results."
-        )
+        python_result = state.get("python_result")
         structured = _require(state.get("structured_report"), "Validated report draft is missing.")
         markdown = _require(state.get("report_markdown"), "Validated report markdown is missing.")
         html = _require(state.get("html_report"), "Validated report HTML is missing.")
-        charts = state.get("report_charts", python_result.charts)
+        charts = state.get("report_charts", python_result.charts if python_result else ())
         executed = (*state.get("executed_nodes", ()), REPORT_COMMIT_NODE)
         report_source = state.get("report_source", "rules")
         trace = _workflow_trace(
@@ -1939,6 +2328,11 @@ def _report_commit_node(repository: DatasetStoreRepository) -> Any:
         combined_summary = {
             **analysis_summary,
             "analysis": analysis_summary,
+            "statistical_verification": (
+                state["statistical_verification"].model_dump(mode="json")
+                if state.get("statistical_verification")
+                else None
+            ),
             "report": {
                 "strategy": state.get("report_strategy"),
                 "revision_count": state.get("report_revision_count", 0),
@@ -1987,8 +2381,23 @@ def _report_commit_node(repository: DatasetStoreRepository) -> Any:
                 "planner_metadata": planner_metadata.model_dump(mode="json")
                 if planner_metadata
                 else None,
+                "analysis_contract": (
+                    state["analysis_contract"].model_dump(mode="json")
+                    if state.get("analysis_contract")
+                    else None
+                ),
+                "statistical_verification": (
+                    state["statistical_verification"].model_dump(mode="json")
+                    if state.get("statistical_verification")
+                    else None
+                ),
+                "analysis_lineage": (
+                    state["analysis_lineage"].model_dump(mode="json")
+                    if state.get("analysis_lineage")
+                    else None
+                ),
                 "planner_source": state.get("planner_source", "rules"),
-                "python_source": state.get("python_source", "rules"),
+                "python_source": state.get("python_source", "not_run"),
                 "python_generated_code": state.get("python_generated_code"),
                 "python_execution_error": state.get("python_execution_error"),
                 "python_attempts": [
@@ -2052,6 +2461,9 @@ def _report_commit_node(repository: DatasetStoreRepository) -> Any:
             multi_dataset_context=state.get("multi_dataset_context"),
             profile=profile,
             analysis_framework=state.get("analysis_framework"),
+            analysis_contract=state.get("analysis_contract"),
+            statistical_verification=state.get("statistical_verification"),
+            analysis_lineage=state.get("analysis_lineage"),
             sql_result=state.get("sql_result"),
             python_result=python_result,
             rounds=state.get("rounds", ()),
@@ -2059,7 +2471,8 @@ def _report_commit_node(repository: DatasetStoreRepository) -> Any:
             validation_issues=state.get("validation_issues", ()),
             structured_report=structured,
             html_report=html,
-            python_source=state.get("python_source", "rules"),
+            sql_source=state.get("sql_source", "none"),
+            python_source=state.get("python_source", "not_run"),
             python_generated_code=state.get("python_generated_code"),
             python_execution_error=state.get("python_execution_error"),
             python_attempts=state.get("python_attempts", ()),
@@ -2117,6 +2530,8 @@ def _attach_finding_evidence_ids(
                         and (
                             "sql" in str(item.get("tool_name") or "")
                             or "semantic" in str(item.get("tool_name") or "")
+                            or isinstance((item.get("result") or {}).get("sql_result"), dict)
+                            or bool((item.get("result") or {}).get("sql"))
                         )
                     )
                     or ("python" in source and "python" in str(item.get("tool_name") or ""))
@@ -2138,13 +2553,34 @@ def _attach_finding_evidence_ids(
 def _mandatory_evidence_findings(
     state: AnalysisWorkflowState,
 ) -> tuple[InsightFindingResponse, ...]:
-    evidence = [
-        item
-        for item in state.get("tool_evidence", ())
-        if item.get("evidence_id")
-        and item.get("status") in {"succeeded", "completed", None}
-        and isinstance(item.get("result"), dict)
-    ]
+    folded_question = state.get("question", "").casefold()
+    trend_requested = any(
+        token in folded_question for token in ("趋势", "月度", "按月", "trend", "monthly")
+    )
+    query_findings = (
+        tuple(
+            finding
+            for finding in _build_final_insights(
+                question=state.get("question", ""),
+                python_result=state.get("python_result"),
+                sql_result=state.get("sql_result"),
+            )
+            if finding.data_source == "sql_result.rows"
+        )
+        if trend_requested
+        else ()
+    )
+    evidence: list[dict[str, Any]] = []
+    for item in state.get("tool_evidence", ()):
+        result = item.get("result")
+        if not isinstance(result, dict):
+            result = item.get("claim_result") or item.get("contract_result")
+        if (
+            item.get("evidence_id")
+            and item.get("status") in {"succeeded", "completed", None}
+            and isinstance(result, dict)
+        ):
+            evidence.append({**item, "result": result})
     aggregates = [
         item for item in evidence if (item.get("result") or {}).get("native_grain") is True
     ]
@@ -2161,7 +2597,7 @@ def _mandatory_evidence_findings(
         state.get("question", "")
     )
     if not aggregates and not (relationship_item and relationship_requested):
-        return ()
+        return query_findings
 
     fact_sources = {
         str((item.get("result") or {}).get("source_dataset") or "")
@@ -2195,29 +2631,39 @@ def _mandatory_evidence_findings(
         relationship_type = str(relationship.get("relationship_type") or "")
         if fact_sources and left_name not in fact_sources and right_name not in fact_sources:
             continue
-        parent_name = child_name = ""
-        child_rows = child_distinct = child_duplicates = 0
+        left_column = str(relationship.get("left_column") or key)
+        right_column = str(relationship.get("right_column") or key)
+        relationship_label = {
+            "one_to_one": "1:1",
+            "one_to_many": "1:N",
+            "many_to_one": "N:1",
+            "many_to_many": "M:N",
+        }.get(relationship_type, relationship_type or "未知")
+        many_rows = many_distinct = many_duplicates = 0
         if relationship_type == "one_to_many":
-            parent_name, child_name = left_name, right_name
-            child_rows = int(relationship.get("right_non_null_count") or 0)
-            child_distinct = int(relationship.get("right_distinct_count") or 0)
-            child_duplicates = int(relationship.get("right_duplicate_count") or 0)
+            many_rows = int(relationship.get("right_non_null_count") or 0)
+            many_distinct = int(relationship.get("right_distinct_count") or 0)
+            many_duplicates = int(relationship.get("right_duplicate_count") or 0)
         elif relationship_type == "many_to_one":
-            parent_name, child_name = right_name, left_name
-            child_rows = int(relationship.get("left_non_null_count") or 0)
-            child_distinct = int(relationship.get("left_distinct_count") or 0)
-            child_duplicates = int(relationship.get("left_duplicate_count") or 0)
+            many_rows = int(relationship.get("left_non_null_count") or 0)
+            many_distinct = int(relationship.get("left_distinct_count") or 0)
+            many_duplicates = int(relationship.get("left_duplicate_count") or 0)
         if (
-            parent_name
-            and (not fact_sources or child_name in fact_sources)
+            relationship_type in {"one_to_one", "one_to_many", "many_to_one"}
+            and (not fact_sources or left_name in fact_sources or right_name in fact_sources)
             and (not direct_fact_risk_keys or key in direct_fact_risk_keys)
         ):
-            signature = (parent_name, child_name, key)
+            signature = (left_name, right_name, f"{left_column}:{right_column}")
             if signature not in seen_relationships and len(relationship_phrases) < 8:
+                detail = (
+                    f"（多侧 {many_rows} 个非空键值、{many_distinct} 个唯一键，"
+                    f"重复 {many_duplicates} 行）"
+                    if relationship_type in {"one_to_many", "many_to_one"}
+                    else ""
+                )
                 relationship_phrases.append(
-                    f"{parent_name}.{key} → {child_name}.{key} 为 1:N"
-                    f"（子表 {child_rows} 个非空键值、{child_distinct} 个唯一键，"
-                    f"重复 {child_duplicates} 行）"
+                    f"{left_name}.{left_column} → {right_name}.{right_column} "
+                    f"为 {relationship_label}{detail}"
                 )
                 seen_relationships.add(signature)
         if (
@@ -2234,7 +2680,7 @@ def _mandatory_evidence_findings(
     evidence_ids: list[str] = []
     for item in aggregates[:12]:
         result = item.get("result") or {}
-        rows = result.get("rows") or []
+        rows = result.get("rows") or result.get("claim_rows") or []
         if not rows or not isinstance(rows[0], dict):
             continue
         metric = str(result.get("metric") or "metric")
@@ -2264,11 +2710,12 @@ def _mandatory_evidence_findings(
             "再连接聚合结果；本次总额直接来自源表粒度，未对展开后的 join 行求和"
         )
     if not sections:
-        return ()
+        return query_findings
     evidence_reference = "; ".join(
         f"evidence_id:{item}" for item in dict.fromkeys(evidence_ids)
     )
     return (
+        *query_findings,
         InsightFindingResponse(
             title="多表关系、事实粒度与防重复口径",
             content="。".join(sections) + "。",
@@ -2339,8 +2786,9 @@ def _preserve_mandatory_report_findings(
     ]
     merged = _merge_report_findings(mandatory, report.key_findings)
     summary = report.executive_summary.strip()
-    if missing and missing[0].content not in summary:
-        summary = f"{summary} {missing[0].content}".strip()
+    for finding in missing[:2]:
+        if finding.content not in summary:
+            summary = f"{summary} {finding.content}".strip()
     next_steps = tuple(
         dict.fromkeys(
             (
@@ -2358,6 +2806,33 @@ def _preserve_mandatory_report_findings(
             "executive_summary": summary,
             "key_findings": merged,
             "recommended_next_steps": next_steps[:8],
+        }
+    )
+
+
+def _preserve_verified_report_findings(
+    report: StructuredReportResponse,
+    verified_findings: tuple[InsightFindingResponse, ...],
+    verification: StatisticalVerificationResponse | None,
+) -> StructuredReportResponse:
+    if verification is None:
+        return report
+    reviewed_titles = {
+        verdict.title
+        for verdict in verification.finding_verdicts
+    }
+    generated = tuple(
+        finding
+        for finding in report.key_findings
+        if finding.title not in reviewed_titles
+        and not _numeric_claim_tokens(finding.content)
+    )
+    return report.model_copy(
+        update={
+            "key_findings": _merge_report_findings(
+                generated,
+                verified_findings,
+            )
         }
     )
 
@@ -2447,6 +2922,21 @@ def _report_node(
                 "planner_metadata": (
                     planner_metadata.model_dump(mode="json") if planner_metadata else None
                 ),
+                "analysis_contract": (
+                    state["analysis_contract"].model_dump(mode="json")
+                    if state.get("analysis_contract")
+                    else None
+                ),
+                "statistical_verification": (
+                    state["statistical_verification"].model_dump(mode="json")
+                    if state.get("statistical_verification")
+                    else None
+                ),
+                "analysis_lineage": (
+                    state["analysis_lineage"].model_dump(mode="json")
+                    if state.get("analysis_lineage")
+                    else None
+                ),
                 "multi_dataset_context": (
                     multi_dataset_context.model_dump(mode="json") if multi_dataset_context else None
                 ),
@@ -2509,6 +2999,9 @@ def _report_node(
             multi_dataset_context=multi_dataset_context,
             profile=profile,
             analysis_framework=analysis_framework,
+            analysis_contract=state.get("analysis_contract"),
+            statistical_verification=state.get("statistical_verification"),
+            analysis_lineage=state.get("analysis_lineage"),
             sql_result=sql_result,
             python_result=python_result,
             rounds=rounds,
@@ -2516,6 +3009,7 @@ def _report_node(
             validation_issues=validation_issues,
             structured_report=structured_report,
             html_report=html_report,
+            sql_source=state.get("sql_source", "none"),
             python_source=state.get("python_source", "rules"),
             python_generated_code=state.get("python_generated_code"),
             python_execution_error=state.get("python_execution_error"),
@@ -2567,6 +3061,279 @@ def _loop_runtime(
     )
 
 
+def _loop_prompt_columns(state: AnalysisWorkflowState) -> tuple[Any, ...]:
+    profile = _require(state.get("profile"), "Missing profile.")
+    contract = state.get("analysis_contract")
+    plan = state.get("planned_analysis")
+    requested_values: list[str | None] = []
+    if contract is not None:
+        requested_values.extend((contract.metric, *contract.dimensions, contract.time_field))
+        requested_values.extend(item.column for item in contract.aggregations if item.column)
+        requested_values.extend(item.column for item in contract.filters)
+    if plan is not None:
+        requested_values.extend((plan.metric_column, plan.category_column, plan.time_column))
+    requested = {str(value) for value in requested_values if value}
+    selected = [
+        column
+        for column in profile.columns
+        if any(
+            column.name == value
+            or column.name.endswith(f"__{value}")
+            or value.endswith(f"__{column.name}")
+            for value in requested
+        )
+    ]
+    selected_names = {column.name for column in selected}
+    selected.extend(
+        column
+        for column in profile.columns
+        if column.name not in selected_names
+        and len(selected) < 24
+    )
+    return tuple(selected[:24])
+
+
+def _compact_loop_multi_dataset_context(
+    state: AnalysisWorkflowState,
+) -> dict[str, Any] | None:
+    compact = _compact_multi_dataset_context(state.get("multi_dataset_context"))
+    if compact is None:
+        return None
+    relevant = {column.name for column in _loop_prompt_columns(state)}
+    source_map = compact.get("column_source_map")
+    if isinstance(source_map, dict):
+        compact["column_source_map"] = {
+            key: value for key, value in source_map.items() if key in relevant
+        }
+    compact["joins"] = list(compact.get("joins") or [])[:8]
+    return compact
+
+
+def _loop_evidence_prompt(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "evidence_id": item.get("evidence_id"),
+        "tool_name": item.get("tool_name"),
+        "status": item.get("status"),
+        "summary": item.get("summary"),
+        "action_hash": str(item.get("action_hash") or "")[:16],
+        "arguments": _compact_loop_arguments(item),
+        "output_fields": list(item.get("output_fields") or ())[:20],
+        "contract_covered": bool(item.get("contract_covered")),
+        "coverage_gaps": item.get("coverage_gaps") or {},
+        "error_type": item.get("error_type"),
+    }
+
+
+def _compact_loop_arguments(item: dict[str, Any]) -> dict[str, Any]:
+    arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+    if item.get("tool_name") == "execute_safe_sql":
+        return {"sql": _truncate_text(str(arguments.get("sql") or ""), 600)}
+    return {
+        str(key): value
+        for key, value in islice(arguments.items(), 8)
+        if isinstance(value, (str, int, float, bool)) or value is None
+    }
+
+
+def _contract_result(result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    compact: dict[str, Any] = {}
+    if result.get("native_grain") is True:
+        compact.update(
+            {
+                key: result.get(key)
+                for key in (
+                    "native_grain",
+                    "source_dataset_id",
+                    "source_dataset",
+                    "metric",
+                    "aggregation",
+                    "group_by",
+                    "grain",
+                    "filters",
+                    "sql",
+                    "explanation",
+                )
+                if result.get(key) is not None
+            }
+        )
+        compact["rows"] = []
+    elif isinstance(result.get("sql_result"), dict):
+        sql_result = result["sql_result"]
+        compact["sql_result"] = {
+            "sql": sql_result.get("sql") or "",
+            "rows": [],
+            "explanation": sql_result.get("explanation") or "",
+        }
+    elif result.get("sql"):
+        compact.update(
+            {
+                "sql": result.get("sql"),
+                "rows": [],
+                "explanation": result.get("explanation") or "",
+            }
+        )
+    if isinstance(result.get("python_result"), dict):
+        python_result = result["python_result"]
+        compact["python_result"] = {
+            "statistics": python_result.get("statistics") or {},
+            "insights": [],
+            "charts": [],
+            "execution_context": python_result.get("execution_context"),
+        }
+    return compact or None
+
+
+def _claim_result(result: Any) -> dict[str, Any] | None:
+    """Keep bounded deterministic claim values when the full result is artifact-backed."""
+
+    if not isinstance(result, dict):
+        return None
+    compact = dict(_contract_result(result) or {})
+    values = _claim_result_numeric_values(result)
+    if values:
+        compact["claim_values"] = sorted(values)
+    claim_rows = _claim_result_rows(result)
+    if claim_rows:
+        compact["claim_rows"] = claim_rows
+    return compact or None
+
+
+def _claim_result_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: Any = result.get("rows")
+    if not isinstance(rows, (list, tuple)) and isinstance(result.get("sql_result"), dict):
+        rows = result["sql_result"].get("rows")
+    if not isinstance(rows, (list, tuple)):
+        return []
+
+    def magnitude(row: Any) -> float:
+        if not isinstance(row, dict):
+            return -math.inf
+        numbers: list[float] = []
+        for value in row.values():
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                number = float(str(value).replace(",", ""))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                numbers.append(abs(number))
+        return max(numbers, default=-math.inf)
+
+    selected = sorted(
+        (row for row in rows if isinstance(row, dict)),
+        key=magnitude,
+        reverse=True,
+    )[:200]
+    return [
+        {
+            str(key): value[:160] if isinstance(value, str) else value
+            for key, value in row.items()
+        }
+        for row in selected
+    ]
+
+
+def _claim_result_numeric_values(value: Any, *, key: str = "") -> set[float]:
+    ignored_keys = {
+        "sql",
+        "code",
+        "explanation",
+        "evidence_id",
+        "source_dataset_id",
+        "dataset_id",
+        "action_hash",
+        "result_hash",
+        "filters",
+        "arguments",
+    }
+    if key in ignored_keys or value is None or isinstance(value, bool):
+        return set()
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return {number} if math.isfinite(number) else set()
+    if isinstance(value, str):
+        return {
+            float(token.replace(",", ""))
+            for token in _NUMERIC_CLAIM_RE.findall(value)
+            if "%" not in token
+        }
+    if isinstance(value, dict):
+        values: set[float] = set()
+        for child_key, child in value.items():
+            values.update(_claim_result_numeric_values(child, key=str(child_key)))
+            if child_key == "rows" and isinstance(child, (list, tuple)):
+                values.update(_claim_result_row_totals(child))
+        return values
+    if isinstance(value, (list, tuple)):
+        values = {float(len(value))} if key == "rows" else set()
+        for child in value:
+            values.update(_claim_result_numeric_values(child))
+        return values
+    return set()
+
+
+def _claim_result_row_totals(rows: list[Any] | tuple[Any, ...]) -> set[float]:
+    columns: dict[str, list[float]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for column, value in row.items():
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                number = float(str(value).replace(",", ""))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                columns.setdefault(str(column), []).append(number)
+    return {
+        float(sum(numbers))
+        for numbers in columns.values()
+        if len(numbers) > 1
+    }
+
+
+def _loop_output_fields(result: Any) -> tuple[str, ...]:
+    if not isinstance(result, dict):
+        return ()
+    rows = result.get("rows")
+    if not isinstance(rows, list):
+        sql_result = result.get("sql_result")
+        rows = sql_result.get("rows") if isinstance(sql_result, dict) else None
+    return tuple(str(key) for key in rows[0]) if isinstance(rows, list) and rows else ()
+
+
+def _annotate_loop_evidence(
+    evidence: tuple[dict[str, Any], ...],
+    execution: dict[str, Any],
+    *,
+    contract_covered: bool,
+    coverage_gaps: dict[str, tuple[str, ...]],
+) -> tuple[dict[str, Any], ...]:
+    evidence_id = execution.get("evidence_id")
+    action_hash = execution.get("action_hash")
+    updated: list[dict[str, Any]] = []
+    for item in evidence:
+        matches = (
+            evidence_id and item.get("evidence_id") == evidence_id
+        ) or (
+            not evidence_id and action_hash and item.get("action_hash") == action_hash
+        )
+        updated.append(
+            {
+                **item,
+                "contract_covered": contract_covered,
+                "coverage_gaps": coverage_gaps,
+            }
+            if matches
+            else item
+        )
+    return tuple(updated)
+
+
 def _loop_bootstrap_node() -> Any:
     def run(state: AnalysisWorkflowState) -> dict[str, Any]:
         settings = get_settings()
@@ -2608,13 +3375,20 @@ def _loop_bootstrap_node() -> Any:
             "loop_terminal_reason": None,
             "loop_pending_call": None,
             "loop_last_execution": None,
+            "loop_duplicate_action": None,
+            "loop_duplicate_decision_count": 0,
+            "loop_action_counts": state.get("loop_action_counts", {}),
+            "loop_deferred_calls": state.get("loop_deferred_calls", ()),
             "executed_nodes": (*state.get("executed_nodes", ()), LOOP_BOOTSTRAP_NODE),
         }
 
     return run
 
 
-def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
+def _loop_decide_node(
+    repository: DatasetStoreRepository,
+    model_router: AnalysisModelRouter | None,
+) -> Any:
     def run(state: AnalysisWorkflowState) -> dict[str, Any]:
         _notify_progress(
             state,
@@ -2625,21 +3399,72 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
         exhausted = _loop_budget_exhaustion(state)
         if exhausted:
             return {"loop_pending_call": None, "loop_terminal_reason": exhausted}
+        repair_context = state.get("loop_repair_context")
+        required_tool = str((repair_context or {}).get("required_tool") or "")
+        deferred_calls = state.get("loop_deferred_calls", ())
+        if deferred_calls and not repair_context:
+            pending = dict(deferred_calls[0])
+            _emit_loop_event(
+                state,
+                event_type="deferred_decision",
+                status="completed",
+                message=f"Continuing the planned tool sequence with {pending['tool_name']}.",
+                iteration=state.get("loop_iteration", 0) + 1,
+                tool_name=str(pending["tool_name"]),
+                payload={
+                    "arguments_hash": canonical_action_hash(
+                        str(pending["tool_name"]), dict(pending.get("arguments") or {})
+                    ),
+                    "remaining_deferred_calls": len(deferred_calls) - 1,
+                },
+            )
+            return {
+                "loop_pending_call": pending,
+                "loop_deferred_calls": tuple(deferred_calls[1:]),
+            }
+        if (
+            required_tool == "execute_safe_sql"
+            and (repair_context or {}).get("deterministic_sql") is True
+            and not state.get("additional_dataset_ids")
+        ):
+            sql, explanation = _build_intent_query(
+                _workflow_dataframe(repository, state),
+                _require(state.get("planned_analysis"), "Missing plan."),
+            )
+            decision_count = state.get("loop_decision_count", 0) + 1
+            pending = {
+                "action": "tool_call",
+                "tool_call_id": f"contract_sql_{decision_count}",
+                "tool_name": "execute_safe_sql",
+                "arguments": {"sql": sql},
+                "reason": explanation,
+            }
+            _emit_loop_event(
+                state,
+                event_type="decision",
+                status="completed",
+                message="Generated deterministic SQL for the remaining contract requirements.",
+                iteration=state.get("loop_iteration", 0) + 1,
+                tool_name="execute_safe_sql",
+                payload={"arguments_hash": canonical_action_hash("execute_safe_sql", {"sql": sql})},
+            )
+            return {
+                "loop_decision_count": decision_count,
+                "loop_pending_call": pending,
+                "loop_deferred_calls": (),
+                "loop_repair_context": None,
+            }
         if model_router is None:
             return {"loop_pending_call": None, "loop_terminal_reason": "provider_unavailable"}
         settings = get_settings()
         decision_count = state.get("loop_decision_count", 0) + 1
-        evidence = [
-            {
-                "evidence_id": item.get("evidence_id"),
-                "tool_name": item.get("tool_name"),
-                "status": item.get("status"),
-                "summary": item.get("summary"),
-                "error_type": item.get("error_type"),
-            }
-            for item in state.get("tool_evidence", ())[-8:]
+        evidence = [_loop_evidence_prompt(item) for item in state.get("tool_evidence", ())[-6:]]
+        available_tools = [
+            item
+            for item in TOOL_DEFINITIONS
+            if not required_tool or item["function"]["name"] == required_tool
         ]
-        repair_context = state.get("loop_repair_context")
+        tool_choice = "required" if required_tool else "auto"
         decision_messages = [
             {
                 "role": "system",
@@ -2649,6 +3474,9 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
                     "For multi-table questions that name original fact tables, first inspect source datasets and use "
                     "aggregate_source_dataset separately for every requested monetary metric. Never finish or fallback "
                     "while an explicitly requested source-table metric lacks native-grain evidence. "
+                    "When repair.required_tool is present, call exactly that tool and cover every field listed in "
+                    "repair.contract_gaps; do not inspect context again. When repair.required_arguments is present, "
+                    "use those arguments as the fixed starting point. "
                     'When evidence is sufficient, reply with JSON {"action":"finish","reason":"..."}. '
                     'When safe analysis is impossible, reply {"action":"fallback","reason":"..."}. '
                     'If native tool calls are unavailable, reply {"action":"tool_call","tool_name":"...","arguments":{...},"reason":"..."}. '
@@ -2668,17 +3496,17 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
                                 "missing_count": column.missing_count,
                                 "distinct_count": column.distinct_count,
                             }
-                            for column in _require(
-                                state.get("profile"), "Missing profile."
-                            ).columns[:80]
+                            for column in _loop_prompt_columns(state)
                         ],
                         "plan": _planned_analysis_payload(
                             _require(state.get("planned_analysis"), "Missing plan.")
                         ),
-                        "multi_dataset_context": _compact_multi_dataset_context(
-                            state.get("multi_dataset_context")
-                        ),
+                        "analysis_contract": _require(
+                            state.get("analysis_contract"), "Missing analysis contract."
+                        ).model_dump(mode="json"),
+                        "multi_dataset_context": _compact_loop_multi_dataset_context(state),
                         "evidence": evidence,
+                        "attempted_action_hashes": list(state.get("loop_action_counts", {}))[-12:],
                         "repair": repair_context,
                         "remaining_budget": _public_loop_budget(
                             state.get("loop_budget", {}), state
@@ -2703,8 +3531,8 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
                         "job_id": str(state["run_id"]),
                         "allow_provider_fallback": False,
                     },
-                    tools=list(TOOL_DEFINITIONS),
-                    tool_choice="auto",
+                    tools=available_tools,
+                    tool_choice=tool_choice,
                 )
             except Exception as exc:
                 if not _is_tool_capability_error(exc):
@@ -2729,53 +3557,61 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
                 "used_tokens": int(state.get("loop_budget", {}).get("used_tokens") or 0)
                 + used_tokens,
             }
-            if len(response.tool_calls) > 1:
+            normalized_calls = tuple(
+                pending
+                for index, raw in enumerate(response.tool_calls)
+                if (pending := _pending_from_tool_call(raw, decision_count, index)) is not None
+            )
+            if len(normalized_calls) > 1:
+                tool_names = [
+                    str(call.get("tool_name") or "") for call in normalized_calls
+                ]
                 _emit_loop_event(
                     state,
-                    event_type="invalid_decision",
-                    status="failed",
-                    message="Model returned multiple tool calls; one call per decision is required.",
+                    event_type="normalized_decision",
+                    status="completed",
+                    message="Model proposed multiple tools; executing one safe call this turn.",
                     iteration=state.get("loop_iteration", 0),
-                    payload={"tool_call_count": len(response.tool_calls)},
-                )
-                return {
-                    "loop_decision_count": decision_count,
-                    "loop_budget": budget,
-                    "loop_pending_call": {"action": "retry_decision"},
-                    "loop_repair_context": {
-                        "error_type": "invalid_decision",
-                        "message": "Return exactly one tool call.",
+                    payload={
+                        "tool_call_count": len(response.tool_calls),
+                        "selected_tool": tool_names[0],
+                        "deferred_tools": tool_names[1:],
                     },
-                }
+                )
             if response.tool_calls:
-                raw = response.tool_calls[0]
-                function = raw.get("function") if isinstance(raw.get("function"), dict) else {}
-                name = str(function.get("name") or "")
-                raw_arguments = function.get("arguments") or {}
-                try:
-                    arguments = (
-                        json.loads(raw_arguments)
-                        if isinstance(raw_arguments, str)
-                        else dict(raw_arguments)
-                    )
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    arguments = {}
+                if not normalized_calls:
                     return {
                         "loop_decision_count": decision_count,
                         "loop_budget": budget,
                         "loop_pending_call": {"action": "retry_decision"},
+                        "loop_deferred_calls": (),
                         "loop_repair_context": {
                             "error_type": "invalid_arguments",
                             "message": "Tool arguments were not valid JSON.",
                         },
                     }
-                pending = {
-                    "action": "tool_call",
-                    "tool_call_id": str(raw.get("id") or f"call_{decision_count}"),
-                    "tool_name": name,
-                    "arguments": arguments,
-                    "reason": str(function.get("reason") or "")[:240],
-                }
+                pending = normalized_calls[0]
+                name = str(pending["tool_name"])
+                arguments = dict(pending.get("arguments") or {})
+                argument_error = _tool_argument_error(name, arguments)
+                if argument_error:
+                    return {
+                        "loop_decision_count": decision_count,
+                        "loop_budget": budget,
+                        "loop_pending_call": {"action": "retry_decision"},
+                        "loop_deferred_calls": (),
+                        "loop_repair_context": _tool_argument_repair_context(
+                            state, repair_context, name, argument_error
+                        ),
+                    }
+                if required_tool and name != required_tool:
+                    return _invalid_required_tool_decision(
+                        decision_count=decision_count,
+                        budget=budget,
+                        required_tool=required_tool,
+                        selected_tool=name,
+                        repair_context=repair_context,
+                    )
                 _emit_loop_event(
                     state,
                     event_type="decision",
@@ -2793,6 +3629,7 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
                     "loop_decision_count": decision_count,
                     "loop_budget": budget,
                     "loop_pending_call": pending,
+                    "loop_deferred_calls": normalized_calls[1:] if not required_tool else (),
                     "loop_repair_context": None,
                     "model_router_provider": response.provider,
                     "model_router_model": response.model,
@@ -2801,6 +3638,17 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
             if decision["action"] == "tool_call":
                 name = str(decision.get("tool_name") or "")
                 arguments = dict(decision.get("arguments") or {})
+                argument_error = _tool_argument_error(name, arguments)
+                if argument_error:
+                    return {
+                        "loop_decision_count": decision_count,
+                        "loop_budget": budget,
+                        "loop_pending_call": {"action": "retry_decision"},
+                        "loop_deferred_calls": (),
+                        "loop_repair_context": _tool_argument_repair_context(
+                            state, repair_context, name, argument_error
+                        ),
+                    }
                 pending = {
                     "action": "tool_call",
                     "tool_call_id": f"json_call_{decision_count}",
@@ -2808,6 +3656,14 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
                     "arguments": arguments,
                     "reason": decision.get("reason"),
                 }
+                if required_tool and name != required_tool:
+                    return _invalid_required_tool_decision(
+                        decision_count=decision_count,
+                        budget=budget,
+                        required_tool=required_tool,
+                        selected_tool=name,
+                        repair_context=repair_context,
+                    )
                 _emit_loop_event(
                     state,
                     event_type="decision",
@@ -2825,10 +3681,19 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
                     "loop_decision_count": decision_count,
                     "loop_budget": budget,
                     "loop_pending_call": pending,
+                    "loop_deferred_calls": (),
                     "loop_repair_context": None,
                     "model_router_provider": response.provider,
                     "model_router_model": response.model,
                 }
+            if required_tool:
+                return _invalid_required_tool_decision(
+                    decision_count=decision_count,
+                    budget=budget,
+                    required_tool=required_tool,
+                    selected_tool="",
+                    repair_context=repair_context,
+                )
             terminal = (
                 "model_finished" if decision["action"] == "finish" else "model_requested_fallback"
             )
@@ -2844,6 +3709,7 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
                 "loop_decision_count": decision_count,
                 "loop_budget": budget,
                 "loop_pending_call": decision,
+                "loop_deferred_calls": (),
                 "loop_terminal_reason": terminal,
                 "model_router_provider": response.provider,
                 "model_router_model": response.model,
@@ -2867,6 +3733,96 @@ def _loop_decide_node(model_router: AnalysisModelRouter | None) -> Any:
     return run
 
 
+def _pending_from_tool_call(
+    raw: dict[str, Any],
+    decision_count: int,
+    index: int,
+) -> dict[str, Any] | None:
+    function = raw.get("function") if isinstance(raw.get("function"), dict) else {}
+    name = str(function.get("name") or "")
+    raw_arguments = function.get("arguments") or {}
+    try:
+        arguments = (
+            json.loads(raw_arguments)
+            if isinstance(raw_arguments, str)
+            else dict(raw_arguments)
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if name not in {item["function"]["name"] for item in TOOL_DEFINITIONS}:
+        return None
+    return {
+        "action": "tool_call",
+        "tool_call_id": str(raw.get("id") or f"call_{decision_count}_{index}"),
+        "tool_name": name,
+        "arguments": arguments,
+        "reason": str(function.get("reason") or "")[:240],
+    }
+
+
+def _tool_argument_error(tool_name: str, arguments: dict[str, Any]) -> str | None:
+    definition = next(
+        (
+            item
+            for item in TOOL_DEFINITIONS
+            if item["function"]["name"] == tool_name
+        ),
+        None,
+    )
+    if definition is None:
+        return f"Unknown tool: {tool_name}."
+    required = definition["function"].get("parameters", {}).get("required", ())
+    missing = [
+        name
+        for name in required
+        if name not in arguments
+        or arguments[name] is None
+        or (isinstance(arguments[name], str) and not arguments[name].strip())
+    ]
+    return f"Missing required tool arguments: {', '.join(missing)}." if missing else None
+
+
+def _tool_argument_repair_context(
+    state: AnalysisWorkflowState,
+    repair_context: dict[str, Any] | None,
+    tool_name: str,
+    message: str,
+) -> dict[str, Any]:
+    context = {
+        **(repair_context or {}),
+        "error_type": "invalid_arguments",
+        "message": message,
+    }
+    if tool_name == "execute_safe_sql" and not state.get("additional_dataset_ids"):
+        context.update(_contract_gap_guidance(state))
+        context["deterministic_sql"] = True
+    return context
+
+
+def _invalid_required_tool_decision(
+    *,
+    decision_count: int,
+    budget: dict[str, Any],
+    required_tool: str,
+    selected_tool: str,
+    repair_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "loop_decision_count": decision_count,
+        "loop_budget": budget,
+        "loop_pending_call": {"action": "fallback"},
+        "loop_terminal_reason": "contract_repair_rejected",
+        "loop_repair_context": {
+            **(repair_context or {}),
+            "error_type": "invalid_tool_selection",
+            "message": (
+                f"The contract repair requires {required_tool}; "
+                f"{selected_tool or 'no tool'} does not address the remaining gaps."
+            ),
+        },
+    }
+
+
 def _loop_execute_node(
     repository: DatasetStoreRepository, python_executor: PythonAnalysisExecutor
 ) -> Any:
@@ -2875,6 +3831,8 @@ def _loop_execute_node(
         tool_name = str(pending.get("tool_name") or "")
         arguments = dict(pending.get("arguments") or {})
         action_hash = canonical_action_hash(tool_name, arguments)
+        action_counts = dict(state.get("loop_action_counts", {}))
+        action_counts[action_hash] = action_counts.get(action_hash, 0) + 1
         next_iteration = state.get("loop_iteration", 0) + 1
         idempotency_key = canonical_action_hash(
             str(state["run_id"]),
@@ -2883,9 +3841,37 @@ def _loop_execute_node(
         idempotency_artifact_id = uuid5(NAMESPACE_URL, f"datamind-agent-action:{idempotency_key}")
         for evidence in state.get("tool_evidence", ()):
             if evidence.get("action_hash") == action_hash and evidence.get("status") == "succeeded":
+                result_hash = evidence.get("result_hash") or canonical_result_hash(
+                    evidence.get("result")
+                    if isinstance(evidence.get("result"), dict)
+                    else None
+                )
+                duplicate = {
+                    "kind": "action",
+                    "action_hash": action_hash,
+                    "result_hash": result_hash,
+                    "evidence_id": evidence.get("evidence_id"),
+                    "tool_name": tool_name,
+                }
+                _emit_loop_event(
+                    state,
+                    event_type="duplicate_action",
+                    status="completed",
+                    message="Repeated tool decision reused existing evidence.",
+                    iteration=next_iteration,
+                    tool_name=tool_name,
+                    payload=duplicate,
+                )
                 return {
-                    "loop_last_execution": {**evidence, "cached": True},
-                    "loop_iteration": state.get("loop_iteration", 0) + 1,
+                    "loop_last_execution": {
+                        **evidence,
+                        "cached": True,
+                        "duplicate_action": True,
+                        "result_hash": result_hash,
+                    },
+                    "loop_duplicate_action": duplicate,
+                    "loop_action_counts": action_counts,
+                    "loop_iteration": next_iteration,
                 }
         try:
             restored = repository.get_artifact(state["dataset_id"], idempotency_artifact_id)
@@ -2901,11 +3887,13 @@ def _loop_execute_node(
                 "idempotency_artifact_id": str(idempotency_artifact_id),
                 "status": "succeeded",
                 "result": content.get("result"),
+                "result_hash": content.get("result_hash"),
                 "cached": True,
             }
             return {
                 "loop_iteration": next_iteration,
                 "loop_last_execution": execution,
+                "loop_action_counts": action_counts,
                 "executed_nodes": (*state.get("executed_nodes", ()), LOOP_EXECUTE_NODE),
             }
         attempts = dict(state.get("tool_attempts", {}))
@@ -2933,6 +3921,34 @@ def _loop_execute_node(
                 "error": result.error,
             }
             if result.succeeded:
+                result_hash = canonical_result_hash(result.result)
+                execution["result_hash"] = result_hash
+                matching_evidence = next(
+                    (
+                        item
+                        for item in state.get("tool_evidence", ())
+                        if result_hash
+                        and item.get("status") == "succeeded"
+                        and (
+                            item.get("result_hash")
+                            or canonical_result_hash(
+                                item.get("result")
+                                if isinstance(item.get("result"), dict)
+                                else None
+                            )
+                        )
+                        == result_hash
+                    ),
+                    None,
+                )
+                if matching_evidence is not None:
+                    execution.update(
+                        {
+                            "duplicate_action": True,
+                            "duplicate_kind": "result",
+                            "duplicate_evidence_id": matching_evidence.get("evidence_id"),
+                        }
+                    )
                 repository.save_artifact(
                     dataset_id=state["dataset_id"],
                     artifact_type="agent_loop_action",
@@ -2940,23 +3956,31 @@ def _loop_execute_node(
                         "idempotency_key": idempotency_key,
                         "tool_name": tool_name,
                         "result": result.result,
+                        "result_hash": result_hash,
                     },
                     file_name=f"{idempotency_key}.json",
                     artifact_id=idempotency_artifact_id,
                     if_absent=True,
                 )
                 execution["idempotency_artifact_id"] = str(idempotency_artifact_id)
+        duplicate = bool(execution.get("duplicate_action"))
         _emit_loop_event(
             state,
-            event_type="tool_execution",
+            event_type="duplicate_action" if duplicate else "tool_execution",
             status=execution["status"],
-            message=f"{tool_name} {execution['status']}.",
+            message=(
+                "Tool result duplicated existing evidence."
+                if duplicate
+                else f"{tool_name} {execution['status']}."
+            ),
             iteration=next_iteration,
             tool_name=tool_name,
             payload={
                 "arguments_hash": action_hash,
                 "idempotency_key": idempotency_key,
                 "error_type": execution.get("error_type"),
+                "result_hash": execution.get("result_hash"),
+                "duplicate_kind": execution.get("duplicate_kind"),
                 "result_summary": _loop_result_summary(execution.get("result")),
             },
         )
@@ -2964,7 +3988,19 @@ def _loop_execute_node(
             "loop_iteration": next_iteration,
             "tool_call_count": state.get("tool_call_count", 0) + 1,
             "tool_attempts": attempts,
+            "loop_action_counts": action_counts,
             "loop_last_execution": execution,
+            "loop_duplicate_action": (
+                {
+                    "kind": execution.get("duplicate_kind"),
+                    "action_hash": action_hash,
+                    "result_hash": execution.get("result_hash"),
+                    "evidence_id": execution.get("duplicate_evidence_id"),
+                    "tool_name": tool_name,
+                }
+                if duplicate
+                else None
+            ),
             "executed_nodes": (*state.get("executed_nodes", ()), LOOP_EXECUTE_NODE),
         }
 
@@ -2974,11 +4010,8 @@ def _loop_execute_node(
 def _loop_observe_node(repository: DatasetStoreRepository) -> Any:
     def run(state: AnalysisWorkflowState) -> dict[str, Any]:
         execution = dict(state.get("loop_last_execution") or {})
-        if execution.get("cached") and any(
-            item.get("action_hash") == execution.get("action_hash")
-            for item in state.get("tool_evidence", ())
-        ):
-            return {}
+        if execution.get("duplicate_action"):
+            return {"loop_pending_call": None}
         evidence = list(state.get("tool_evidence", ()))
         evidence_id = f"ev_{len(evidence) + 1}"
         result = execution.get("result")
@@ -2996,8 +4029,12 @@ def _loop_observe_node(repository: DatasetStoreRepository) -> Any:
         item = {
             **execution,
             "result": None if artifact_id else result,
+            "contract_result": _contract_result(result),
+            "claim_result": _claim_result(result),
+            "output_fields": _loop_output_fields(result),
             "evidence_id": evidence_id,
             "artifact_id": artifact_id,
+            "result_hash": execution.get("result_hash") or canonical_result_hash(result),
             "summary": _loop_result_summary(result),
         }
         evidence.append(item)
@@ -3018,6 +4055,7 @@ def _loop_observe_node(repository: DatasetStoreRepository) -> Any:
             "tool_evidence": tuple(evidence),
             "loop_last_execution": item,
             "loop_pending_call": None,
+            "loop_duplicate_action": None,
             "executed_nodes": (*state.get("executed_nodes", ()), LOOP_OBSERVE_NODE),
         }
 
@@ -3032,17 +4070,38 @@ def _loop_verify_node() -> Any:
             valid = (isinstance(result, dict) and bool(result)) or bool(
                 execution.get("artifact_id")
             )
+            contract_covered, coverage_gaps = _loop_execution_contract_status(
+                state,
+                execution,
+            )
+            contract_covered = valid and contract_covered
+            continue_sequence = (
+                bool(state.get("loop_deferred_calls"))
+                and valid
+                and _loop_budget_exhaustion(state) is None
+            )
+            duplicate = bool(execution.get("duplicate_action"))
+            action_hash = str(execution.get("action_hash") or "")
+            duplicate_count = max(
+                0,
+                int(state.get("loop_action_counts", {}).get(action_hash) or 0) - 1,
+            ) if duplicate else 0
             outcome = (
-                "sufficient"
-                if valid
-                and execution.get("tool_name")
-                in {
-                    "execute_semantic_query",
-                    "execute_safe_sql",
-                    "execute_python_analysis",
-                    "validate_evidence",
-                }
+                "sequence_continues"
+                if continue_sequence
+                else "sufficient"
+                if contract_covered
                 else "need_more_evidence"
+            )
+            repeated_duplicate = duplicate and not contract_covered and duplicate_count >= 2
+            action = (
+                "continue_sequence"
+                if continue_sequence
+                else "fallback"
+                if repeated_duplicate
+                else "verified"
+                if contract_covered
+                else "repairable"
             )
             _emit_loop_event(
                 state,
@@ -3051,11 +4110,42 @@ def _loop_verify_node() -> Any:
                 message=f"Evidence verification: {outcome}.",
                 iteration=state.get("loop_iteration", 0),
                 tool_name=str(execution.get("tool_name") or "") or None,
-                payload={"outcome": outcome, "valid": valid},
+                payload={
+                    "outcome": outcome,
+                    "valid": valid,
+                    "contract_covered": contract_covered,
+                    "duplicate_action": duplicate,
+                    "duplicate_count": duplicate_count,
+                    "result_hash": execution.get("result_hash"),
+                    "coverage_gaps": coverage_gaps,
+                },
+            )
+            evidence = _annotate_loop_evidence(
+                state.get("tool_evidence", ()),
+                execution,
+                contract_covered=contract_covered,
+                coverage_gaps=coverage_gaps,
             )
             return {
-                "loop_pending_call": {"action": "verified", "outcome": outcome},
-                "loop_repair_context": None,
+                "tool_evidence": evidence,
+                "loop_pending_call": {"action": action, "outcome": outcome},
+                "loop_duplicate_decision_count": duplicate_count,
+                "loop_terminal_reason": (
+                    "repeated_duplicate_decision" if repeated_duplicate else None
+                ),
+                "loop_repair_context": (
+                    {
+                        "error_type": "duplicate_action" if duplicate else "contract_gap",
+                        "message": (
+                            "Execute the deterministic contract-completing action; do not inspect "
+                            "context or repeat an existing action."
+                        ),
+                        **(state.get("loop_duplicate_action") or {}),
+                        **_contract_gap_guidance(state, coverage_gaps=coverage_gaps),
+                    }
+                    if not continue_sequence and not contract_covered and not repeated_duplicate
+                    else None
+                ),
             }
         error_type = str(execution.get("error_type") or LoopErrorType.FATAL_STATE_ERROR)
         fingerprint = error_fingerprint(
@@ -3112,10 +4202,178 @@ def _loop_verify_node() -> Any:
                 "error_type": error_type,
                 "error": execution.get("error"),
                 "repeat_count": failures[key],
+                **(_contract_gap_guidance(state) if repairable else {}),
             },
         }
 
     return run
+
+
+def _loop_execution_contract_status(
+    state: AnalysisWorkflowState,
+    execution: dict[str, Any],
+) -> tuple[bool, dict[str, tuple[str, ...]]]:
+    contract = state.get("analysis_contract")
+    if contract is None:
+        return False, {}
+    evidence = list(state.get("tool_evidence", ()))
+    if execution and not any(item is execution for item in evidence):
+        evidence.append(execution)
+    candidates: list[dict[str, tuple[str, ...]]] = [
+        analysis_contract_gaps(
+            contract=contract,
+            sql_result=None,
+            python_result=None,
+            evidence=tuple(evidence),
+        )
+    ]
+    for item in evidence:
+        if item.get("status") != "succeeded":
+            continue
+        result = item.get("contract_result") or item.get("result")
+        if not isinstance(result, dict):
+            continue
+        sql_result, python_result = _loop_analysis_results(result)
+        if sql_result is None and python_result is None:
+            continue
+        candidates.append(
+            analysis_contract_gaps(
+                contract=contract,
+                sql_result=sql_result,
+                python_result=python_result,
+            )
+        )
+    gaps = min(candidates, key=lambda item: sum(len(values) for values in item.values()))
+    return not any(gaps.values()), gaps
+
+
+def _loop_analysis_results(
+    result: dict[str, Any],
+) -> tuple[SQLAnalysisResponse | None, PythonAnalysisResponse | None]:
+    sql_result: SQLAnalysisResponse | None = None
+    python_result: PythonAnalysisResponse | None = None
+    try:
+        if isinstance(result.get("sql_result"), dict):
+            sql_result = SQLAnalysisResponse.model_validate(result["sql_result"])
+        elif result.get("sql") and isinstance(result.get("rows"), list):
+            sql_result = SQLAnalysisResponse.model_validate(
+                {
+                    "sql": result["sql"],
+                    "rows": result["rows"],
+                    "explanation": result.get("explanation") or "",
+                }
+            )
+        if isinstance(result.get("python_result"), dict):
+            python_result = PythonAnalysisResponse.model_validate(result["python_result"])
+    except (TypeError, ValueError):
+        return None, None
+    return sql_result, python_result
+
+
+def _contract_gap_guidance(
+    state: AnalysisWorkflowState,
+    *,
+    coverage_gaps: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, Any]:
+    contract = state.get("analysis_contract")
+    plan = state.get("planned_analysis")
+    if contract is None or plan is None:
+        return {}
+    if plan.route not in {"sql", "hybrid"} and not contract.aggregations:
+        return {}
+    multi_dataset = bool(state.get("additional_dataset_ids"))
+    return {
+        "required_tool": "execute_safe_sql",
+        "deterministic_sql": (
+            plan.route not in {"sql", "hybrid"} and bool(contract.aggregations)
+        ),
+        "contract_gaps": {
+            "metric": contract.metric,
+            "dimensions": list(
+                (coverage_gaps or {}).get("dimensions") or contract.dimensions
+            ),
+            "time_field": contract.time_field,
+            "aggregations": [
+                aggregation.model_dump(mode="json")
+                for aggregation in contract.aggregations
+                if not coverage_gaps
+                or not coverage_gaps.get("aggregations")
+                or f"{aggregation.operation}({aggregation.column or '*'})"
+                in coverage_gaps["aggregations"]
+            ],
+            "filters": [
+                item.model_dump(mode="json")
+                for item in contract.filters
+                if not coverage_gaps
+                or not coverage_gaps.get("filters")
+                or f"{item.column}{item.operator}{item.value}" in coverage_gaps["filters"]
+            ],
+        },
+        "instruction": (
+            "Generate one read-only SELECT against dataset that returns the requested "
+            "metric at the requested dimension/time grain and applies every contract filter. "
+            + (
+                "The joined result will be checked against source-grain evidence before reporting."
+                if multi_dataset
+                else ""
+            )
+        ),
+    }
+
+
+def _source_grain_repair_guidance(state: AnalysisWorkflowState) -> dict[str, Any]:
+    contract = state.get("analysis_contract")
+    context = state.get("multi_dataset_context")
+    if contract is None or context is None or not contract.metric:
+        return {}
+    metric = contract.metric
+    source_metric = metric.rsplit("__", 1)[-1]
+    datasets = (context.primary_dataset, *context.additional_datasets)
+    matches = [
+        (dataset, column)
+        for dataset in datasets
+        for column in dataset.columns
+        if column == metric or column == source_metric or metric.endswith(f"__{column}")
+    ]
+    if len(matches) != 1:
+        return {}
+    dataset, column = matches[0]
+    aggregation = next(
+        (
+            item.operation
+            for item in contract.aggregations
+            if item.column in {None, metric, column} and item.operation != "count"
+        ),
+        "sum",
+    )
+    same_source_dimension = next(
+        (
+            dimension.rsplit("__", 1)[-1]
+            for dimension in contract.dimensions
+            if dimension.rsplit("__", 1)[-1] in dataset.columns
+        ),
+        None,
+    )
+    arguments: dict[str, Any] = {
+        "dataset": dataset.name,
+        "metric": column,
+        "aggregation": aggregation,
+    }
+    if same_source_dimension:
+        arguments["group_by"] = same_source_dimension
+    return {
+        "required_tool": "aggregate_source_dataset",
+        "required_arguments": arguments,
+        "contract_gaps": {
+            "metric": metric,
+            "dimensions": list(contract.dimensions),
+            "grain": list(contract.grain),
+        },
+        "instruction": (
+            f"Recompute {column} from {dataset.name} at its native grain before using "
+            "joined rows. Preserve the requested dimension only when it exists on that source."
+        ),
+    }
 
 
 def _loop_repair_node() -> Any:
@@ -3149,6 +4407,12 @@ def _loop_fallback_node(
             message="Using the deterministic legacy fallback.",
         )
         fallback = _loop_runtime(repository, state, python_executor).legacy_fallback()
+        components = tuple(
+            component
+            for component, key in (("sql", "sql_result"), ("python", "python_result"))
+            if isinstance(fallback.get(key), dict)
+        )
+        component_label = " + ".join(item.upper() for item in components) or "evidence"
         evidence = (
             *state.get("tool_evidence", ()),
             {
@@ -3157,17 +4421,20 @@ def _loop_fallback_node(
                 "action_hash": "legacy_fallback",
                 "status": "succeeded",
                 "result": fallback,
-                "summary": "Deterministic SQL/Python fallback completed.",
+                "summary": f"Deterministic {component_label} fallback completed.",
             },
         )
         _emit_loop_event(
             state,
             event_type="fallback",
             status="completed",
-            message="Deterministic legacy fallback completed.",
+            message=f"Deterministic {component_label} fallback completed.",
             iteration=state.get("loop_iteration", 0),
             tool_name="legacy_fallback",
-            payload={"reason": state.get("loop_terminal_reason") or "verification_fallback"},
+            payload={
+                "reason": state.get("loop_terminal_reason") or "verification_fallback",
+                "analysis_components": components,
+            },
         )
         return {
             "tool_evidence": evidence,
@@ -3183,21 +4450,34 @@ def _loop_finalize_node(repository: DatasetStoreRepository) -> Any:
         dataframe = _workflow_dataframe(repository, state)
         plan = _require(state.get("planned_analysis"), "Missing analysis plan.")
         evidence_items = list(state.get("tool_evidence", ()))
+        resolved_results: dict[int, dict[str, Any]] = {}
+
+        def resolved_result(item: dict[str, Any]) -> dict[str, Any]:
+            key = id(item)
+            if key not in resolved_results:
+                resolved_results[key] = (
+                    load_evidence_result(repository, state["dataset_id"], item) or {}
+                )
+            return resolved_results[key]
+
         covered_source_aggregates = {
             (
-                str((item.get("result") or {}).get("source_dataset_id") or ""),
-                str((item.get("result") or {}).get("metric") or ""),
-                str((item.get("result") or {}).get("aggregation") or ""),
+                str(resolved_result(item).get("source_dataset_id") or ""),
+                str(resolved_result(item).get("metric") or ""),
+                str(resolved_result(item).get("aggregation") or ""),
             )
             for item in evidence_items
-            if isinstance(item.get("result"), dict)
-            and (item.get("result") or {}).get("native_grain") is True
+            if resolved_result(item).get("native_grain") is True
         }
         source_guard_count = sum(
-            1 for item in evidence_items if item.get("source_guard") is True
+            1
+            for item in evidence_items
+            if resolved_result(item).get("native_grain") is True
         )
         runtime = _loop_runtime(repository, state, run_generated_python_analysis)
-        for source_result in runtime.required_source_aggregates():
+        for source_result in runtime.required_source_aggregates(
+            excluded=covered_source_aggregates
+        ):
             signature = (
                 str(source_result.get("source_dataset_id") or ""),
                 str(source_result.get("metric") or ""),
@@ -3230,9 +4510,12 @@ def _loop_finalize_node(repository: DatasetStoreRepository) -> Any:
             )
             covered_source_aggregates.add(signature)
             source_guard_count += 1
-        relationship_guard_count = sum(
-            1 for item in evidence_items if item.get("relationship_guard") is True
-        )
+        relationship_items = [
+            item
+            for item in evidence_items
+            if isinstance(resolved_result(item).get("relationships"), list)
+        ]
+        relationship_guard_count = len(relationship_items)
         relationship_profile: dict[str, Any] = {}
         if relationship_guard_count == 0 and _relationship_analysis_requested(
             state.get("question", "")
@@ -3265,10 +4548,8 @@ def _loop_finalize_node(repository: DatasetStoreRepository) -> Any:
         else:
             existing_relationship = next(
                 (
-                    item.get("result")
-                    for item in evidence_items
-                    if item.get("relationship_guard") is True
-                    and isinstance(item.get("result"), dict)
+                    resolved_result(item)
+                    for item in relationship_items
                 ),
                 {},
             )
@@ -3276,16 +4557,10 @@ def _loop_finalize_node(repository: DatasetStoreRepository) -> Any:
                 existing_relationship if isinstance(existing_relationship, dict) else {}
             )
         sql_evidence: list[tuple[str, SQLAnalysisResponse]] = []
-        python_result: PythonAnalysisResponse | None = None
+        python_evidence: list[tuple[str, PythonAnalysisResponse]] = []
         charts: list[ChartResponse] = []
         for evidence in evidence_items:
-            result = evidence.get("result") if isinstance(evidence.get("result"), dict) else {}
-            if not result and evidence.get("artifact_id"):
-                artifact = repository.get_artifact(
-                    state["dataset_id"], UUID(str(evidence["artifact_id"]))
-                )
-                content = artifact.get("content")
-                result = content if isinstance(content, dict) else {}
+            result = resolved_result(evidence)
             if result.get("sql_result"):
                 sql_evidence.append(
                     (
@@ -3307,19 +4582,65 @@ def _loop_finalize_node(repository: DatasetStoreRepository) -> Any:
                     )
                 )
             if result.get("python_result"):
-                python_result = PythonAnalysisResponse.model_validate(result["python_result"])
+                python_evidence.append(
+                    (
+                        str(evidence.get("evidence_id") or f"ev_{len(python_evidence) + 1}"),
+                        PythonAnalysisResponse.model_validate(result["python_result"]),
+                    )
+                )
             if result.get("chart"):
                 charts.append(ChartResponse.model_validate(result["chart"]))
         sql_result = _combined_loop_sql_result(sql_evidence)
-        if sql_result is None:
-            sql_result = _run_sql(dataframe, plan)
-        if python_result is None:
-            python_result = _run_python(dataframe, plan, sql_result, state["question"])
-        if charts:
-            python_result = python_result.model_copy(
-                update={"charts": (*python_result.charts, *charts)}
-            )
+        python_result = _combined_loop_python_result(python_evidence)
+        contract = _require(
+            state.get("analysis_contract"),
+            "Planner did not produce an analysis contract.",
+        )
+        analysis_dataframe = _apply_plan_filters(dataframe, plan.filters)
+        preflight = verify_statistical_analysis(
+            contract=contract,
+            profile=_require(state.get("profile"), "Missing dataset profile."),
+            dataframe=analysis_dataframe,
+            findings=(),
+            evidence=tuple(evidence_items),
+            sql_result=sql_result,
+            python_result=python_result,
+            multi_dataset_context=state.get("multi_dataset_context"),
+        )
         terminal = state.get("loop_terminal_reason") or "evidence_sufficient"
+        executed_tools = tuple(
+            dict.fromkeys(
+                str(item.get("tool_name"))
+                for item in evidence_items
+                if item.get("status") == "succeeded" and item.get("tool_name")
+            )
+        )
+        fallback_sql = any(
+            item.get("tool_name") == "legacy_fallback"
+            and isinstance(resolved_result(item).get("sql_result"), dict)
+            for item in evidence_items
+        )
+        fallback_python = any(
+            item.get("tool_name") == "legacy_fallback"
+            and isinstance(resolved_result(item).get("python_result"), dict)
+            for item in evidence_items
+        )
+        components = tuple(
+            component
+            for component, executed in (
+                (
+                    "sql",
+                    "execute_safe_sql" in executed_tools
+                    or "execute_semantic_query" in executed_tools
+                    or fallback_sql,
+                ),
+                (
+                    "python",
+                    "execute_python_analysis" in executed_tools or fallback_python,
+                ),
+            )
+            if executed
+        )
         summary = {
             "iterations": state.get("loop_iteration", 0),
             "decisions": state.get("loop_decision_count", 0),
@@ -3340,24 +4661,82 @@ def _loop_finalize_node(repository: DatasetStoreRepository) -> Any:
             "source_relationship_risk_count": int(
                 relationship_profile.get("risk_count") or 0
             ),
+            "executed_tools": executed_tools,
+            "analysis_components": components,
         }
         _emit_loop_event(
             state,
-            event_type="loop_finalize",
-            status="completed",
-            message=f"Autonomous loop finalized: {terminal}.",
+            event_type="statistical_preflight",
+            status="failed" if preflight.requires_replan else "completed",
+            message=preflight.summary,
             iteration=state.get("loop_iteration", 0),
-            payload=summary,
+            payload={
+                "failed_checks": [
+                    check.code for check in preflight.checks if check.status == "failed"
+                ]
+            },
+        )
+        _emit_loop_event(
+            state,
+            event_type="loop_finalize",
+            status="failed" if preflight.requires_replan else "completed",
+            message=(
+                preflight.summary
+                if preflight.requires_replan
+                else f"Autonomous loop finalized: {terminal}."
+            ),
+            iteration=state.get("loop_iteration", 0),
+            payload={
+                **summary,
+                "preflight_status": preflight.status,
+                "failed_checks": [
+                    check.code for check in preflight.checks if check.status == "failed"
+                ],
+                "analysis_snapshot": {
+                    "plan": _planned_analysis_payload(plan),
+                    "contract": contract.model_dump(mode="json"),
+                    "sql": (
+                        {
+                            "sql": sql_result.sql,
+                            "row_count": len(sql_result.rows),
+                            "columns": list(sql_result.rows[0]) if sql_result.rows else [],
+                            "result_hash": canonical_result_hash(
+                                {"rows": list(sql_result.rows[:5])}
+                            ),
+                            "explanation": sql_result.explanation,
+                        }
+                        if sql_result is not None
+                        else None
+                    ),
+                    "charts": [
+                        chart.model_dump(mode="json", exclude={"data"})
+                        for chart in charts[:10]
+                    ],
+                    "verification": preflight.model_dump(mode="json"),
+                    "evidence": [
+                        {
+                            "evidence_id": item.get("evidence_id"),
+                            "tool_name": item.get("tool_name"),
+                            "status": item.get("status"),
+                            "summary": item.get("summary"),
+                        }
+                        for item in evidence_items[:24]
+                    ],
+                },
+            },
         )
         return {
             "sql_result": sql_result,
             "python_result": python_result,
             "rounds": (),
+            "report_charts": tuple(charts),
             "tool_evidence": tuple(evidence_items),
             "loop_summary": summary,
+            "loop_preflight_verification": preflight,
+            "statistical_verification": preflight,
             "loop_terminal_reason": terminal,
-            "sql_source": "agent_loop",
-            "python_source": "agent_loop",
+            "sql_source": _loop_component_source(evidence_items, "sql") if sql_result else "not_run",
+            "python_source": _loop_component_source(evidence_items, "python") if python_result else "not_run",
             "executed_nodes": (*state.get("executed_nodes", ()), LOOP_FINALIZE_NODE),
         }
 
@@ -3375,12 +4754,12 @@ def _combined_loop_sql_result(
     statements: list[str] = []
     for query_index, (evidence_id, result) in enumerate(evidence, start=1):
         statements.append(f"-- {evidence_id}\n{result.sql.rstrip(';')};")
-        for row in result.rows[:200]:
+        for row in result.rows:
             rows.append(
                 {
+                    **row,
                     "evidence_id": evidence_id,
                     "query_index": query_index,
-                    **row,
                 }
             )
             if len(rows) >= 1000:
@@ -3397,6 +4776,71 @@ def _combined_loop_sql_result(
     )
 
 
+def _combined_loop_python_result(
+    evidence: list[tuple[str, PythonAnalysisResponse]],
+) -> PythonAnalysisResponse | None:
+    if not evidence:
+        return None
+    if len(evidence) == 1:
+        return evidence[0][1]
+
+    statistics: dict[str, Any] = {}
+    evidence_statistics: list[dict[str, Any]] = []
+    insights: list[str] = []
+    charts: list[ChartResponse] = []
+    chart_keys: set[tuple[str, str, str]] = set()
+    text_analysis = []
+    for evidence_id, result in evidence:
+        statistics.update(result.statistics)
+        evidence_statistics.append(
+            {"evidence_id": evidence_id, "statistics": result.statistics}
+        )
+        for insight in result.insights:
+            if insight and insight not in insights:
+                insights.append(insight)
+        for chart in result.charts:
+            key = (chart.title, chart.chart_type, json.dumps(chart.spec, sort_keys=True))
+            if key not in chart_keys:
+                chart_keys.add(key)
+                charts.append(chart)
+        text_analysis.extend(result.text_analysis)
+    statistics["agent_loop_evidence"] = evidence_statistics
+    contexts = [result.execution_context for _, result in evidence]
+    execution_context = (
+        contexts[0]
+        if contexts
+        and contexts[0] is not None
+        and all(context == contexts[0] for context in contexts)
+        else None
+    )
+    return PythonAnalysisResponse(
+        statistics=statistics,
+        insights=tuple(insights),
+        charts=tuple(charts),
+        text_analysis=tuple(text_analysis),
+        execution_context=execution_context,
+    )
+
+
+def _loop_component_source(evidence: list[dict[str, Any]], component: str) -> str:
+    tool_name = {
+        "sql": "execute_safe_sql",
+        "python": "execute_python_analysis",
+    }[component]
+    sources = {
+        str(item.get("tool_name") or "")
+        for item in evidence
+        if item.get("status") == "succeeded" and item.get("tool_name")
+    }
+    if "legacy_fallback" in sources:
+        return "legacy_fallback"
+    if tool_name in sources:
+        return "agent_loop"
+    if component == "sql" and "execute_semantic_query" in sources:
+        return "semantic"
+    return "evidence_projection"
+
+
 def _loop_adversarial_repair_node() -> Any:
     def run(state: AnalysisWorkflowState) -> dict[str, Any]:
         issues = [
@@ -3404,6 +4848,18 @@ def _loop_adversarial_repair_node() -> Any:
             for item in state.get("validation_issues", ())
             if item.severity.lower() in {"high", "critical", "error"}
         ]
+        verification = state.get("statistical_verification")
+        failed_checks = (
+            [check for check in verification.checks if check.status == "failed"]
+            if verification is not None
+            else []
+        )
+        if any(check.code == "join_grain" for check in failed_checks):
+            repair_guidance = _source_grain_repair_guidance(state)
+        elif any(check.code == "request_coverage" for check in failed_checks):
+            repair_guidance = _contract_gap_guidance(state)
+        else:
+            repair_guidance = {}
         _emit_loop_event(
             state,
             event_type="adversarial_repair",
@@ -3416,8 +4872,17 @@ def _loop_adversarial_repair_node() -> Any:
             "adversarial_repair_count": state.get("adversarial_repair_count", 0) + 1,
             "loop_repair_context": {
                 "error_type": "validation_error",
-                "message": "Address adversarial validation issues.",
+                "message": "Repair the failed statistical checks with contract-completing evidence.",
                 "issues": issues[:10],
+                "failed_checks": [
+                    {
+                        "code": check.code,
+                        "message": check.message,
+                        "details": check.details,
+                    }
+                    for check in failed_checks
+                ],
+                **repair_guidance,
             },
             "loop_pending_call": None,
             "loop_terminal_reason": None,
@@ -3446,7 +4911,14 @@ def _route_after_loop_decide(state: AnalysisWorkflowState) -> str:
 
 
 def _route_after_loop_verify(state: AnalysisWorkflowState) -> str:
-    action = (state.get("loop_pending_call") or {}).get("action")
+    pending = state.get("loop_pending_call") or {}
+    action = pending.get("action")
+    if action == "continue_sequence":
+        return LOOP_DECIDE_NODE
+    if action in {"verified", "duplicate_action"} and pending.get("outcome") == "sufficient":
+        return LOOP_FINALIZE_NODE
+    if action == "duplicate_action":
+        return LOOP_REPAIR_NODE
     if action == "repairable":
         return LOOP_REPAIR_NODE
     if action in {"fallback", "budget_exhausted"}:
@@ -3456,7 +4928,30 @@ def _route_after_loop_verify(state: AnalysisWorkflowState) -> str:
     return LOOP_DECIDE_NODE
 
 
+def _route_after_loop_preflight(state: AnalysisWorkflowState) -> str:
+    verification = state.get("loop_preflight_verification")
+    if verification is None or not verification.requires_replan:
+        return INTEGRATE_INSIGHTS_NODE
+    can_repair = (
+        state.get("adversarial_repair_count", 0) < 1
+        and _loop_budget_exhaustion(state) is None
+        and any(
+            check.code in {"request_coverage", "join_grain"}
+            for check in verification.checks
+            if check.status == "failed"
+        )
+    )
+    if can_repair:
+        return LOOP_ADVERSARIAL_REPAIR_NODE
+    raise RuntimeError(_statistical_failure_message(verification))
+
+
 def _route_after_adversarial_validate(state: AnalysisWorkflowState) -> str:
+    verification = state.get("statistical_verification")
+    if verification is not None and verification.requires_replan:
+        if state.get("agent_mode") == "loop" and state.get("adversarial_repair_count", 0) < 1:
+            return LOOP_ADVERSARIAL_REPAIR_NODE
+        raise RuntimeError(_statistical_failure_message(verification))
     if state.get("agent_mode") != "loop" or state.get("adversarial_repair_count", 0) >= 1:
         return (
             REPORT_DECIDE_NODE
@@ -3470,6 +4965,25 @@ def _route_after_adversarial_validate(state: AnalysisWorkflowState) -> str:
     if high:
         return LOOP_ADVERSARIAL_REPAIR_NODE
     return REPORT_DECIDE_NODE if get_settings().report_loop_enabled else REPORT_NODE
+
+
+def _require_reportable_verification(state: AnalysisWorkflowState) -> None:
+    verification = state.get("statistical_verification")
+    if verification is None:
+        raise RuntimeError("Statistical verification is missing; report commit was blocked.")
+    if verification.requires_replan or verification.status == "failed":
+        raise RuntimeError(_statistical_failure_message(verification))
+
+
+def _statistical_failure_message(verification: StatisticalVerificationResponse) -> str:
+    failures = [check.message for check in verification.checks if check.status == "failed"]
+    verdict_failures = [
+        f"{verdict.title}: {' '.join(verdict.notes[:3])}"
+        for verdict in verification.finding_verdicts
+        if verdict.status == "failed" and verdict.notes
+    ]
+    detail = "; ".join((*failures, *verdict_failures)[:4]) or verification.summary
+    return f"Statistical verification failed after replanning; report commit was blocked: {detail}"
 
 
 def _route_after_report_decide(state: AnalysisWorkflowState) -> str:
@@ -3564,6 +5078,13 @@ def _planned_analysis_payload(plan: PlannedAnalysis) -> dict[str, Any]:
         "metric": plan.metric_column,
         "dimension": plan.category_column,
         "time": plan.time_column,
+        "time_grain": plan.time_grain,
+        "aggregations": [
+            item.model_dump(mode="json") for item in plan.aggregations
+        ],
+        "filters": [item.model_dump(mode="json") for item in plan.filters],
+        "requested_dimensions": list(plan.requested_dimensions),
+        "derived_metrics": list(plan.derived_metrics),
         "steps": list(plan.steps),
     }
 
@@ -3732,6 +5253,12 @@ def _round_python_messages(
         "category_column": planned_analysis.category_column,
         "metric_column": planned_analysis.metric_column,
         "time_column": planned_analysis.time_column,
+        "required_aggregations": [
+            item.model_dump(mode="json") for item in planned_analysis.aggregations
+        ],
+        "required_filters": [
+            item.model_dump(mode="json") for item in planned_analysis.filters
+        ],
         "columns": [
             {
                 "name": column.name,
@@ -3804,7 +5331,7 @@ def _integrate_messages(
     profile: DatasetProfileResponse,
     rounds: tuple[AnalysisRoundResponse, ...],
     sql_result: SQLAnalysisResponse | None,
-    python_result: PythonAnalysisResponse,
+    python_result: PythonAnalysisResponse | None,
     multimodal_inputs: tuple[MultimodalInputResponse, ...] = (),
     multi_dataset_context: MultiDatasetProfileResponse | None = None,
 ) -> list[dict[str, str]]:
@@ -3813,9 +5340,13 @@ def _integrate_messages(
         "profile": _compact_profile(profile),
         "rounds": [_compact_round(round_item) for round_item in rounds],
         "sql_result": _compact_sql_result(sql_result),
-        "python_statistics": _compact_python_statistics(python_result.statistics),
-        "python_insights": list(python_result.insights),
-        "charts": [_compact_chart(chart) for chart in python_result.charts],
+        "python_statistics": _compact_python_statistics(
+            python_result.statistics if python_result else {}
+        ),
+        "python_insights": list(python_result.insights) if python_result else [],
+        "charts": [_compact_chart(chart) for chart in python_result.charts]
+        if python_result
+        else [],
         "multimodal_context": _multimodal_payload(multimodal_inputs),
         "multi_dataset_context": _compact_multi_dataset_context(multi_dataset_context),
         "experience_context": _experience_context(
@@ -3852,6 +5383,8 @@ def _review_messages(
     sql_result: SQLAnalysisResponse | None,
     multimodal_inputs: tuple[MultimodalInputResponse, ...] = (),
     multi_dataset_context: MultiDatasetProfileResponse | None = None,
+    analysis_contract: AnalysisContractResponse | None = None,
+    statistical_verification: StatisticalVerificationResponse | None = None,
 ) -> list[dict[str, str]]:
     payload = {
         "question": _truncate_text(question, 2000),
@@ -3860,6 +5393,14 @@ def _review_messages(
         "sql_result": _compact_sql_result(sql_result),
         "multimodal_context": _multimodal_payload(multimodal_inputs),
         "multi_dataset_context": _compact_multi_dataset_context(multi_dataset_context),
+        "analysis_contract": (
+            analysis_contract.model_dump(mode="json") if analysis_contract else None
+        ),
+        "statistical_verification": (
+            statistical_verification.model_dump(mode="json")
+            if statistical_verification
+            else None
+        ),
         "experience_context": _experience_context("review"),
     }
     return [
@@ -3869,6 +5410,7 @@ def _review_messages(
                 "You are DataMind adversarial_validate. Return only JSON with key issues. "
                 "Each issue has severity, finding_ref, issue, suggestion. Return at most 10 issues. "
                 "Flag unsupported claims, chart/text mismatch, over-attribution, data gaps, hallucinated fields, "
+                "unqualified causal language, missing comparison support, unsafe analysis grain, "
                 "and any misuse of multimodal context as if it were tabular evidence. Apply "
                 "experience_context as additional review criteria."
             ),
@@ -3988,9 +5530,13 @@ def _report_messages(
                 "array with title, content, data_source, evidence, confidence, business_impact, "
                 "recommended_action, impact_pct. Do not invent columns, rows, or metrics beyond "
                 "the payload. Keep all dataset claims traceable to SQL, Python, chart, or round "
-                "evidence. Findings whose data_source starts with tool_evidence are mandatory: "
-                "preserve their source-table totals, relationship direction, fact grain, cardinality "
-                "risk, prevention method, and evidence_id in both the executive summary and key findings. "
+                "evidence. Findings whose data_source starts with sql_result or tool_evidence are mandatory: "
+                "preserve their verified KPIs, trend periods, source-table totals, relationship direction, "
+                "fact grain, cardinality risk, prevention method, and evidence_id in both the executive "
+                "summary and key findings. "
+                "Respect analysis_contract and statistical_verification. Do not restore findings whose "
+                "verdict failed. Comparison claims must retain sample size plus effect size or confidence "
+                "interval. Describe observational associations without causal language. "
                 "Multimodal context can enrich explanation and data-gap notes but must "
                 "not be treated as verified tabular data unless the payload provides matching evidence. "
                 "Use experience_context to shape narrative quality, prioritization, and review discipline."
@@ -4019,6 +5565,12 @@ def _python_messages(
         "category_column": planned_analysis.category_column,
         "metric_column": planned_analysis.metric_column,
         "time_column": planned_analysis.time_column,
+        "required_aggregations": [
+            item.model_dump(mode="json") for item in planned_analysis.aggregations
+        ],
+        "required_filters": [
+            item.model_dump(mode="json") for item in planned_analysis.filters
+        ],
         "columns": [
             {
                 "name": column.name,
@@ -4076,6 +5628,12 @@ def _python_chart_messages(
         "category_column": planned_analysis.category_column,
         "metric_column": planned_analysis.metric_column,
         "time_column": planned_analysis.time_column,
+        "required_aggregations": [
+            item.model_dump(mode="json") for item in planned_analysis.aggregations
+        ],
+        "required_filters": [
+            item.model_dump(mode="json") for item in planned_analysis.filters
+        ],
         "columns": [
             {
                 "name": column.name,
@@ -4138,6 +5696,7 @@ def _execute_generated_python_with_repairs(
     python_executor: PythonAnalysisExecutor,
     hypothesis: str | None = None,
 ) -> PythonCodeExecutionResult:
+    dataframe = _apply_plan_filters(dataframe, planned_analysis.filters)
     attempts: list[PythonCodeAttemptResponse] = []
     provider: str | None = None
     model: str | None = None
@@ -4397,6 +5956,12 @@ def _sql_messages(
         "category_column": planned_analysis.category_column,
         "metric_column": planned_analysis.metric_column,
         "time_column": planned_analysis.time_column,
+        "required_aggregations": [
+            item.model_dump(mode="json") for item in planned_analysis.aggregations
+        ],
+        "required_filters": [
+            item.model_dump(mode="json") for item in planned_analysis.filters
+        ],
         "columns": [
             {
                 "name": column.name,
@@ -4422,7 +5987,8 @@ def _sql_messages(
                 "use DROP, DELETE, UPDATE, INSERT, ATTACH, or COPY. Use experience_context "
                 "only to choose useful aggregations or filters; never reference columns outside "
                 "the provided schema. For joined data, inspect multi_dataset_context: do not SUM or AVG "
-                "a metric across expanded duplicate rows unless the query explicitly restores its source grain."
+                "a metric across expanded duplicate rows unless the query explicitly restores its source grain. "
+                "The query must implement every required_aggregation and required_filter exactly."
             ),
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -4611,9 +6177,14 @@ def _parse_model_plan(content: str, *, fallback: PlannedAnalysis) -> PlannedAnal
     return PlannedAnalysis(
         route=route,
         category_column=_optional_str(payload.get("category_column")),
-        metric_column=_optional_str(payload.get("metric_column")),
-        time_column=_optional_str(payload.get("time_column")),
+        metric_column=_optional_str(payload.get("metric_column")) or fallback.metric_column,
+        time_column=_optional_str(payload.get("time_column")) or fallback.time_column,
         steps=steps or fallback.steps,
+        aggregations=fallback.aggregations,
+        filters=fallback.filters,
+        requested_dimensions=fallback.requested_dimensions,
+        derived_metrics=fallback.derived_metrics,
+        time_grain=fallback.time_grain,
     )
 
 
@@ -4730,7 +6301,11 @@ def _execute_analysis_round(
             )
             if plan_validation_issues:
                 raise ValueError(_plan_validation_summary(plan_validation_issues))
-            round_plan = _sanitize_model_plan(model_plan, profile)
+            round_plan = _sanitize_model_plan(
+                model_plan,
+                profile,
+                allow_time=round_plan.time_column is not None,
+            )
             model_router_provider = response.provider
             model_router_model = response.model
         except Exception as exc:
@@ -5478,7 +7053,7 @@ def _apply_report_chart_explanations(
                 chart_type=chart.chart_type,
                 spec=chart.spec,
                 data=chart.data,
-                explanation=explanation,
+                explanation=_preserve_chart_denominator_scope(chart, explanation),
                 related_finding_ids=chart.related_finding_ids,
             )
         )
@@ -5495,6 +7070,34 @@ def _markdown_from_structured_report(report: StructuredReportResponse) -> str:
     ]
     if report.analysis_context:
         lines.extend(["## Analysis Context", report.analysis_context, ""])
+    if report.analysis_contract:
+        contract = report.analysis_contract
+        lines.extend(
+            [
+                "## Analysis Contract",
+                f"- 目标: {contract.objective}",
+                f"- 总体: {contract.population}",
+                f"- 方法: {contract.method}",
+                f"- 指标: {contract.metric or '计数/文本分析'}",
+                f"- 粒度: {', '.join(contract.grain)}",
+                "",
+            ]
+        )
+    if report.statistical_verification:
+        verification = report.statistical_verification
+        lines.extend(
+            [
+                "## Statistical Verification",
+                verification.summary,
+                f"- 数值证据覆盖率: {verification.numeric_evidence_coverage:.0%}",
+                *[
+                    f"- {check.status} · {check.code}: {check.message}"
+                    for check in verification.checks
+                    if check.status != "not_applicable"
+                ],
+                "",
+            ]
+        )
     if report.key_findings:
         lines.append("## Key Findings")
         for finding in report.key_findings:
@@ -5562,22 +7165,81 @@ def _apply_model_chart_explanations(
             chart_type=chart.chart_type,
             spec=chart.spec,
             data=chart.data,
-            explanation=explanation_by_title.get(chart.title, chart.explanation),
+            explanation=_preserve_chart_denominator_scope(
+                chart,
+                explanation_by_title.get(chart.title, chart.explanation),
+            ),
             related_finding_ids=chart.related_finding_ids,
         )
         for chart in charts
     )
 
 
+def _preserve_chart_denominator_scope(
+    chart: ChartResponse,
+    explanation: str,
+) -> str:
+    scope = str(chart.spec.get("denominator_scope") or "")
+    if chart.chart_type != "pie" or not scope:
+        return explanation
+    displayed = int(chart.spec.get("displayed_category_count") or len(chart.data))
+    excluded = int(chart.spec.get("excluded_category_count") or 0)
+    if scope == "displayed_top_n":
+        required = (
+            f"百分比以展示的前 {displayed} 类合计为分母；另有 {excluded} 类未展示，"
+            "不代表全量占比。"
+        )
+    else:
+        required = "百分比以查询返回的全部类别合计为分母。"
+    base = str(explanation or "").strip()
+    return base if required in base else f"{base} {required}".strip()
+
+
 def _sanitize_model_plan(
     planned_analysis: PlannedAnalysis,
     profile: DatasetProfileResponse,
+    *,
+    allow_time: bool = True,
 ) -> PlannedAnalysis:
     available_columns = {column.name for column in profile.columns}
     metric_columns = set(profile.numeric_columns)
-    metric_column = _column_or_none(planned_analysis.metric_column, metric_columns)
-    category_column = _column_or_none(planned_analysis.category_column, available_columns)
-    time_column = _column_or_none(planned_analysis.time_column, available_columns)
+    requested_dimensions = tuple(
+        column
+        for column in planned_analysis.requested_dimensions
+        if column in available_columns
+    )
+    aggregations = tuple(
+        item
+        for item in planned_analysis.aggregations
+        if item.column is None or item.column in available_columns
+    )
+    filters = tuple(
+        item for item in planned_analysis.filters if item.column in available_columns
+    )
+    requested_metric = next(
+        (
+            item.column
+            for item in aggregations
+            if item.operation in {"sum", "avg", "min", "max"}
+            and item.column in metric_columns
+        ),
+        None,
+    )
+    metric_column = requested_metric or _column_or_none(
+        planned_analysis.metric_column, metric_columns
+    )
+    category_column = (
+        requested_dimensions[0]
+        if requested_dimensions
+        else None
+        if aggregations
+        else _column_or_none(planned_analysis.category_column, available_columns)
+    )
+    time_column = (
+        _column_or_none(planned_analysis.time_column, available_columns)
+        if allow_time
+        else None
+    )
     if category_column == metric_column:
         category_column = next(
             (column for column in profile.categorical_columns if column != metric_column),
@@ -5594,6 +7256,28 @@ def _sanitize_model_plan(
         metric_column=metric_column,
         time_column=time_column,
         steps=planned_analysis.steps,
+        aggregations=aggregations,
+        filters=filters,
+        requested_dimensions=requested_dimensions,
+        derived_metrics=planned_analysis.derived_metrics,
+        time_grain=planned_analysis.time_grain if time_column else None,
+    )
+
+
+def _analysis_fast_path_eligible(
+    *,
+    profile: DatasetProfileResponse,
+    planned_analysis: PlannedAnalysis,
+    multi_dataset_context: MultiDatasetProfileResponse | None,
+    multimodal_inputs: tuple[MultimodalInputResponse, ...],
+) -> bool:
+    settings = get_settings()
+    return bool(
+        settings.analysis_fast_path_enabled
+        and profile.row_count <= settings.analysis_fast_path_max_rows
+        and planned_analysis.route == "sql"
+        and multi_dataset_context is None
+        and not multimodal_inputs
     )
 
 
@@ -5606,8 +7290,52 @@ def _planner_metadata(
     error: str | None,
     multi_dataset_context: MultiDatasetProfileResponse | None = None,
 ) -> PlannerMetadataResponse:
-    candidate_metrics = tuple(profile.numeric_columns[:8])
-    candidate_dimensions = tuple(profile.categorical_columns[:8])
+    metric_priority = (
+        *((planned_analysis.metric_column,) if planned_analysis.metric_column else ()),
+        *profile.numeric_columns,
+    )
+    candidate_metrics = tuple(
+        dict.fromkeys(
+            column
+            for column in metric_priority
+            if not _looks_like_identifier_column(column)
+        )
+    )[:8]
+    excluded_dimension_columns = {
+        *(item.column for item in planned_analysis.filters),
+        *(item.column for item in planned_analysis.aggregations if item.column),
+        *((planned_analysis.metric_column,) if planned_analysis.metric_column else ()),
+    }
+    selected_dimensions = tuple(
+        column
+        for column in (
+        *planned_analysis.requested_dimensions,
+        *((planned_analysis.category_column,) if planned_analysis.category_column else ()),
+        )
+        if column not in excluded_dimension_columns
+    )
+    non_identifier_dimensions = tuple(
+        column
+        for column in profile.categorical_columns
+        if not _looks_like_identifier_column(column)
+    )
+    identifier_dimensions = tuple(
+        column
+        for column in profile.categorical_columns
+        if _looks_like_identifier_column(column)
+    )
+    fallback_dimensions = (
+        (*non_identifier_dimensions, *identifier_dimensions)
+        if not selected_dimensions
+        else ()
+    )
+    candidate_dimensions = tuple(
+        dict.fromkeys(
+            column
+            for column in (*selected_dimensions, *fallback_dimensions)
+            if column not in excluded_dimension_columns
+        )
+    )[:8]
     candidate_time_fields = tuple(
         column.name
         for column in profile.columns
@@ -5667,7 +7395,7 @@ def _planner_metadata(
             f"已确认 {join_count} 个 join。"
         )
     if error:
-        route_reason += f" 模型规划不可用，已使用规则 fallback：{error}"
+        route_reason += " 模型规划不可用，已使用确定性规则执行。"
     return PlannerMetadataResponse(
         confidence=max(0, min(confidence, 1)),
         route_reason=route_reason,
@@ -5717,24 +7445,32 @@ def _workflow_trace(
             WorkflowTraceNodeResponse(
                 node=node,
                 status="fallback" if error else "completed",
-                provider=provider
-                if node
-                in {
-                    REPORT_NODE,
-                    INTEGRATE_INSIGHTS_NODE,
-                    ADVERSARIAL_VALIDATE_NODE,
-                    FORMAT_CHARTS_NODE,
-                }
-                else state.get("model_router_provider"),
-                model=model
-                if node
-                in {
-                    REPORT_NODE,
-                    INTEGRATE_INSIGHTS_NODE,
-                    ADVERSARIAL_VALIDATE_NODE,
-                    FORMAT_CHARTS_NODE,
-                }
-                else state.get("model_router_model"),
+                provider=None
+                if node == STATISTICAL_VERIFY_NODE
+                else (
+                    provider
+                    if node
+                    in {
+                        REPORT_NODE,
+                        INTEGRATE_INSIGHTS_NODE,
+                        ADVERSARIAL_VALIDATE_NODE,
+                        FORMAT_CHARTS_NODE,
+                    }
+                    else state.get("model_router_provider")
+                ),
+                model=None
+                if node == STATISTICAL_VERIFY_NODE
+                else (
+                    model
+                    if node
+                    in {
+                        REPORT_NODE,
+                        INTEGRATE_INSIGHTS_NODE,
+                        ADVERSARIAL_VALIDATE_NODE,
+                        FORMAT_CHARTS_NODE,
+                    }
+                    else state.get("model_router_model")
+                ),
                 input_summary=_node_input_summary(state, node),
                 output_summary=_node_output_summary(state, node, report_source=report_source),
                 fallback=_node_fallback(state, node, report_source=report_source),
@@ -5794,6 +7530,8 @@ def _node_input_summary(state: AnalysisWorkflowState, node: str) -> str:
         return "使用 planner 输出和 dataframe 执行安全 SELECT。"
     if node == PYTHON_NODE:
         return "使用 dataframe、planner 输出和 SQL 结果生成 Python 分析。"
+    if node == STATISTICAL_VERIFY_NODE:
+        return "检查分析契约、逐条结论证据、比较支持与 Join 粒度。"
     if node == REPORT_NODE:
         return "整合 SQL、Python、图表、验证问题和多轮分析 trace。"
     return "使用上游节点输出。"
@@ -5829,6 +7567,9 @@ def _node_output_summary(
         attempts = state.get("python_attempts", ())
         attempt_summary = f"，Python 代码尝试 {len(attempts)} 次" if attempts else ""
         return f"{len(python_result.insights) if python_result else 0} 条洞察，{len(python_result.charts) if python_result else 0} 个图表{attempt_summary}"
+    if node == STATISTICAL_VERIFY_NODE:
+        verification = state.get("statistical_verification")
+        return verification.summary if verification else "未生成统计审查结果"
     if node == REPORT_NODE:
         return f"report_source={report_source}"
     if node == ROUND_REFLECT_NODE:

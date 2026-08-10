@@ -274,6 +274,36 @@ def semantic_model_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def data_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": UUID(str(row["id"])),
+        "user_id": str(row["user_id"]),
+        "dataset_id": UUID(str(row["dataset_id"])),
+        "source": str(row["source"]),
+        "row_count": int(row["row_count"]),
+        "sample_size": int(row["sample_size"]),
+        "fingerprint": str(row["fingerprint"]),
+        "profile": json_loads(row["profile"], {}),
+        "created_at": str(row["created_at"]),
+    }
+
+
+def data_drift_event_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": UUID(str(row["id"])),
+        "user_id": str(row["user_id"]),
+        "dataset_id": UUID(str(row["dataset_id"])),
+        "baseline_snapshot_id": UUID(str(row["baseline_snapshot_id"])),
+        "current_snapshot_id": UUID(str(row["current_snapshot_id"])),
+        "status": str(row["status"]),
+        "changes": json_loads(row["changes"], []),
+        "affected_assets": json_loads(row["affected_assets"], []),
+        "recommended_actions": json_loads(row["recommended_actions"], []),
+        "created_at": str(row["created_at"]),
+        "acknowledged_at": optional_text(row["acknowledged_at"]),
+    }
+
+
 def cleaning_run_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],

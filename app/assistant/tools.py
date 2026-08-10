@@ -3,10 +3,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.analysis.agent_loop import canonical_action_hash
 from app.analysis.cleaning_jobs import start_cleaning_job
@@ -14,6 +17,8 @@ from app.analysis.dataset_groups import (
     suggest_dataset_group_relationships,
 )
 from app.analysis.jobs import start_analysis_job
+from app.assistant.control import AssistantRunCanceled, AssistantRunPaused
+from app.assistant.evidence import canonical_reliability, report_reliability, safe_excerpt
 from app.assistant.permissions import AssistantPermissionService
 from app.assistant.report_revision import revise_report_snapshot
 from app.core.settings import Settings
@@ -84,7 +89,7 @@ ASSISTANT_READ_TOOLS: tuple[dict[str, Any], ...] = (
     ),
     _tool(
         "get_report",
-        "Read an existing DataMind report and its verified findings.",
+        "Read an existing DataMind report, its findings, and its recorded DataMind verification status.",
         {"report_id": {"type": "string"}},
         required=("report_id",),
     ),
@@ -408,20 +413,58 @@ class AssistantToolRuntime:
             raise
 
     def auto_retrieve(self, query: str) -> tuple[dict[str, Any], ...]:
-        search = self._tool_search_datamind_assets({"query": query})
-        if not search["reports"]:
-            search = self._tool_search_datamind_assets({"query": ""})
+        started = time.perf_counter()
+        normalized_query = query.strip()
+        if not normalized_query:
+            return ()
+        explicit_follow_up = _is_report_follow_up(normalized_query)
+        reports: list[dict[str, Any]] = [
+            report
+            for report in self.store.list_reports(
+                query=normalized_query,
+                limit=20,
+                include_content=False,
+            )
+            if _report_matches_query(report, normalized_query)
+        ]
+        if not reports:
+            seen_report_ids: set[str] = set()
+            for term in _report_retrieval_terms(normalized_query):
+                for report in self.store.list_reports(
+                    query=term,
+                    limit=20,
+                    include_content=False,
+                ):
+                    report_id = str(report.get("report_id") or report.get("id") or "")
+                    if not report_id or report_id in seen_report_ids:
+                        continue
+                    if not _report_matches_query(report, normalized_query):
+                        continue
+                    seen_report_ids.add(report_id)
+                    reports.append(report)
+        if not reports and explicit_follow_up:
+            reports = list(self.store.list_reports(limit=20, include_content=False))
+        matched_query = bool(reports)
         items: list[dict[str, Any]] = []
-        for report in search["reports"][:3]:
+        for report in _latest_report_candidates(reports, limit=3):
             try:
-                items.append(self._tool_get_report({"report_id": report["report_id"]}))
+                items.append(
+                    self._tool_get_report(
+                        {"report_id": str(report.get("report_id") or report["id"])}
+                    )
+                )
             except RuntimeError:
                 continue
+        duration_ms = round((time.perf_counter() - started) * 1000)
         self.event(
             event_type="retrieval.completed",
             status="completed",
             message=f"已检索到 {len(items)} 份可引用报告。",
-            payload={"report_count": len(items)},
+            payload={
+                "report_count": len(items),
+                "duration_ms": duration_ms,
+                "matched_query": matched_query,
+            },
         )
         return tuple(items)
 
@@ -430,8 +473,12 @@ class AssistantToolRuntime:
         datasets = [item for item in self.store.list_datasets() if self._dataset_allowed(item.id)]
         reports = [
             item
-            for item in self.store.list_reports(include_content=True)
-            if self._dataset_allowed(UUID(str(item["dataset_id"])))
+            for item in self.store.list_reports(
+                query=query or None,
+                limit=20,
+                include_content=False,
+            )
+            if self._report_allowed(item)
         ]
         jobs = [
             item
@@ -468,10 +515,12 @@ class AssistantToolRuntime:
                     "dataset_id": str(item["dataset_id"]),
                     "title": item["title"],
                     "question": item.get("question"),
-                    "created_at": item.get("created_at"),
+                    "version": int(item.get("version") or 1),
+                    "created_at": _display_timestamp(
+                        item.get("created_at"), self.settings.display_timezone
+                    ),
                 }
                 for item in reports
-                if matches(item["title"], item.get("question"), item.get("markdown"))
             ][:20],
             "analysis_jobs": [
                 {
@@ -479,7 +528,9 @@ class AssistantToolRuntime:
                     "dataset_id": str(item.dataset_id),
                     "question": item.question,
                     "report_id": str(item.report_id) if item.report_id else None,
-                    "completed_at": item.completed_at,
+                    "completed_at": _display_timestamp(
+                        item.completed_at, self.settings.display_timezone
+                    ),
                 }
                 for item in jobs
                 if matches(item.question)
@@ -522,39 +573,116 @@ class AssistantToolRuntime:
             dataset.name,
             f"{result['row_count']} rows; {len(result['columns'])} columns",
             dataset_id,
+            facts={
+                "datasets_used": [dataset.name],
+                "row_count": result["row_count"],
+            },
         )
         return result
 
     def _tool_get_report(self, arguments: dict[str, Any]) -> dict[str, Any]:
         report_id = UUID(str(arguments["report_id"]))
         report = self.store.get_report(report_id)
+        if not self._report_allowed(report):
+            raise RuntimeError("Report is outside the conversation scope.")
         dataset_id = UUID(str(report["dataset_id"]))
-        self._require_dataset(dataset_id)
         metadata = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
         structured = (
             metadata.get("structured_report")
             if isinstance(metadata.get("structured_report"), dict)
             else {}
         )
+        multi_dataset = (
+            metadata.get("multi_dataset_context")
+            if isinstance(metadata.get("multi_dataset_context"), dict)
+            else {}
+        )
+        dataset_names: list[str] = []
+        primary_dataset = (
+            multi_dataset.get("primary_dataset")
+            if isinstance(multi_dataset.get("primary_dataset"), dict)
+            else {}
+        )
+        additional_datasets = (
+            multi_dataset.get("additional_datasets")
+            if isinstance(multi_dataset.get("additional_datasets"), list)
+            else []
+        )
+        total_row_count = 0
+        for item in (primary_dataset, *additional_datasets):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name and name not in dataset_names:
+                dataset_names.append(name)
+            row_count = item.get("row_count")
+            if isinstance(row_count, int) and not isinstance(row_count, bool):
+                total_row_count += max(0, row_count)
+        if not dataset_names:
+            try:
+                dataset_names.append(self.store.get_dataset(dataset_id).name)
+                total_row_count = self.store.count_analysis_records(dataset_id)
+            except RuntimeError:
+                pass
+        report_verification = (
+            metadata.get("statistical_verification")
+            if isinstance(metadata.get("statistical_verification"), dict)
+            else {}
+        )
+        lineage_verification = self._report_lineage_verification(report_id, report)
+        reliability = canonical_reliability(report_verification, lineage_verification)
+        statistical_verification = _compact_statistical_verification(
+            _least_reliable_verification(report_verification, lineage_verification)
+        )
+        join_context = _compact_report_join_context(metadata)
+        chart_context = _compact_report_chart_context(structured.get("charts"))
         result = {
             "report_id": str(report_id),
             "dataset_id": str(dataset_id),
             "title": report["title"],
+            "version": int(report.get("version") or 1),
             "question": report.get("question") or metadata.get("question"),
+            "datasets_used": dataset_names,
             "executive_summary": structured.get("executive_summary")
-            or str(report.get("markdown") or "")[:2500],
-            "key_findings": (structured.get("key_findings") or [])[:12],
-            "validation_issues": (structured.get("validation_issues") or [])[:8],
-            "recommended_next_steps": (structured.get("recommended_next_steps") or [])[:8],
-            "created_at": report.get("created_at"),
+            or safe_excerpt(report.get("markdown"), limit=1600),
+            "analysis_context": str(structured.get("analysis_context") or "").strip(),
+            "analysis_contract": metadata.get("analysis_contract")
+            if isinstance(metadata.get("analysis_contract"), dict)
+            else None,
+            "statistical_verification": statistical_verification,
+            "join_context": join_context,
+            "chart_context": chart_context,
+            "key_findings": (structured.get("key_findings") or [])[:8],
+            "validation_issues": (structured.get("validation_issues") or [])[:4],
+            "recommended_next_steps": (structured.get("recommended_next_steps") or [])[:5],
+            "reliability": reliability,
+            "created_at": _display_timestamp(
+                report.get("created_at"), self.settings.display_timezone
+            ),
         }
         self._add_evidence(
             "report",
             report_id,
             str(report["title"]),
-            str(result["executive_summary"])[:320],
+            safe_excerpt(result["executive_summary"]),
             dataset_id,
             artifact_role=str(arguments.get("_artifact_role") or "evidence"),
+            reliability=reliability,
+            facts={
+                "datasets_used": dataset_names,
+                "row_count": total_row_count,
+                "executive_summary": result["executive_summary"],
+                "analysis_context": result["analysis_context"],
+                "analysis_contract": result["analysis_contract"],
+                "statistical_verification": statistical_verification,
+                "join_context": join_context,
+                "chart_context": chart_context,
+                "key_findings": [
+                    str(item.get("content") or "").strip()
+                    for item in result["key_findings"][:3]
+                    if isinstance(item, dict) and str(item.get("content") or "").strip()
+                ],
+            },
         )
         return result
 
@@ -566,19 +694,30 @@ class AssistantToolRuntime:
             raise RuntimeError("Analysis result is not available.")
         result = _compact_analysis(job.result)
         self.allowed_jobs.add(job_id)
-        self._add_evidence(
-            "analysis_job",
-            job_id,
-            job.question,
-            str(result.get("executive_summary") or "")[:320],
-            job.dataset_id,
-        )
         report = (
             self._tool_get_report(
                 {"report_id": str(job.report_id), "_artifact_role": "deliverable"}
             )
             if job.report_id is not None
             else None
+        )
+        lineage_reliability = canonical_reliability(
+            result.get("reliability"),
+            report.get("reliability") if report else None,
+        )
+        result["reliability"] = lineage_reliability
+        if report is not None:
+            report["reliability"] = lineage_reliability
+            report_evidence = self.evidence.get(f"report:{job.report_id}")
+            if report_evidence is not None:
+                report_evidence["reliability"] = lineage_reliability
+        self._add_evidence(
+            "analysis_job",
+            job_id,
+            job.question,
+            safe_excerpt(result.get("executive_summary")),
+            job.dataset_id,
+            reliability=lineage_reliability,
         )
         return result | {
             "job_id": str(job_id),
@@ -979,7 +1118,9 @@ class AssistantToolRuntime:
         while time.monotonic() < deadline:
             if self.assistant_store.cancel_requested(self.run_id):
                 self.store.request_cleaning_job_cancel(job_id)
-                raise RuntimeError("Assistant run was canceled.")
+                raise AssistantRunCanceled("Assistant run was canceled.")
+            if self.assistant_store.pause_requested(self.run_id):
+                raise AssistantRunPaused("Assistant run was paused.")
             for event in self.store.list_cleaning_job_events(job_id, after_sequence=cursor):
                 cursor = max(cursor, int(event.get("sequence") or 0))
                 self.event(
@@ -1018,7 +1159,9 @@ class AssistantToolRuntime:
         while time.monotonic() < deadline:
             if self.assistant_store.cancel_requested(self.run_id):
                 self.store.request_analysis_job_cancel(job_id)
-                raise RuntimeError("Assistant run was canceled.")
+                raise AssistantRunCanceled("Assistant run was canceled.")
+            if self.assistant_store.pause_requested(self.run_id):
+                raise AssistantRunPaused("Assistant run was paused.")
             for event in self.store.list_analysis_job_events(job_id, after_sequence=cursor):
                 cursor = max(cursor, int(event.get("sequence") or 0))
                 self.event(
@@ -1076,6 +1219,47 @@ class AssistantToolRuntime:
             return dataset_id == UUID(str(self.store.get_report(scope_id)["dataset_id"]))
         return False
 
+    def _report_allowed(self, report: dict[str, Any]) -> bool:
+        if not self._dataset_allowed(UUID(str(report["dataset_id"]))):
+            return False
+        if self.conversation["scope_type"] != "report":
+            return True
+        scope_id = UUID(str(self.conversation["scope_id"]))
+        if UUID(str(report["id"])) == scope_id:
+            return True
+        metadata = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
+        revision = (
+            metadata.get("report_revision")
+            if isinstance(metadata.get("report_revision"), dict)
+            else {}
+        )
+        return str(revision.get("source_report_id") or "") == str(scope_id)
+
+    def _report_lineage_verification(
+        self,
+        report_id: UUID,
+        report: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        metadata = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
+        revision = (
+            metadata.get("report_revision")
+            if isinstance(metadata.get("report_revision"), dict)
+            else {}
+        )
+        lineage_report_ids = {str(report_id)}
+        if revision.get("source_report_id"):
+            lineage_report_ids.add(str(revision["source_report_id"]))
+        for job in self.store.list_analysis_jobs(
+            dataset_id=UUID(str(report["dataset_id"])),
+            limit=200,
+        ):
+            if job.report_id is None or str(job.report_id) not in lineage_report_ids:
+                continue
+            result = job.result if isinstance(job.result, dict) else {}
+            verification = result.get("statistical_verification")
+            return verification if isinstance(verification, dict) else None
+        return None
+
     def _require_dataset(self, dataset_id: UUID) -> Any:
         dataset = self.store.get_dataset(dataset_id)
         if not self._dataset_allowed(dataset_id):
@@ -1099,6 +1283,8 @@ class AssistantToolRuntime:
         dataset_id: UUID,
         *,
         artifact_role: str = "evidence",
+        reliability: dict[str, Any] | None = None,
+        facts: dict[str, Any] | None = None,
     ) -> None:
         if artifact_role == "deliverable":
             for item in self.evidence.values():
@@ -1109,10 +1295,178 @@ class AssistantToolRuntime:
             "source_type": source_type,
             "source_id": str(source_id),
             "label": label,
-            "excerpt": excerpt,
+            "excerpt": safe_excerpt(excerpt),
             "dataset_id": str(dataset_id),
             "artifact_role": artifact_role,
+            "reliability": reliability
+            or {"status": "unverified", "summary": "未提供统计审查状态。"},
         }
+        if facts:
+            self.evidence[key]["facts"] = facts
+
+
+_REPORT_BAR_CATEGORY_DISPLAY_LIMIT = 24
+_RELIABILITY_RANK = {
+    "rejected": 0,
+    "warning": 1,
+    "unverified": 2,
+    "verified": 3,
+}
+
+
+def _least_reliable_verification(*values: Any) -> dict[str, Any]:
+    candidates = [
+        value
+        for value in values
+        if isinstance(value, dict)
+        and (str(value.get("status") or "").strip() or value.get("requires_replan") is True)
+    ]
+    if not candidates:
+        return {}
+    return min(
+        candidates,
+        key=lambda value: _RELIABILITY_RANK[report_reliability(value)["status"]],
+    )
+
+
+def _bounded_report_metadata(value: Any, *, depth: int = 0) -> Any:
+    """Keep report evidence useful without injecting unbounded report payloads."""
+
+    if depth >= 4:
+        return safe_excerpt(value, limit=400)
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_report_metadata(item, depth=depth + 1)
+            for key, item in list(value.items())[:24]
+        }
+    if isinstance(value, list | tuple):
+        return [_bounded_report_metadata(item, depth=depth + 1) for item in value[:12]]
+    if isinstance(value, str):
+        return safe_excerpt(value, limit=800)
+    return value
+
+
+def _compact_statistical_verification(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    checks = value.get("checks") if isinstance(value.get("checks"), list) else []
+    return {
+        "status": value.get("status"),
+        "summary": safe_excerpt(value.get("summary"), limit=800),
+        "requires_replan": bool(value.get("requires_replan")),
+        "numeric_evidence_coverage": value.get("numeric_evidence_coverage"),
+        "checks": [
+            {
+                "code": check.get("code"),
+                "status": check.get("status"),
+                "message": safe_excerpt(check.get("message"), limit=500),
+                "details": _bounded_report_metadata(check.get("details") or {}),
+            }
+            for check in checks[:16]
+            if isinstance(check, dict)
+        ],
+    }
+
+
+def _compact_report_join_context(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    summary = metadata.get("join_summary") if isinstance(metadata.get("join_summary"), dict) else {}
+    lineage = (
+        metadata.get("analysis_lineage")
+        if isinstance(metadata.get("analysis_lineage"), dict)
+        else {}
+    )
+    graph = (
+        lineage.get("relationship_graph")
+        if isinstance(lineage.get("relationship_graph"), dict)
+        else {}
+    )
+    grain_plan = lineage.get("grain_plan") if isinstance(lineage.get("grain_plan"), dict) else {}
+    nodes = graph.get("nodes") if isinstance(graph.get("nodes"), list) else []
+    names_by_entity = {
+        str(node.get("entity_id")): str(node.get("name") or node.get("entity_id"))
+        for node in nodes
+        if isinstance(node, dict) and node.get("entity_id")
+    }
+    join_path = grain_plan.get("join_path") if isinstance(grain_plan.get("join_path"), list) else []
+    executed_joins = summary.get("joins") if isinstance(summary.get("joins"), list) else []
+    paths: list[dict[str, Any]] = []
+    for index, edge in enumerate(join_path[:12]):
+        if not isinstance(edge, dict):
+            continue
+        executed = executed_joins[index] if index < len(executed_joins) else {}
+        if not isinstance(executed, dict):
+            executed = {}
+        paths.append(
+            {
+                "left_dataset": names_by_entity.get(
+                    str(edge.get("left_entity_id")), str(edge.get("left_entity_id") or "")
+                ),
+                "left_column": executed.get("left_column"),
+                "right_dataset": names_by_entity.get(
+                    str(edge.get("right_entity_id")),
+                    str(executed.get("right_dataset_name") or edge.get("right_entity_id") or ""),
+                ),
+                "right_column": executed.get("right_column"),
+                "cardinality": edge.get("cardinality"),
+                "join_type": edge.get("join_type") or executed.get("join_type"),
+                "row_expansion_ratio": executed.get("row_expansion_ratio"),
+                "before_rows": executed.get("before_rows"),
+                "after_rows": executed.get("after_rows"),
+                "risk_note": safe_excerpt(edge.get("risk_note"), limit=400),
+            }
+        )
+    if not paths:
+        paths = [
+            _bounded_report_metadata(item) for item in executed_joins[:12] if isinstance(item, dict)
+        ]
+    if not summary and not paths and not grain_plan:
+        return None
+    return {
+        "mode": summary.get("mode"),
+        "dataset_count": summary.get("dataset_count"),
+        "joined_dataset_count": summary.get("joined_dataset_count"),
+        "joined_row_count": summary.get("joined_row_count"),
+        "joined_column_count": summary.get("joined_column_count"),
+        "row_expansion_ratio": summary.get("row_expansion_ratio"),
+        "skipped_join_count": summary.get("skipped_join_count"),
+        "metric_grain": _bounded_report_metadata(grain_plan.get("metric_grain") or []),
+        "safe": grain_plan.get("safe"),
+        "warnings": _bounded_report_metadata(grain_plan.get("warnings") or []),
+        "paths": paths,
+    }
+
+
+def _compact_report_chart_context(value: Any) -> list[dict[str, Any]]:
+    charts = value if isinstance(value, list | tuple) else []
+    result: list[dict[str, Any]] = []
+    for chart in charts[:8]:
+        if not isinstance(chart, dict):
+            continue
+        chart_type = str(chart.get("chart_type") or "")
+        spec = chart.get("spec") if isinstance(chart.get("spec"), dict) else {}
+        data = chart.get("data") if isinstance(chart.get("data"), list) else []
+        context = {
+            "title": chart.get("title"),
+            "chart_type": chart_type,
+            "x": spec.get("x") or spec.get("names"),
+            "y": spec.get("y") or spec.get("values"),
+            "data_point_count": len(data),
+            "denominator_scope": spec.get("denominator_scope"),
+            "displayed_category_count": spec.get("displayed_category_count"),
+            "excluded_category_count": spec.get("excluded_category_count"),
+            "explanation": safe_excerpt(chart.get("explanation"), limit=1000),
+        }
+        if chart_type == "bar" and len(data) > _REPORT_BAR_CATEGORY_DISPLAY_LIMIT:
+            context.update(
+                {
+                    "display_rule": "top_n_by_y_descending",
+                    "displayed_category_count": _REPORT_BAR_CATEGORY_DISPLAY_LIMIT,
+                    "excluded_category_count": len(data) - _REPORT_BAR_CATEGORY_DISPLAY_LIMIT,
+                    "denominator_scope": "not_applicable_for_bar_chart",
+                }
+            )
+        result.append(context)
+    return result
 
 
 def _compact_analysis(result: dict[str, Any]) -> dict[str, Any]:
@@ -1123,18 +1477,188 @@ def _compact_analysis(result: dict[str, Any]) -> dict[str, Any]:
         result.get("python_result") if isinstance(result.get("python_result"), dict) else {}
     )
     sql_result = result.get("sql_result") if isinstance(result.get("sql_result"), dict) else {}
+    reliability = report_reliability(result.get("statistical_verification"))
     return {
         "question": result.get("question"),
         "executive_summary": structured.get("executive_summary"),
-        "key_findings": (structured.get("key_findings") or result.get("final_insights") or [])[:12],
+        "key_findings": (structured.get("key_findings") or result.get("final_insights") or [])[:8],
         "validation_issues": (
             structured.get("validation_issues") or result.get("validation_issues") or []
-        )[:8],
-        "recommended_next_steps": (structured.get("recommended_next_steps") or [])[:8],
-        "sql_rows": (sql_result.get("rows") or [])[:30],
+        )[:4],
+        "recommended_next_steps": (structured.get("recommended_next_steps") or [])[:5],
+        "sql_rows": (sql_result.get("rows") or [])[:20],
         "python_statistics": python_result.get("statistics") or {},
         "report_id": result.get("report_id"),
+        "statistical_verification": result.get("statistical_verification"),
+        "reliability": reliability,
     }
+
+
+def _latest_report_candidates(
+    reports: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    limit: int,
+) -> tuple[dict[str, Any], ...]:
+    latest: list[dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    ordered = sorted(
+        reports,
+        key=lambda report: (
+            str(report.get("created_at") or ""),
+            int(report.get("version") or 0),
+            str(report.get("report_id") or report.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    for report in ordered:
+        question = _normalized_report_identity(_report_question(report))
+        title = _normalized_report_identity(report.get("title"))
+        # Re-running the same user question supersedes the older result even if
+        # the corrected planner chose a different primary dataset.  Dataset ID
+        # is only part of the fallback identity when no question was persisted.
+        key = (
+            ("question", question)
+            if question
+            else (
+                "title",
+                str(report.get("dataset_id") or ""),
+                title or str(report.get("report_id") or report.get("id") or ""),
+            )
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        latest.append(report)
+        if len(latest) >= limit:
+            break
+    return tuple(latest)
+
+
+def _normalized_report_identity(value: Any) -> str:
+    return "".join(character.lower() for character in str(value or "") if character.isalnum())
+
+
+def _report_question(report: dict[str, Any]) -> str:
+    metadata = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
+    return str(report.get("question") or metadata.get("question") or "").strip()
+
+
+def _report_matches_query(report: dict[str, Any], query: str) -> bool:
+    """Match report topics, never incidental words in report bodies or verification metadata."""
+
+    topic = " ".join(
+        value
+        for value in (_report_question(report), str(report.get("title") or "").strip())
+        if value
+    )
+    normalized_query = _normalized_report_identity(query)
+    normalized_topic = _normalized_report_identity(topic)
+    if not normalized_query or not normalized_topic:
+        return False
+    query_terms = set(_report_retrieval_terms(query))
+    if not query_terms:
+        return False
+    if normalized_query in normalized_topic:
+        return True
+
+    topic_terms = set(_report_retrieval_terms(topic))
+    overlap = query_terms & topic_terms
+    return bool(overlap)
+
+
+_RETRIEVAL_STOP_TERMS = {
+    "please",
+    "could",
+    "would",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+    "about",
+    "show",
+    "tell",
+    "如何",
+    "怎么",
+    "怎样",
+    "请问",
+    "一下",
+    "给出",
+    "完整",
+    "结论",
+    "报告",
+    "结果",
+    "分析",
+    "统计",
+    "审查",
+    "通过",
+    "回答",
+    "发送",
+    "按钮",
+    "测试",
+    "问题",
+    "用户",
+    "解释",
+    "含义",
+}
+
+
+def _report_retrieval_terms(query: str) -> tuple[str, ...]:
+    """Return topic-bearing terms without falling back to unrelated recent reports."""
+
+    normalized = query.casefold()
+    terms: list[str] = []
+    for word in re.findall(r"[a-z0-9_]{3,}", normalized):
+        if word not in _RETRIEVAL_STOP_TERMS:
+            terms.append(word)
+    for segment in re.findall(r"[\u3400-\u9fff]+", normalized):
+        for index in range(max(len(segment) - 1, 0)):
+            term = segment[index : index + 2]
+            if term not in _RETRIEVAL_STOP_TERMS:
+                terms.append(term)
+    return tuple(dict.fromkeys(terms))
+
+
+def _is_report_follow_up(query: str) -> bool:
+    normalized = query.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "上述",
+            "上面",
+            "刚才",
+            "刚完成",
+            "最新报告",
+            "最近报告",
+            "这份报告",
+            "该报告",
+            "给出完整结论",
+            "完整结论",
+            "完整结果",
+            "继续上面的分析",
+            "补全上面的回答",
+            "complete conclusion",
+            "the report",
+            "previous result",
+        )
+    )
+
+
+def _display_timestamp(value: Any, timezone_name: str) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        try:
+            timezone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            timezone = UTC
+        return parsed.astimezone(timezone).isoformat(timespec="seconds")
+    except ValueError:
+        return text
 
 
 def _compact(value: dict[str, Any]) -> dict[str, Any]:

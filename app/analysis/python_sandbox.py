@@ -103,6 +103,10 @@ def run_generated_python_analysis(
     settings = get_settings()
     if settings.python_runner_url:
         return _run_remote_python_analysis(payload, policy=execution_policy)
+    if settings.environment.lower() == "production":
+        raise GeneratedPythonSafetyError(
+            "Production Python execution requires the container Runner."
+        )
     env = {
         "PYTHONIOENCODING": "utf-8",
         "PYTHONPATH": os.environ.get("PYTHONPATH", ""),

@@ -4,7 +4,7 @@ import logging
 import socket
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from threading import Lock
+from threading import Event, Lock, Thread
 from uuid import UUID
 
 from app.analysis.runtime import build_analysis_runner
@@ -106,6 +106,8 @@ def run_analysis_job(
     repository = DatasetStoreRepository(dataset_store_path, user_id=user_id)
     settings = get_settings()
     resolved_worker_id = worker_id or f"{socket.gethostname()}:{job_id}"
+    heartbeat_stop = Event()
+    heartbeat_thread: Thread | None = None
     try:
         job = repository.get_analysis_job(job_id)
         if job.status == "canceled" or job.cancel_requested:
@@ -124,6 +126,19 @@ def run_analysis_job(
         )
         if claimed is None:
             return
+        heartbeat_thread = Thread(
+            target=_maintain_analysis_job_lease,
+            kwargs={
+                "repository": repository,
+                "job_id": job_id,
+                "worker_id": resolved_worker_id,
+                "lease_seconds": settings.worker_lease_seconds,
+                "stop": heartbeat_stop,
+            },
+            name=f"analysis-heartbeat-{job_id}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
 
         def progress_callback(stage: str, progress: int, message: str) -> None:
             current = repository.get_analysis_job(job_id)
@@ -244,8 +259,34 @@ def run_analysis_job(
             completed=True,
         )
     finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=2)
         with _lock:
             _futures.pop(job_id, None)
+
+
+def _maintain_analysis_job_lease(
+    *,
+    repository: DatasetStoreRepository,
+    job_id: UUID,
+    worker_id: str,
+    lease_seconds: int,
+    stop: Event,
+) -> None:
+    interval = max(5.0, min(30.0, lease_seconds / 3))
+    while not stop.wait(interval):
+        try:
+            current = repository.get_analysis_job(job_id)
+            if current.status != "running" or current.lease_owner != worker_id:
+                return
+            repository.heartbeat_analysis_job(
+                job_id,
+                worker_id=worker_id,
+                lease_seconds=lease_seconds,
+            )
+        except Exception:
+            logger.exception("Analysis job heartbeat failed.")
 
 
 def _complete_job(

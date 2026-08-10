@@ -96,7 +96,12 @@ def test_report_grant_can_analyze_only_its_source_dataset(
     assistant.save_permission_grant(
         asset_type="report",
         asset_id=report_id,
-        capabilities=("analysis_manage", "report_manage"),
+        capabilities=(
+            "analysis_manage",
+            "report_manage",
+            "data_prepare",
+            "asset_recycle",
+        ),
     )
     service = AssistantPermissionService(store=store, assistant_store=assistant)
     conversation = {"scope_type": "report", "scope_id": report_id}
@@ -115,6 +120,23 @@ def test_report_grant_can_analyze_only_its_source_dataset(
         execution_mode="execute",
     )
     assert revision is not None and revision.asset_id == report_id
+
+    with pytest.raises(PermissionError, match="Missing assistant capability"):
+        service.authorize_tool(
+            tool_name="start_cleaning",
+            arguments={"dataset_id": str(source.id)},
+            conversation=conversation,
+            execution_mode="execute",
+        )
+    with pytest.raises(PermissionError, match="Missing assistant capability"):
+        service.authorize_tool(
+            tool_name="soft_delete_asset",
+            arguments={"asset_type": "dataset", "asset_id": str(source.id)},
+            conversation=conversation,
+            execution_mode="execute",
+        )
+    with pytest.raises(ValueError, match="not allowed for report"):
+        service.validate_grant_capabilities("report", ("data_prepare",))
 
     with pytest.raises(PermissionError, match="outside the conversation scope"):
         service.authorize_tool(

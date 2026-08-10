@@ -26,6 +26,7 @@ def aggregate_sqlite_history(path: Path) -> dict[str, Any]:
             "cleaning_jobs": _job_summary(connection, "cleaning_jobs", tables),
             "assistant_runs": _job_summary(connection, "assistant_runs", tables),
             "analysis_events": _event_summary(connection, tables),
+            "assistant_events": _assistant_event_summary(connection, tables),
             "privacy": "Aggregate status, timing, repair and fallback fields only; no prompts, rows, or report content.",
         }
     finally:
@@ -90,6 +91,69 @@ def _event_summary(connection: sqlite3.Connection, tables: set[str]) -> dict[str
         },
         "token_usage_status": "available" if token_available else "metric_unavailable",
         "total_tokens": token_total if token_available else None,
+    }
+
+
+def _assistant_event_summary(
+    connection: sqlite3.Connection, tables: set[str]
+) -> dict[str, Any]:
+    if "assistant_run_events" not in tables:
+        return {"available": False}
+    rows = connection.execute(
+        """
+        SELECT payload
+        FROM assistant_run_events
+        WHERE event_type='message.completed'
+        """
+    ).fetchall()
+    samples: dict[str, list[float]] = {
+        "retrieval_ms": [],
+        "tool_routing_ms": [],
+        "model_first_token_ms": [],
+        "first_answer_ms": [],
+        "total_ms": [],
+    }
+    fast_path_count = 0
+    token_total = 0
+    valid_payloads = 0
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        valid_payloads += 1
+        latency = payload.get("latency")
+        if isinstance(latency, dict):
+            fast_path_count += int(latency.get("fast_path") is True)
+            for key, values in samples.items():
+                value = latency.get(key)
+                if isinstance(value, (int, float)) and value >= 0:
+                    values.append(float(value))
+        usage = payload.get("token_usage")
+        if isinstance(usage, dict):
+            token_total += int(usage.get("total_tokens") or 0)
+    return {
+        "available": True,
+        "count": len(rows),
+        "valid_payloads": valid_payloads,
+        "fast_path_rate": (
+            round(fast_path_count / valid_payloads, 4) if valid_payloads else None
+        ),
+        "latency_ms": {
+            key: _distribution(values) for key, values in samples.items()
+        },
+        "token_usage_status": "available" if token_total > 0 else "metric_unavailable",
+        "total_tokens": token_total if token_total > 0 else None,
+    }
+
+
+def _distribution(values: list[float]) -> dict[str, float | int | None]:
+    return {
+        "samples": len(values),
+        "median": round(median(values), 3) if values else None,
+        "p95": round(_percentile(values, 0.95), 3) if values else None,
     }
 
 

@@ -5,13 +5,173 @@ import io
 
 import pandas as pd
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from app.analysis.dataset_groups import suggest_dataset_group_relationships
+from app.api.v1 import analysis as analysis_api
 from app.core.settings import get_settings
 from app.main import create_app
 from app.mcp.tool_schemas import ModelRouterResponse
+from app.schemas.analysis import AnalysisRunRequest, DatasetJoinConfig
 from app.storage.dataset_store import DatasetStoreRepository
+
+
+def test_create_job_persists_question_scoped_dataset_ids(tmp_path, monkeypatch) -> None:
+    repository = DatasetStoreRepository(str(tmp_path), user_id="default")
+    datasets = {
+        name: repository.create_dataset(
+            name=f"olist_{name}_dataset.csv",
+            source_type="csv",
+            source_metadata={},
+        )
+        for name in (
+            "order_items",
+            "orders",
+            "customers",
+            "order_payments",
+            "products",
+            "product_translation",
+            "sellers",
+            "order_reviews",
+            "geolocation",
+        )
+    }
+    rows = {
+        "order_items": [
+            {"order_id": "O1", "product_id": "P1", "seller_id": "S1"}
+        ],
+        "orders": [
+            {"order_id": "O1", "customer_id": "C1", "order_status": "delivered"}
+        ],
+        "customers": [
+            {
+                "customer_id": "C1",
+                "customer_state": "SP",
+                "customer_zip_code_prefix": "01000",
+            }
+        ],
+        "order_payments": [
+            {"order_id": "O1", "payment_type": "credit_card", "payment_value": 10.0}
+        ],
+        "products": [{"product_id": "P1", "product_category_name": "books"}],
+        "product_translation": [
+            {"product_category_name": "books", "product_category_name_english": "books"}
+        ],
+        "sellers": [{"seller_id": "S1", "seller_state": "SP"}],
+        "order_reviews": [{"order_id": "O1", "review_comment_message": "ok"}],
+        "geolocation": [
+            {
+                "geolocation_zip_code_prefix": "01000",
+                "geolocation_state": "SP",
+            }
+        ],
+    }
+    for name, records in rows.items():
+        repository.append_raw_records(dataset_id=datasets[name].id, records=records)
+    relationship_plan = (
+        DatasetJoinConfig(
+            left_dataset_id=datasets["order_items"].id,
+            right_dataset_id=datasets["orders"].id,
+            left_column="order_id",
+            right_column="order_id",
+        ),
+        DatasetJoinConfig(
+            left_dataset_id=datasets["orders"].id,
+            right_dataset_id=datasets["customers"].id,
+            left_column="customer_id",
+            right_column="customer_id",
+        ),
+        DatasetJoinConfig(
+            left_dataset_id=datasets["orders"].id,
+            right_dataset_id=datasets["order_payments"].id,
+            left_column="order_id",
+            right_column="order_id",
+        ),
+        DatasetJoinConfig(
+            left_dataset_id=datasets["order_items"].id,
+            right_dataset_id=datasets["products"].id,
+            left_column="product_id",
+            right_column="product_id",
+        ),
+        DatasetJoinConfig(
+            left_dataset_id=datasets["products"].id,
+            right_dataset_id=datasets["product_translation"].id,
+            left_column="product_category_name",
+            right_column="product_category_name",
+        ),
+        DatasetJoinConfig(
+            left_dataset_id=datasets["order_items"].id,
+            right_dataset_id=datasets["sellers"].id,
+            left_column="seller_id",
+            right_column="seller_id",
+        ),
+        DatasetJoinConfig(
+            left_dataset_id=datasets["orders"].id,
+            right_dataset_id=datasets["order_reviews"].id,
+            left_column="order_id",
+            right_column="order_id",
+        ),
+        DatasetJoinConfig(
+            left_dataset_id=datasets["customers"].id,
+            right_dataset_id=datasets["geolocation"].id,
+            left_column="customer_zip_code_prefix",
+            right_column="geolocation_zip_code_prefix",
+        ),
+    )
+    question = (
+        "仅使用 customers、orders、order_payments 三张表，过滤 "
+        "order_status=delivered，按 customer_state 统计 payment_value 总额，"
+        "并给出总体支付总额和 SP 州支付总额。不要使用 order_items、reviews、"
+        "products、sellers 或 geolocation，也不要按 order_status 或 "
+        "payment_type 分组。"
+    )
+    monkeypatch.setattr(analysis_api, "_repository", lambda _user_id: repository)
+    monkeypatch.setattr(analysis_api, "start_analysis_job", lambda **_kwargs: None)
+
+    response = analysis_api.create_analysis_job(
+        AnalysisRunRequest(
+            dataset_id=datasets["order_items"].id,
+            additional_dataset_ids=tuple(
+                dataset.id
+                for name, dataset in datasets.items()
+                if name != "order_items"
+            ),
+            join_plan=relationship_plan,
+            relationship_plan=relationship_plan,
+            question=question,
+            agent_mode="legacy",
+        ),
+        user_id="default",
+    )
+
+    stored = repository.get_analysis_job(response.job_id)
+    assert stored.dataset_id == datasets["order_payments"].id
+    assert set(stored.additional_dataset_ids) == {
+        datasets["orders"].id,
+        datasets["customers"].id,
+    }
+    assert len(stored.join_plan) == 2
+    assert len(stored.relationship_plan) == 2
+    assert {stored.dataset_id, *stored.additional_dataset_ids} == {
+        datasets["order_payments"].id,
+        datasets["orders"].id,
+        datasets["customers"].id,
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        analysis_api.create_analysis_job(
+            AnalysisRunRequest(
+                dataset_id=datasets["order_payments"].id,
+                question=question,
+                agent_mode="legacy",
+            ),
+            user_id="default",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "not submitted" in str(exc_info.value.detail)
+    assert len(repository.list_analysis_jobs()) == 1
 
 
 @pytest.mark.asyncio
@@ -185,6 +345,9 @@ async def test_analysis_endpoint_runs_dataset_workflow(tmp_path, monkeypatch) ->
             json={"dataset_id": dataset_id, "question": "Which region has the highest sales?"},
         )
         reports_response = await client.get("/api/v1/store/reports")
+        report_summaries_response = await client.get(
+            "/api/v1/store/reports?include_content=false"
+        )
         dataset_reports_response = await client.get(f"/api/v1/store/datasets/{dataset_id}/reports")
         report_id = reports_response.json()["reports"][0]["id"]
         delete_report_response = await client.delete(f"/api/v1/store/reports/{report_id}")
@@ -207,6 +370,13 @@ async def test_analysis_endpoint_runs_dataset_workflow(tmp_path, monkeypatch) ->
     assert reports_response.json()["reports"][0]["dataset_id"] == dataset_id
     assert reports_response.json()["reports"][0]["metadata"]["workflow"] == "langgraph_analysis"
     assert "html_report" in reports_response.json()["reports"][0]["metadata"]
+    summary = report_summaries_response.json()["reports"][0]
+    assert report_summaries_response.status_code == 200
+    assert summary["markdown"] == ""
+    assert summary["metadata"]["route"] == "sql"
+    assert summary["metadata"]["sql_source"] != "none"
+    assert summary["metadata"]["python_source"] != "none"
+    assert "html_report" not in summary["metadata"]
     assert dataset_reports_response.status_code == 200
     assert "DataMind 分析报告" in dataset_reports_response.json()["reports"][0]["markdown"]
     assert delete_report_response.status_code == 200

@@ -219,6 +219,12 @@ def test_history_aggregation_reads_only_status_and_timing_fields(tmp_path) -> No
         CREATE TABLE analysis_job_events (
             duration_ms REAL, token_usage TEXT, status TEXT, event_type TEXT, payload TEXT
         );
+        CREATE TABLE assistant_runs (
+            status TEXT, created_at TEXT, completed_at TEXT
+        );
+        CREATE TABLE assistant_run_events (
+            event_type TEXT, payload TEXT
+        );
         """
     )
     connection.execute(
@@ -229,6 +235,29 @@ def test_history_aggregation_reads_only_status_and_timing_fields(tmp_path) -> No
         "INSERT INTO analysis_job_events VALUES (?,?,?,?,?)",
         (20.0, json.dumps({"total_tokens": 8}), "completed", "node", "private payload"),
     )
+    connection.execute(
+        "INSERT INTO assistant_runs VALUES (?,?,?)",
+        ("completed", "2026-01-01T00:00:00", "2026-01-01T00:00:02"),
+    )
+    connection.execute(
+        "INSERT INTO assistant_run_events VALUES (?,?)",
+        (
+            "message.completed",
+            json.dumps(
+                {
+                    "latency": {
+                        "retrieval_ms": 40,
+                        "tool_routing_ms": 0,
+                        "model_first_token_ms": 300,
+                        "first_answer_ms": 380,
+                        "total_ms": 900,
+                        "fast_path": True,
+                    },
+                    "token_usage": {"total_tokens": 12},
+                }
+            ),
+        ),
+    )
     connection.commit()
     connection.close()
 
@@ -237,6 +266,9 @@ def test_history_aggregation_reads_only_status_and_timing_fields(tmp_path) -> No
     encoded = json.dumps(summary)
     assert summary["analysis_jobs"]["statuses"] == {"completed": 1}
     assert summary["analysis_events"]["token_usage_status"] == "available"
+    assert summary["assistant_events"]["fast_path_rate"] == 1.0
+    assert summary["assistant_events"]["latency_ms"]["first_answer_ms"]["median"] == 380
+    assert summary["assistant_events"]["total_tokens"] == 12
     assert "private question" not in encoded
     assert "private payload" not in encoded
 

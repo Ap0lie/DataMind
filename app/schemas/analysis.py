@@ -179,11 +179,34 @@ class TextAnalysisResultResponse(ApiModel):
     charts: tuple[ChartResponse, ...] = ()
 
 
+class AnalysisAggregationResponse(ApiModel):
+    operation: str = Field(
+        pattern="^(sum|avg|min|max|count|count_distinct)$"
+    )
+    column: str | None = None
+    alias: str
+
+
+class AnalysisFilterResponse(ApiModel):
+    column: str
+    operator: str = Field(default="=", pattern="^(=|!=|>|>=|<|<=)$")
+    value: str | int | float | bool
+
+
+class PythonExecutionContextResponse(ApiModel):
+    source_row_count: int = Field(ge=0)
+    input_row_count: int = Field(ge=0)
+    input_evidence_id: str | None = None
+    applied_filters: tuple[AnalysisFilterResponse, ...] = ()
+    referenced_columns: tuple[str, ...] = ()
+
+
 class PythonAnalysisResponse(ApiModel):
     statistics: dict[str, Any]
     insights: tuple[str, ...]
     charts: tuple[ChartResponse, ...]
     text_analysis: tuple[TextAnalysisResultResponse, ...] = ()
+    execution_context: PythonExecutionContextResponse | None = None
 
 
 class PythonCodeAttemptResponse(ApiModel):
@@ -206,6 +229,78 @@ class AnalysisFrameworkResponse(ApiModel):
     dimensions: tuple[str, ...] = ()
     key_questions: tuple[str, ...] = ()
     success_criteria: str = ""
+
+
+class AnalysisContractResponse(ApiModel):
+    contract_version: str = "1"
+    objective: str
+    population: str
+    dataset_ids: tuple[UUID, ...] = ()
+    analysis_type: str
+    metric: str | None = None
+    dimensions: tuple[str, ...] = ()
+    time_field: str | None = None
+    aggregations: tuple[AnalysisAggregationResponse, ...] = ()
+    filters: tuple[AnalysisFilterResponse, ...] = ()
+    grain: tuple[str, ...] = ()
+    hypothesis: str | None = None
+    method: str
+    assumptions: tuple[str, ...] = ()
+    acceptance_criteria: tuple[str, ...] = ()
+    stop_conditions: tuple[str, ...] = ()
+    causal_claim_allowed: bool = False
+    analysis_budget: dict[str, int | float] = Field(default_factory=dict)
+
+
+class StatisticalCheckResponse(ApiModel):
+    code: str
+    status: str = Field(pattern="^(passed|warning|failed|not_applicable)$")
+    severity: str = Field(pattern="^(info|warning|error)$")
+    message: str
+    finding_ref: str = "analysis"
+    evidence_ids: tuple[str, ...] = ()
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class StatisticalFindingVerdictResponse(ApiModel):
+    finding_ref: str
+    title: str
+    status: str = Field(pattern="^(passed|warning|failed)$")
+    evidence_ids: tuple[str, ...] = ()
+    sample_size: int | None = Field(default=None, ge=0)
+    effect_size: float | None = None
+    confidence_interval: tuple[float, float] | None = None
+    notes: tuple[str, ...] = ()
+
+
+class StatisticalVerificationResponse(ApiModel):
+    status: str = Field(pattern="^(passed|warning|failed)$")
+    summary: str
+    checks: tuple[StatisticalCheckResponse, ...] = ()
+    finding_verdicts: tuple[StatisticalFindingVerdictResponse, ...] = ()
+    requires_replan: bool = False
+    numeric_evidence_coverage: float = Field(default=1, ge=0, le=1)
+
+
+class LineageNodeResponse(ApiModel):
+    node_id: str
+    node_type: str
+    label: str
+    source_ref: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LineageEdgeResponse(ApiModel):
+    source_node_id: str
+    target_node_id: str
+    relation: str
+
+
+class AnalysisLineageResponse(ApiModel):
+    nodes: tuple[LineageNodeResponse, ...] = ()
+    edges: tuple[LineageEdgeResponse, ...] = ()
+    relationship_graph: dict[str, Any] = Field(default_factory=dict)
+    grain_plan: dict[str, Any] = Field(default_factory=dict)
 
 
 class AnalysisHypothesisResponse(ApiModel):
@@ -272,6 +367,9 @@ class StructuredReportResponse(ApiModel):
     validation_issues: tuple[ValidationIssueResponse, ...] = ()
     recommended_next_steps: tuple[str, ...] = ()
     analysis_trace: tuple[AnalysisRoundResponse, ...] = ()
+    analysis_contract: AnalysisContractResponse | None = None
+    statistical_verification: StatisticalVerificationResponse | None = None
+    analysis_lineage: AnalysisLineageResponse | None = None
     provider: str | None = None
     model: str | None = None
 
@@ -287,6 +385,9 @@ class AnalysisRunResponse(ApiModel):
     multi_dataset_context: MultiDatasetProfileResponse | None = None
     profile: DatasetProfileResponse
     analysis_framework: AnalysisFrameworkResponse | None = None
+    analysis_contract: AnalysisContractResponse | None = None
+    statistical_verification: StatisticalVerificationResponse | None = None
+    analysis_lineage: AnalysisLineageResponse | None = None
     sql_result: SQLAnalysisResponse | None = None
     python_result: PythonAnalysisResponse | None = None
     rounds: tuple[AnalysisRoundResponse, ...] = ()
@@ -294,6 +395,7 @@ class AnalysisRunResponse(ApiModel):
     validation_issues: tuple[ValidationIssueResponse, ...] = ()
     structured_report: StructuredReportResponse | None = None
     html_report: str | None = None
+    sql_source: str | None = None
     python_source: str | None = None
     python_generated_code: str | None = None
     python_execution_error: str | None = None

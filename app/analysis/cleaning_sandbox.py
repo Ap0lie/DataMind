@@ -82,6 +82,10 @@ def run_generated_cleaning_analysis(
     if settings.python_runner_url:
         result = _run_remote(payload, execution_policy)
     else:
+        if settings.environment.lower() == "production":
+            raise GeneratedCleaningSandboxError(
+                "Production cleaning execution requires the container Runner."
+            )
         env = {"PYTHONIOENCODING": "utf-8", "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
         try:
             with tempfile.TemporaryDirectory(prefix="datamind-cleaning-agent-") as folder:

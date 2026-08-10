@@ -17,8 +17,12 @@ from app.analysis.dataset_groups import (
     suggest_dataset_group_relationships,
 )
 from app.api.v1.deps import current_user_id
+from app.assistant.evidence import canonical_reliability, safe_excerpt
 from app.assistant.jobs import start_assistant_run
-from app.assistant.permissions import FULL_CAPABILITIES, AssistantPermissionService
+from app.assistant.permissions import (
+    AssistantPermissionService,
+    capabilities_for_asset,
+)
 from app.core.settings import get_settings
 from app.schemas.assistant import (
     AssistantActionListResponse,
@@ -43,7 +47,11 @@ from app.schemas.assistant import (
     RecycledAssetResponse,
 )
 from app.security.rate_limit import RateLimitExceeded, enforce_rate_limit
-from app.services.tabular_import import records_from_file_bytes, xlsx_sheet_previews_from_bytes
+from app.services.tabular_import import (
+    preview_file_from_path,
+    record_batches_from_file_path,
+    xlsx_sheet_previews_from_path,
+)
 from app.storage.assistant_repository import AssistantRepository, StoredAssistantRun
 from app.storage.dataset_store import DatasetStoreRepository
 
@@ -150,11 +158,17 @@ def create_permission_grant(
     repository = _repository(user_id)
     store = DatasetStoreRepository(get_settings().dataset_store_path, user_id=user_id)
     try:
-        AssistantPermissionService(store=store, assistant_store=repository).validate_grant_target(
-            request.asset_type, request.asset_id
+        permission_service = AssistantPermissionService(
+            store=store,
+            assistant_store=repository,
         )
+        permission_service.validate_grant_target(request.asset_type, request.asset_id)
         if not request.capabilities:
             raise ValueError("At least one assistant capability is required.")
+        permission_service.validate_grant_capabilities(
+            request.asset_type,
+            request.capabilities,
+        )
         return AssistantPermissionGrantResponse.model_validate(
             repository.save_permission_grant(
                 asset_type=request.asset_type,
@@ -420,37 +434,45 @@ def commit_import_batch(
                 continue
             attachment_id = UUID(str(item["attachment_id"]))
             attachment = repository.get_attachment(attachment_id)
-            file_bytes = repository.attachment_path(attachment_id).read_bytes()
             selected_sheet = request.sheet_selections.get(attachment_id) or item.get(
                 "selected_sheet"
             )
             if item.get("requires_sheet_selection") and not selected_sheet:
                 raise ValueError(f"请先为 {attachment['file_name']} 选择要导入的 Sheet。")
-            parsed = records_from_file_bytes(
-                file_bytes=file_bytes,
-                source_type=str(item["source_type"]),
-                sheet_name=selected_sheet,
-            )
-            records = parsed.get("data") if parsed.get("ok") else None
-            if not isinstance(records, list) or not records:
+            dataset = None
+            try:
+                stream = record_batches_from_file_path(
+                    repository.attachment_path(attachment_id),
+                    source_type=str(item["source_type"]),
+                    sheet_name=selected_sheet,
+                )
+                dataset = store.create_dataset(
+                    name=str(attachment["file_name"]),
+                    source_type=str(item["source_type"]),
+                    source_metadata={
+                        "kind": item["source_type"],
+                        "name": attachment["file_name"],
+                        "size_kb": round(int(attachment["size_bytes"]) / 1024, 1),
+                        "parser": "assistant_tabular_import",
+                        "streaming_import": True,
+                        "sheet_name": stream.selected_sheet_name,
+                        "assistant_import_batch_id": str(batch_id),
+                    },
+                )
+                inserted = store.replace_raw_record_batches(
+                    dataset_id=dataset.id,
+                    batches=stream.batches,
+                )
+                if inserted <= 0:
+                    raise ValueError(f"{attachment['file_name']} 中没有可导入记录。")
+            except Exception:
+                if dataset is not None:
+                    with suppress(RuntimeError):
+                        store.hard_delete_dataset(dataset.id)
                 if request.allow_partial:
                     continue
-                raise ValueError(
-                    str(parsed.get("error") or f"{attachment['file_name']} 导入失败。")
-                )
-            dataset = store.create_dataset(
-                name=str(attachment["file_name"]),
-                source_type=str(item["source_type"]),
-                source_metadata={
-                    "kind": item["source_type"],
-                    "name": attachment["file_name"],
-                    "size_kb": round(int(attachment["size_bytes"]) / 1024, 1),
-                    "parser": "assistant_tabular_import",
-                    "sheet_name": selected_sheet,
-                    "assistant_import_batch_id": str(batch_id),
-                },
-            )
-            store.append_raw_records(dataset_id=dataset.id, records=records)
+                raise
+            assert dataset is not None
             cleaning_job = store.create_cleaning_job(
                 dataset_id=dataset.id,
                 cleaning_strategy="auto",
@@ -487,7 +509,9 @@ def commit_import_batch(
             ("dataset_group", group_id) if group_id else ("dataset", dataset_ids[0])
         )
         repository.save_permission_grant(
-            asset_type=grant_type, asset_id=grant_id, capabilities=FULL_CAPABILITIES
+            asset_type=grant_type,
+            asset_id=grant_id,
+            capabilities=capabilities_for_asset(grant_type),
         )
         repository.update_conversation(
             batch["conversation_id"], scope_type=grant_type, scope_id=grant_id
@@ -594,7 +618,12 @@ async def stream_run_events(
                 yield f"id: {cursor}\nevent: assistant\ndata: {json.dumps(item, ensure_ascii=False, default=str)}\n\n"
                 idle = 0
             run = repository.get_run(run_id)
-            if run.status not in {"queued", "running", "cancel_requested"} and not rows:
+            if run.status not in {
+                "queued",
+                "running",
+                "pause_requested",
+                "cancel_requested",
+            } and not rows:
                 yield f"event: end\ndata: {json.dumps({'status': run.status})}\n\n"
                 return
             idle += 1
@@ -667,6 +696,30 @@ def cancel_run(run_id: UUID, user_id: str = Depends(current_user_id)) -> Assista
         return _run_response(run)
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/pause", response_model=AssistantRunResponse, status_code=202)
+def pause_run(run_id: UUID, user_id: str = Depends(current_user_id)) -> AssistantRunResponse:
+    repository = _repository(user_id)
+    try:
+        return _run_response(repository.request_pause(run_id))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/resume", response_model=AssistantRunResponse, status_code=202)
+def resume_run(run_id: UUID, user_id: str = Depends(current_user_id)) -> AssistantRunResponse:
+    repository = _repository(user_id)
+    try:
+        resumed = repository.resume_run(run_id)
+        start_assistant_run(
+            run_id=run_id,
+            user_id=user_id,
+            dataset_store_path=get_settings().dataset_store_path,
+        )
+        return _run_response(resumed)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _run_response(run: StoredAssistantRun) -> AssistantRunResponse:
@@ -758,7 +811,12 @@ def _citations_with_report_artifacts(
             continue
         try:
             job = store.get_analysis_job(UUID(str(citation["source_id"])))
-            if job.report_id is None or ("report", str(job.report_id)) in known:
+            job_result = job.result if isinstance(job.result, dict) else {}
+            citation["reliability"] = canonical_reliability(
+                citation.get("reliability"),
+                job_result.get("statistical_verification"),
+            )
+            if job.report_id is None:
                 continue
             report = store.get_report(job.report_id)
         except (RuntimeError, ValueError):
@@ -769,23 +827,45 @@ def _citations_with_report_artifacts(
             if isinstance(metadata.get("structured_report"), dict)
             else {}
         )
-        excerpt = str(
+        excerpt = safe_excerpt(
             structured.get("executive_summary") or report.get("markdown") or "完整分析报告已生成。"
-        )[:320]
-        enriched.append(
-            {
+        )
+        report_citation = next(
+            (
+                item
+                for item in enriched
+                if item.get("source_type") == "report"
+                and str(item.get("source_id")) == str(job.report_id)
+            ),
+            None,
+        )
+        lineage_reliability = canonical_reliability(
+            citation.get("reliability"),
+            report_citation.get("reliability") if report_citation else None,
+            metadata.get("statistical_verification"),
+        )
+        citation["reliability"] = lineage_reliability
+        if report_citation is None:
+            report_citation = {
                 "source_type": "report",
                 "source_id": str(job.report_id),
                 "label": str(report["title"]),
                 "excerpt": excerpt,
                 "dataset_id": str(report["dataset_id"]),
-                "artifact_role": "deliverable"
-                if citation.get("artifact_role") == "deliverable"
-                or str(job.report_id) == str(deliverable_report_id)
-                else "evidence",
+                "artifact_role": "evidence",
             }
-        )
+            enriched.append(report_citation)
+        else:
+            report_citation["excerpt"] = safe_excerpt(report_citation.get("excerpt"))
+        report_citation["reliability"] = lineage_reliability
+        if (
+            citation.get("artifact_role") == "deliverable"
+            or str(job.report_id) == str(deliverable_report_id)
+        ):
+            report_citation["artifact_role"] = "deliverable"
         known.add(("report", str(job.report_id)))
+    for item in enriched:
+        item["excerpt"] = safe_excerpt(item.get("excerpt"))
     deliverable_indexes = [
         index
         for index, item in enumerate(enriched)
@@ -793,7 +873,22 @@ def _citations_with_report_artifacts(
     ]
     for index in deliverable_indexes[:-1]:
         enriched[index]["artifact_role"] = "evidence"
-    return tuple(enriched)
+    public_fields = {
+        "source_type",
+        "source_id",
+        "label",
+        "excerpt",
+        "dataset_id",
+        "artifact_role",
+        "reliability",
+    }
+    # Older or interrupted runs may contain server-only enrichment fields.
+    # Sanitize on read as well as write so one malformed citation cannot make
+    # the entire conversation endpoint return 500.
+    return tuple(
+        {key: value for key, value in item.items() if key in public_fields}
+        for item in enriched
+    )
 
 
 def _preview_data_attachment(
@@ -816,9 +911,9 @@ def _preview_data_attachment(
         "sheets": [],
     }
     try:
-        file_bytes = repository.attachment_path(attachment_id).read_bytes()
+        file_path = repository.attachment_path(attachment_id)
         if source_type == "xlsx":
-            sheets = xlsx_sheet_previews_from_bytes(file_bytes)
+            sheets = xlsx_sheet_previews_from_path(file_path)
             if not sheets.get("ok"):
                 return base | {"error": str(sheets.get("error") or "XLSX 预览失败。")}
             sheet_items = list(sheets.get("sheets") or [])
@@ -839,17 +934,15 @@ def _preview_data_attachment(
                 "requires_sheet_selection": requires_selection,
                 "sheets": sheet_items,
             }
-        parsed = records_from_file_bytes(file_bytes=file_bytes, source_type=source_type)
-        records = parsed.get("data") if parsed.get("ok") else None
-        if not isinstance(records, list) or not records:
+        parsed = preview_file_from_path(file_path, source_type=source_type)
+        if not parsed.get("ok"):
             return base | {"error": str(parsed.get("error") or "文件中没有可导入记录。")}
-        columns = list(records[0].keys()) if isinstance(records[0], dict) else []
         return base | {
             "valid": True,
-            "row_count": len(records),
-            "column_count": len(columns),
-            "columns": columns,
-            "preview_records": records[:8],
+            "row_count": int(parsed.get("row_count") or 0),
+            "column_count": int(parsed.get("column_count") or 0),
+            "columns": list(parsed.get("columns") or []),
+            "preview_records": list(parsed.get("preview_records") or []),
         }
     except Exception as exc:
         return base | {"error": str(exc)}

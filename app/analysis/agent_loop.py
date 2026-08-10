@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 from dataclasses import dataclass
@@ -12,8 +13,14 @@ import pandas as pd
 from sqlglot import exp, parse
 
 from app.analysis.python_execution import PythonAnalysisExecutor
-from app.analysis.services import PlannedAnalysis, _run_python, _run_sql
-from app.schemas.analysis import DatasetProfileResponse
+from app.analysis.query_intent import SOURCE_METRIC_ALIASES
+from app.analysis.services import (
+    PlannedAnalysis,
+    _apply_plan_filters,
+    _run_python,
+    _run_sql,
+)
+from app.schemas.analysis import DatasetProfileResponse, PythonExecutionContextResponse
 from app.semantic.service import SemanticLayerService
 from app.storage.dataset_store import DatasetStoreRepository
 
@@ -118,8 +125,14 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     ),
     _tool(
         "execute_python_analysis",
-        "Execute one sandboxed Python analysis attempt. Code must define analyze(df).",
-        {"code": {"type": "string"}},
+        (
+            "Execute one sandboxed Python analysis attempt. Code must define analyze(df). "
+            "Optionally use rows from earlier SQL evidence as the input dataframe."
+        ),
+        {
+            "code": {"type": "string"},
+            "evidence_id": {"type": "string"},
+        },
         required=("code",),
     ),
     _tool(
@@ -139,8 +152,69 @@ TOOL_NAMES = frozenset(item["function"]["name"] for item in TOOL_DEFINITIONS)
 
 
 def canonical_action_hash(tool_name: str, arguments: dict[str, Any]) -> str:
-    canonical = json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    normalized = dict(arguments)
+    if tool_name == "execute_safe_sql" and isinstance(normalized.get("sql"), str):
+        normalized["sql"] = _canonical_sql(str(normalized["sql"]))
+    canonical = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     return hashlib.sha256(f"{tool_name}:{canonical}".encode()).hexdigest()
+
+
+def canonical_result_hash(result: dict[str, Any] | None) -> str | None:
+    if not result:
+        return None
+    canonical = json.dumps(
+        result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _canonical_sql(sql: str) -> str:
+    try:
+        statements = parse(sql, read="duckdb")
+    except Exception:
+        return " ".join(sql.split())
+
+    canonical: list[str] = []
+    for statement in statements:
+        normalized = statement.transform(_strip_sql_alias)
+        normalized = normalized.transform(_strip_sql_qualifier)
+        canonical.append(
+            normalized.sql(
+                dialect="duckdb",
+                normalize=True,
+                pretty=False,
+                comments=False,
+            )
+        )
+    return ";".join(canonical)
+
+
+def _strip_sql_alias(node: exp.Expression) -> exp.Expression:
+    if isinstance(node, exp.Alias):
+        return node.this.copy()
+    return node
+
+
+def _strip_sql_qualifier(node: exp.Expression) -> exp.Expression:
+    if isinstance(node, exp.Table):
+        normalized = node.copy()
+        normalized.set("alias", None)
+        return normalized
+    if isinstance(node, exp.Column) and node.table:
+        normalized = node.copy()
+        normalized.set("table", None)
+        return normalized
+    return node
 
 
 def error_fingerprint(error_type: LoopErrorType, message: str) -> str:
@@ -169,6 +243,27 @@ def classify_tool_error(tool_name: str, exc: Exception) -> LoopErrorType:
     return LoopErrorType.FATAL_STATE_ERROR
 
 
+def load_evidence_result(
+    repository: DatasetStoreRepository,
+    dataset_id: UUID,
+    evidence: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Load one evidence payload regardless of its storage representation."""
+
+    result = evidence.get("result")
+    if isinstance(result, dict):
+        return result
+    artifact_id = evidence.get("artifact_id")
+    if not artifact_id:
+        return None
+    artifact = repository.get_artifact(dataset_id, UUID(str(artifact_id)))
+    content = artifact.get("content")
+    if not isinstance(content, dict):
+        return None
+    nested = content.get("result")
+    return nested if isinstance(nested, dict) else content
+
+
 class AgentToolRuntime:
     """Read-only, job-scoped tool view. Identity and dataset scope are server supplied."""
 
@@ -195,7 +290,9 @@ class AgentToolRuntime:
         self.job_id = job_id
         self.dataset_id = dataset_id
         self.allowed_dataset_ids = allowed_dataset_ids
-        self.dataframe = dataframe
+        self.source_dataframe = dataframe
+        self.source_row_count = len(dataframe)
+        self.dataframe = _apply_plan_filters(dataframe, plan.filters)
         self.question = question
         self.profile = profile
         self.plan = plan
@@ -205,9 +302,11 @@ class AgentToolRuntime:
         self.evidence: dict[str, dict[str, Any]] = {}
         for item in evidence:
             hydrated = dict(item)
-            if hydrated.get("result") is None and hydrated.get("artifact_id"):
-                artifact = repository.get_artifact(dataset_id, UUID(str(hydrated["artifact_id"])))
-                hydrated["result"] = artifact.get("content")
+            hydrated["result"] = load_evidence_result(
+                repository,
+                dataset_id,
+                hydrated,
+            )
             self.evidence[str(hydrated.get("evidence_id"))] = hydrated
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolExecution:
@@ -290,7 +389,23 @@ class AgentToolRuntime:
         dataset_id = self._resolve_source_dataset(arguments.get("dataset"))
         dataset = self.repository.get_dataset(dataset_id)
         frame = self._source_dataframe(dataset_id)
-        group_by = _optional_column(frame, arguments.get("group_by"))
+        scoped = self._source_contract_scope(frame)
+        if scoped["missing_filters"] or scoped["missing_dimensions"]:
+            missing = (*scoped["missing_filters"], *scoped["missing_dimensions"])
+            raise ValueError(
+                "Source dataset cannot satisfy the contract population/grain: "
+                + ", ".join(missing)
+            )
+        original_row_count = len(frame)
+        frame = _apply_plan_filters(frame, scoped["filters"])
+        required_group_by = next(iter(scoped["dimensions"]), None)
+        group_by = _optional_column(
+            frame, arguments.get("group_by") or required_group_by
+        )
+        if len(scoped["dimensions"]) > 1 or (
+            scoped["dimensions"] and group_by != required_group_by
+        ):
+            raise ValueError("Source aggregation does not preserve the contract grain.")
         metric = _required_column(frame, arguments.get("metric"))
         aggregation = str(arguments.get("aggregation") or "sum")
         result = _aggregate_frame(
@@ -302,10 +417,12 @@ class AgentToolRuntime:
         return _source_aggregate_result(
             dataset_id=dataset_id,
             dataset_name=dataset.name,
-            source_row_count=len(frame),
+            source_row_count=original_row_count,
+            filtered_row_count=len(frame),
             group_by=group_by,
             metric=metric,
             aggregation=aggregation,
+            filters=scoped["filters"],
             result=result,
         )
 
@@ -349,12 +466,42 @@ class AgentToolRuntime:
         code = str(arguments.get("code") or "").strip()
         if not code:
             raise ValueError("Python code is required.")
-        return {"code": code, "python_result": self.python_executor(code, self.dataframe).model_dump(mode="json")}
+        evidence_id = str(arguments.get("evidence_id") or "").strip() or None
+        frame = self.dataframe
+        source_row_count = self.source_row_count
+        applied_filters = self.plan.filters
+        if evidence_id:
+            source = self._required_evidence(evidence_id)
+            source_result = source.get("result") if isinstance(source.get("result"), dict) else {}
+            rows = _evidence_rows(source_result)
+            if not rows:
+                raise ValueError("Referenced evidence has no tabular rows for Python analysis.")
+            frame = pd.DataFrame.from_records(rows)
+            source_row_count = len(frame)
+            applied_filters = ()
+        python_result = self.python_executor(code, frame).model_copy(
+            update={
+                "execution_context": PythonExecutionContextResponse(
+                    source_row_count=source_row_count,
+                    input_row_count=len(frame),
+                    input_evidence_id=evidence_id,
+                    applied_filters=applied_filters,
+                    referenced_columns=_python_referenced_columns(code, frame.columns),
+                )
+            }
+        )
+        return {
+            "code": code,
+            "python_result": python_result.model_dump(mode="json"),
+        }
 
     def _tool_generate_chart(self, arguments: dict[str, Any]) -> dict[str, Any]:
         evidence = self._required_evidence(arguments.get("evidence_id"))
         result = evidence.get("result") if isinstance(evidence.get("result"), dict) else {}
-        rows = result.get("rows") or (result.get("python_result") or {}).get("charts", [{}])[0].get("data") or []
+        rows = _evidence_rows(result)
+        if not rows:
+            charts = (result.get("python_result") or {}).get("charts") or []
+            rows = charts[0].get("data") if charts and isinstance(charts[0], dict) else []
         if not isinstance(rows, list) or not rows:
             raise ValueError("Referenced evidence has no chartable rows.")
         x, y = str(arguments.get("x") or ""), str(arguments.get("y") or "")
@@ -374,30 +521,46 @@ class AgentToolRuntime:
             raise KeyError("Unknown evidence_id.")
         return evidence
 
-    def required_source_aggregates(self) -> tuple[dict[str, Any], ...]:
+    def required_source_aggregates(
+        self,
+        excluded: set[tuple[str, str, str]] | None = None,
+    ) -> tuple[dict[str, Any], ...]:
         """Compute source-grain totals explicitly requested by a multi-table question."""
         if len(self.allowed_dataset_ids) < 2:
             return ()
         question = _normalized_source_name(self.question)
         requested: list[dict[str, Any]] = []
-        aliases = {
-            "price": ("price", "商品收入", "商品金额", "销售额", "gmv"),
-            "freight_value": ("freightvalue", "freight", "运费"),
-            "payment_value": ("paymentvalue", "支付总额", "支付金额", "付款总额"),
-        }
+        excluded = excluded or set()
         for dataset_id in self.allowed_dataset_ids:
             dataset = self.repository.get_dataset(dataset_id)
             if _normalized_source_name(dataset.name) not in question:
                 continue
             frame = self._source_dataframe(dataset_id)
-            for metric, metric_aliases in aliases.items():
-                if metric not in frame.columns:
-                    continue
-                if not any(_normalized_source_name(alias) in question for alias in metric_aliases):
-                    continue
+            scoped = self._source_contract_scope(frame)
+            if (
+                scoped["missing_filters"]
+                or scoped["missing_dimensions"]
+                or len(scoped["dimensions"]) > 1
+            ):
+                continue
+            group_by = next(iter(scoped["dimensions"]), None)
+            metrics = [
+                metric
+                for metric, metric_aliases in SOURCE_METRIC_ALIASES.items()
+                if metric in frame.columns
+                and any(
+                    _normalized_source_name(alias) in question
+                    for alias in metric_aliases
+                )
+                and (str(dataset_id), metric, "sum") not in excluded
+            ]
+            if not metrics:
+                continue
+            filtered_frame = _apply_plan_filters(frame, scoped["filters"])
+            for metric in metrics:
                 result = _aggregate_frame(
-                    frame,
-                    group_by=None,
+                    filtered_frame,
+                    group_by=group_by,
                     metric=metric,
                     aggregation="sum",
                 )
@@ -406,13 +569,47 @@ class AgentToolRuntime:
                         dataset_id=dataset_id,
                         dataset_name=dataset.name,
                         source_row_count=len(frame),
-                        group_by=None,
+                        filtered_row_count=len(filtered_frame),
+                        group_by=group_by,
                         metric=metric,
                         aggregation="sum",
+                        filters=scoped["filters"],
                         result=result,
                     )
                 )
         return tuple(requested)
+
+    def _source_contract_scope(self, frame: pd.DataFrame) -> dict[str, Any]:
+        filters = []
+        missing_filters: list[str] = []
+        for condition in self.plan.filters:
+            column = _source_contract_column(frame, condition.column)
+            if column is None:
+                missing_filters.append(condition.column)
+                continue
+            filters.append(condition.model_copy(update={"column": column}))
+
+        dimensions = []
+        missing_dimensions: list[str] = []
+        contract_dimensions = tuple(
+            dict.fromkeys(
+                item
+                for item in (*self.plan.requested_dimensions, self.plan.time_column)
+                if item
+            )
+        )
+        for dimension in contract_dimensions:
+            column = _source_contract_column(frame, dimension)
+            if column is None:
+                missing_dimensions.append(dimension)
+                continue
+            dimensions.append(column)
+        return {
+            "filters": tuple(filters),
+            "dimensions": tuple(dimensions),
+            "missing_filters": tuple(missing_filters),
+            "missing_dimensions": tuple(missing_dimensions),
+        }
 
     def source_relationships(self) -> dict[str, Any]:
         """Profile shared identifier keys across the original scoped datasets."""
@@ -488,9 +685,71 @@ class AgentToolRuntime:
         raise KeyError(f"Unknown or disallowed source dataset: {requested}")
 
     def legacy_fallback(self) -> dict[str, Any]:
-        sql_result = _run_sql(self.dataframe, self.plan)
-        python_result = _run_python(self.dataframe, self.plan, sql_result, self.question)
-        return {"sql_result": sql_result.model_dump(mode="json"), "python_result": python_result.model_dump(mode="json")}
+        output: dict[str, Any] = {}
+        sql_result = None
+        if self.plan.route in {"sql", "hybrid"}:
+            sql_result = _run_sql(self.source_dataframe, self.plan)
+            output["sql_result"] = sql_result.model_dump(mode="json")
+        if self.plan.route in {"python", "hybrid"}:
+            referenced_columns = tuple(
+                dict.fromkeys(
+                    column
+                    for column in (
+                        *self.plan.requested_dimensions,
+                        self.plan.time_column,
+                        self.plan.metric_column,
+                    )
+                    if column and column in self.dataframe.columns
+                )
+            )
+            python_result = _run_python(
+                self.source_dataframe,
+                self.plan,
+                sql_result,
+                self.question,
+            ).model_copy(
+                update={
+                    "execution_context": PythonExecutionContextResponse(
+                        source_row_count=self.source_row_count,
+                        input_row_count=len(self.dataframe),
+                        applied_filters=self.plan.filters,
+                        referenced_columns=referenced_columns,
+                    )
+                }
+            )
+            output["python_result"] = python_result.model_dump(mode="json")
+        return output
+
+
+def _evidence_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = result.get("rows")
+    if not isinstance(rows, list) and isinstance(result.get("sql_result"), dict):
+        rows = result["sql_result"].get("rows")
+    if not isinstance(rows, (list, tuple)):
+        return []
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def _python_referenced_columns(code: str, columns: Any) -> tuple[str, ...]:
+    available = tuple(str(column) for column in columns)
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError:
+        return ()
+    literal_names = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    attribute_names = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "df"
+    }
+    referenced = literal_names | attribute_names
+    return tuple(column for column in available if column in referenced)
 
 
 def _validate_safe_dataset_sql(sql: str) -> None:
@@ -527,6 +786,14 @@ def _optional_column(frame: pd.DataFrame, value: Any) -> str | None:
     return _required_column(frame, value)
 
 
+def _source_contract_column(frame: pd.DataFrame, value: str) -> str | None:
+    if value in frame.columns:
+        return value
+    suffix = value.rsplit("__", 1)[-1]
+    matches = [str(column) for column in frame.columns if str(column) == suffix]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _aggregate_frame(
     frame: pd.DataFrame,
     *,
@@ -561,9 +828,11 @@ def _source_aggregate_result(
     dataset_id: UUID,
     dataset_name: str,
     source_row_count: int,
+    filtered_row_count: int,
     group_by: str | None,
     metric: str,
     aggregation: str,
+    filters: tuple[Any, ...],
     result: pd.DataFrame,
 ) -> dict[str, Any]:
     quoted_metric = metric.replace('"', '""')
@@ -577,6 +846,13 @@ def _source_aggregate_result(
         f'SELECT {group_sql}{aggregation.upper()}(CAST(\"{quoted_metric}\" AS DOUBLE)) '
         f'AS \"{alias}\" FROM \"{source_name}\"'
     )
+    where_parts = [
+        f'\"{item.column.replace(chr(34), chr(34) * 2)}\" {item.operator} '
+        + _source_sql_literal(item.value)
+        for item in filters
+    ]
+    if where_parts:
+        sql += f" WHERE {' AND '.join(where_parts)}"
     if group_by:
         sql += f' GROUP BY \"{group_by.replace(chr(34), chr(34) * 2)}\"'
     rows = _frame_rows(result.head(1000))
@@ -589,11 +865,22 @@ def _source_aggregate_result(
         "source_dataset_id": str(dataset_id),
         "source_dataset": dataset_name,
         "source_row_count": source_row_count,
+        "filtered_row_count": filtered_row_count,
         "group_by": group_by,
+        "grain": [group_by] if group_by else ["dataset"],
         "metric": metric,
         "aggregation": aggregation,
+        "filters": [item.model_dump(mode="json") for item in filters],
         "native_grain": True,
     }
+
+
+def _source_sql_literal(value: object) -> str:
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def _relationship_key_name(column: str) -> bool:

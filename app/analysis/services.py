@@ -1,18 +1,26 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from html import escape
 from itertools import islice
-from math import cos, isnan, pi, sin
+from math import cos, isfinite, isnan, pi, sin
 from typing import Any
 from uuid import UUID
 
 import duckdb
 import pandas as pd
 
+from app.analysis.query_intent import (
+    infer_query_intent,
+    negated_grouping_columns,
+    strip_negated_clauses,
+)
 from app.analysis.text_analysis import run_text_analysis_toolbox
 from app.analysis.validators import validate_chart_specs, validate_findings_traceability
 from app.schemas.analysis import (
+    AnalysisAggregationResponse,
+    AnalysisFilterResponse,
     AnalysisFrameworkResponse,
     AnalysisHypothesisResponse,
     AnalysisPlanResponse,
@@ -39,6 +47,11 @@ class PlannedAnalysis:
     metric_column: str | None
     time_column: str | None
     steps: tuple[str, ...]
+    aggregations: tuple[AnalysisAggregationResponse, ...] = ()
+    filters: tuple[AnalysisFilterResponse, ...] = ()
+    requested_dimensions: tuple[str, ...] = ()
+    derived_metrics: tuple[str, ...] = ()
+    time_grain: str | None = None
 
 
 class DatasetProfiler:
@@ -205,7 +218,11 @@ class AnalysisService:
             python_result=python_result,
         )
         rounds = _build_analysis_rounds(question=question, plan=plan, python_result=python_result)
-        final_insights = _build_final_insights(python_result=python_result, sql_result=sql_result)
+        final_insights = _build_final_insights(
+            question=question,
+            python_result=python_result,
+            sql_result=sql_result,
+        )
         validation_issues = _build_validation_issues(
             findings=final_insights,
             charts=python_result.charts,
@@ -260,12 +277,28 @@ class AnalysisService:
 
 
 def _plan(question: str, profile: DatasetProfileResponse) -> PlannedAnalysis:
-    text = question.lower()
+    semantic_question = strip_negated_clauses(question)
+    text = semantic_question.casefold()
     numeric = list(profile.numeric_columns)
     categorical = list(profile.categorical_columns)
+    intent = infer_query_intent(question, profile)
+    forbidden_dimensions = set(
+        negated_grouping_columns(question, tuple(categorical))
+    )
+    eligible_categories = [
+        column for column in categorical if column not in forbidden_dimensions
+    ]
     time_column = _pick_time_column(profile)
-    metric = _pick_metric_column(text, numeric)
-    category = _pick_category_column(text, categorical)
+    metric = intent.metric or _pick_metric_column(text, numeric)
+    category = (
+        intent.required_dimensions[0]
+        if intent.required_dimensions
+        else None
+        if intent.aggregations
+        else intent.dimensions[0]
+        if intent.dimensions
+        else _pick_category_column(text, eligible_categories)
+    )
 
     wants_python = any(
         token in text for token in ("correlation", "distribution", "histogram", "box", "eda")
@@ -288,7 +321,7 @@ def _plan(question: str, profile: DatasetProfileResponse) -> PlannedAnalysis:
     ) or any(token in question for token in ("关键词", "正面", "负面", "评论", "评价", "文本", "情绪"))
     wants_python = wants_python or wants_text_analysis
     wants_trend = any(token in text for token in ("trend", "monthly", "date", "time")) or any(
-        token in question for token in ("趋势", "月份", "日期", "时间")
+        token in question for token in ("趋势", "月度", "按月", "月份", "日期", "时间")
     )
     route = "python" if wants_python and not category else "sql"
     if wants_python and (category or wants_trend):
@@ -307,10 +340,20 @@ def _plan(question: str, profile: DatasetProfileResponse) -> PlannedAnalysis:
         metric_column=metric,
         time_column=time_column if wants_trend else None,
         steps=steps,
+        aggregations=intent.aggregations,
+        filters=intent.filters,
+        requested_dimensions=intent.required_dimensions,
+        derived_metrics=intent.derived_metrics,
+        time_grain="month"
+        if wants_trend and any(token in text for token in ("月度", "按月", "月份", "monthly"))
+        else None,
     )
 
 
 def _run_sql(df: pd.DataFrame, plan: PlannedAnalysis) -> SQLAnalysisResponse:
+    if plan.aggregations or plan.filters:
+        return _run_intent_sql(df, plan)
+
     metric = _safe_metric_column(df, plan.metric_column)
     if metric is None:
         category = plan.category_column or _first_categorical(df)
@@ -374,12 +417,171 @@ def _run_sql(df: pd.DataFrame, plan: PlannedAnalysis) -> SQLAnalysisResponse:
     return SQLAnalysisResponse(sql=sql, rows=tuple(rows), explanation=explanation)
 
 
+def _run_intent_sql(
+    df: pd.DataFrame,
+    plan: PlannedAnalysis,
+) -> SQLAnalysisResponse:
+    sql, explanation = _build_intent_query(df, plan)
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.register("dataset", df)
+        rows = _records(connection.execute(sql).fetchdf())
+    finally:
+        connection.close()
+    return SQLAnalysisResponse(sql=sql, rows=tuple(rows), explanation=explanation)
+
+
+def _build_intent_query(
+    df: pd.DataFrame,
+    plan: PlannedAnalysis,
+) -> tuple[str, str]:
+    dimensions = [
+        column
+        for column in (plan.time_column, plan.category_column)
+        if column and column in df.columns
+    ]
+    dimensions = list(dict.fromkeys(dimensions))
+    select_parts: list[str] = []
+    group_parts: list[str] = []
+    for column in dimensions:
+        output_alias = (
+            "period"
+            if column == plan.time_column
+            else "category"
+            if len(dimensions) == 1
+            else _alias(column)
+        )
+        expression = _quote_identifier(column)
+        if column == plan.time_column and plan.time_grain == "month":
+            expression = f"STRFTIME(TRY_CAST({expression} AS TIMESTAMP), '%Y-%m')"
+        selected_expression = (
+            f"COALESCE({expression}, 'ALL')"
+            if column == plan.time_column and plan.time_grain
+            else expression
+        )
+        select_parts.append(f"{selected_expression} AS {_quote_identifier(output_alias)}")
+        group_parts.append(expression)
+
+    aggregation_aliases: list[str] = []
+    aggregation_expressions: dict[tuple[str, str | None], str] = {}
+    for aggregation in plan.aggregations:
+        expression = _aggregation_sql(df, aggregation)
+        if expression is None:
+            continue
+        aggregation_expressions[(aggregation.operation, aggregation.column)] = expression
+        alias = _alias(aggregation.alias)
+        aggregation_aliases.append(alias)
+        select_parts.append(f"{expression} AS {_quote_identifier(alias)}")
+    if "average_order_value" in plan.derived_metrics:
+        total = next(
+            (
+                expression
+                for (operation, _), expression in aggregation_expressions.items()
+                if operation == "sum"
+            ),
+            None,
+        )
+        orders = next(
+            (
+                expression
+                for (operation, _), expression in aggregation_expressions.items()
+                if operation == "count_distinct"
+            ),
+            None,
+        )
+        if total and orders:
+            aggregation_aliases.append("average_order_value")
+            select_parts.append(
+                f"ROUND(CAST(({total}) AS DOUBLE) / NULLIF(({orders}), 0), 6) "
+                'AS "average_order_value"'
+            )
+    if not aggregation_aliases:
+        select_parts.append('COUNT(*) AS "row_count"')
+        aggregation_aliases.append("row_count")
+
+    where_parts = [
+        _filter_sql(condition)
+        for condition in plan.filters
+        if condition.column in df.columns
+    ]
+    sql = f"SELECT {', '.join(select_parts)} FROM dataset"
+    if where_parts:
+        sql += f" WHERE {' AND '.join(where_parts)}"
+    if plan.time_column in dimensions and len(group_parts) == 1 and plan.time_grain:
+        sql += f" GROUP BY GROUPING SETS (({group_parts[0]}), ())"
+    elif group_parts:
+        sql += f" GROUP BY {', '.join(group_parts)}"
+    if plan.time_column in dimensions:
+        sql += ' ORDER BY "period" ASC'
+    elif group_parts and aggregation_aliases:
+        sql += f" ORDER BY {_quote_identifier(aggregation_aliases[0])} DESC"
+    explanation = (
+        "按用户明确要求执行 "
+        f"{', '.join(item.operation for item in plan.aggregations) or 'count'} 聚合"
+        f"，维度：{', '.join(dimensions) or '全体'}"
+        f"，过滤条件：{len(where_parts)} 个"
+        f"，派生指标：{', '.join(plan.derived_metrics) or '无'}。"
+    )
+    return sql, explanation
+
+
+def _aggregation_sql(
+    df: pd.DataFrame,
+    aggregation: AnalysisAggregationResponse,
+) -> str | None:
+    operation = aggregation.operation
+    column = aggregation.column
+    if operation == "count" and not column:
+        return "COUNT(*)"
+    if not column or column not in df.columns:
+        return None
+    quoted = _quote_identifier(column)
+    if operation == "count":
+        return f"COUNT({quoted})"
+    if operation == "count_distinct":
+        return f"COUNT(DISTINCT {quoted})"
+    if operation == "avg" and column.rsplit("__", 1)[-1].casefold() == "on_time":
+        return (
+            "ROUND(AVG(CASE WHEN LOWER(TRIM(CAST("
+            f"{quoted} AS VARCHAR))) IN ('true', '1', 'yes', 'y', 'on_time', 'ontime') "
+            "THEN 1.0 WHEN LOWER(TRIM(CAST("
+            f"{quoted} AS VARCHAR))) IN ('false', '0', 'no', 'n', 'late', 'delayed') "
+            "THEN 0.0 ELSE NULL END), 6)"
+        )
+    if operation not in {"sum", "avg", "min", "max"}:
+        return None
+    if not _is_metric_column(df, column):
+        return None
+    expression = f"{operation.upper()}(CAST({quoted} AS DOUBLE))"
+    return f"ROUND({expression}, 6)"
+
+
+def _filter_sql(condition: AnalysisFilterResponse) -> str:
+    return (
+        f"{_quote_identifier(condition.column)} {condition.operator} "
+        f"{_sql_literal(condition.value)}"
+    )
+
+
+def _quote_identifier(value: str) -> str:
+    return f'"{value.replace(chr(34), chr(34) * 2)}"'
+
+
+def _sql_literal(value: str | int | float | bool) -> str:
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _run_python(
     df: pd.DataFrame,
     plan: PlannedAnalysis,
     sql_result: SQLAnalysisResponse | None,
     question: str = "",
 ) -> PythonAnalysisResponse:
+    df = _apply_plan_filters(df, plan.filters)
     numeric_df = df.apply(pd.to_numeric, errors="coerce")
     numeric_df = numeric_df.dropna(axis=1, how="all")
     statistics: dict[str, Any] = {
@@ -406,21 +608,58 @@ def _run_python(
     charts: list[ChartResponse] = []
     if sql_result and sql_result.rows:
         row_keys = tuple(sql_result.rows[0].keys())
+        primary_aggregation = next(
+            (
+                item
+                for item in plan.aggregations
+                if item.alias in row_keys
+                and item.operation in {"sum", "count", "count_distinct"}
+            ),
+            None,
+        ) or next(
+            (item for item in plan.aggregations if item.alias in row_keys),
+            None,
+        )
+        chart_metric = (
+            primary_aggregation.alias if primary_aggregation is not None else row_keys[-1]
+        )
         charts.append(
             ChartResponse(
                 title="SQL 结果图",
                 chart_type="bar",
-                spec={"x": row_keys[0], "y": row_keys[-1]},
+                spec={"x": row_keys[0], "y": chart_metric},
                 data=sql_result.rows,
             )
         )
-        if len(row_keys) >= 2:
+        if (
+            len(row_keys) >= 2
+            and primary_aggregation is not None
+            and primary_aggregation.operation in {"sum", "count", "count_distinct"}
+        ):
+            displayed_rows = tuple(sql_result.rows[:8])
+            excluded_count = max(0, len(sql_result.rows) - len(displayed_rows))
+            denominator_scope = (
+                "displayed_top_n" if excluded_count else "complete_query_result"
+            )
             charts.append(
                 ChartResponse(
                     title="占比图",
                     chart_type="pie",
-                    spec={"names": row_keys[0], "values": row_keys[-1]},
-                    data=sql_result.rows[:10],
+                    spec={
+                        "names": row_keys[0],
+                        "values": chart_metric,
+                        "denominator_scope": denominator_scope,
+                        "displayed_category_count": len(displayed_rows),
+                        "excluded_category_count": excluded_count,
+                    },
+                    data=displayed_rows,
+                    explanation=(
+                        f"仅展示查询结果前 {len(displayed_rows)} 类；百分比以这 "
+                        f"{len(displayed_rows)} 类的合计为分母，另有 {excluded_count} 类"
+                        "未进入图表，不能将该百分比解释为全量占比。"
+                        if excluded_count
+                        else "展示查询返回的全部类别；百分比以全部返回类别的合计为分母。"
+                    ),
                 )
             )
 
@@ -448,12 +687,17 @@ def _run_python(
 
     if metric and metric in df.columns:
         histogram_series = pd.to_numeric(_column_series(df, metric), errors="coerce").dropna()
-        if not histogram_series.empty:
+        if len(histogram_series) >= 10:
             charts.append(
                 ChartResponse(
                     title="数值分布直方图",
                     chart_type="histogram",
-                    spec={"x": "label", "y": "value", "source_metric": metric},
+                    spec={
+                        "x": "label",
+                        "y": "value",
+                        "source_metric": metric,
+                        "sample_size": len(histogram_series),
+                    },
                     data=tuple(_histogram_buckets(histogram_series.tolist())),
                 )
             )
@@ -463,24 +707,39 @@ def _run_python(
         if category and category in df.columns and not histogram_series.empty:
             box_df = df[[category, metric]].copy()
             box_df[metric] = pd.to_numeric(box_df[metric], errors="coerce")
-            box_df = box_df.dropna(subset=[metric]).head(500)
-            if not box_df.empty:
+            box_df = box_df.dropna(subset=[category, metric])
+            group_sizes = box_df.groupby(category, dropna=True)[metric].count()
+            eligible_groups = group_sizes[group_sizes >= 5]
+            box_df = box_df[box_df[category].isin(eligible_groups.index)].head(500)
+            if len(eligible_groups) >= 2:
                 charts.append(
                     ChartResponse(
                         title="分类箱线图",
                         chart_type="box_plot",
-                        spec={"x": category, "y": metric},
+                        spec={
+                            "x": category,
+                            "y": metric,
+                            "sample_size": len(box_df),
+                            "group_sizes": {
+                                str(key): int(value)
+                                for key, value in eligible_groups.items()
+                            },
+                        },
                         data=tuple(_records(box_df)),
                     )
                 )
 
-    if len(numeric_df.columns) >= 2:
+    correlation_rows = int(numeric_df.dropna(how="all").shape[0])
+    if len(numeric_df.columns) >= 3 and correlation_rows >= 20:
         corr = numeric_df.corr(numeric_only=True).fillna(0)
         charts.append(
             ChartResponse(
                 title="相关性热力图",
                 chart_type="correlation_heatmap",
-                spec={"columns": [str(column) for column in corr.columns]},
+                spec={
+                    "columns": [str(column) for column in corr.columns],
+                    "sample_size": correlation_rows,
+                },
                 data=tuple(
                     {
                         "source": str(source),
@@ -492,7 +751,9 @@ def _run_python(
                 ),
             )
         )
-    text_analysis = run_text_analysis_toolbox(df, question=f"{question} {' '.join(plan.steps)}")
+    # Text intent and grouping exclusions are user-contract decisions. Planner prose must not
+    # reintroduce a text route or a dimension that the user explicitly rejected.
+    text_analysis = run_text_analysis_toolbox(df, question=question)
     for text_result in text_analysis:
         for insight in text_result.insights:
             if insight and insight not in insights:
@@ -511,6 +772,33 @@ def _run_python(
     )
 
 
+def _apply_plan_filters(
+    dataframe: pd.DataFrame,
+    filters: tuple[AnalysisFilterResponse, ...],
+) -> pd.DataFrame:
+    filtered = dataframe
+    for condition in filters:
+        if condition.column not in filtered.columns:
+            continue
+        series = _column_series(filtered, condition.column)
+        value = condition.value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            comparable = pd.to_numeric(series, errors="coerce")
+        else:
+            comparable = series.astype("string").str.casefold()
+            value = str(value).casefold()
+        mask = {
+            "=": comparable == value,
+            "!=": comparable != value,
+            ">": comparable > value,
+            ">=": comparable >= value,
+            "<": comparable < value,
+            "<=": comparable <= value,
+        }[condition.operator]
+        filtered = filtered.loc[mask.fillna(False)]
+    return filtered
+
+
 def _report_markdown(
     *,
     question: str,
@@ -519,12 +807,25 @@ def _report_markdown(
     sql_result: SQLAnalysisResponse | None,
     python_result: PythonAnalysisResponse,
 ) -> str:
+    analysis_row_count = _analysis_row_count(profile, python_result)
+    findings = _build_final_insights(
+        question=question,
+        python_result=python_result,
+        sql_result=sql_result,
+    )
+    charts = _format_report_charts(
+        question=question,
+        sql_result=sql_result,
+        charts=python_result.charts,
+        findings=findings,
+        plan=plan,
+    )
     lines = [
         "# DataMind 分析报告",
         "",
         "## Executive Summary",
         f"- 用户问题: {question}",
-        f"- 数据规模: {profile.row_count} 行, {profile.column_count} 列",
+        f"- 数据规模: {analysis_row_count} 行, {profile.column_count} 列",
         f"- 缺失值: {profile.missing_value_count} 个, 重复行: {profile.duplicate_row_count} 行",
         f"- Planner 路由: {plan.route}",
         "",
@@ -541,16 +842,27 @@ def _report_markdown(
                 "",
             ]
         )
-    lines.extend(
-        [
-            "## Visualizations",
-            *[f"- {chart.title} ({chart.chart_type})" for chart in python_result.charts],
-            "",
-        ]
-    )
-    lines.extend(
-        ["## Business Insights", *[f"- {insight}" for insight in python_result.insights], ""]
-    )
+    if findings:
+        lines.extend(["## Business Insights"])
+        for finding in findings:
+            lines.append(f"- **{finding.title}**: {finding.content}")
+            if finding.evidence:
+                lines.append(f"  - 证据: {finding.evidence}")
+            if finding.recommended_action:
+                lines.append(f"  - 建议: {finding.recommended_action}")
+        lines.append("")
+    if charts:
+        lines.extend(
+            [
+                "## Visualizations",
+                *[
+                    f"- {chart.title} ({chart.chart_type}): "
+                    f"{chart.explanation or '见图表数据。'}"
+                    for chart in charts
+                ],
+                "",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -653,10 +965,145 @@ def _format_report_charts(
     *,
     charts: tuple[ChartResponse, ...],
     findings: tuple[InsightFindingResponse, ...],
+    question: str = "",
+    sql_result: SQLAnalysisResponse | None = None,
+    plan: PlannedAnalysis | None = None,
 ) -> tuple[ChartResponse, ...]:
     finding_titles = tuple(finding.title for finding in findings[:2])
+    focused_rows = _coherent_sql_rows(sql_result, question)
+    preferred_fields = tuple(
+        dict.fromkeys(
+            field
+            for field in (
+                plan.metric_column if plan else None,
+                plan.category_column if plan else None,
+                plan.time_column if plan else None,
+                *(plan.requested_dimensions if plan else ()),
+            )
+            if field
+        )
+    )
+    time_column = _preferred_column(
+        tuple(focused_rows[0]) if focused_rows else (),
+        tuple(field for field in (plan.time_column if plan else None,) if field),
+    ) or _time_column(focused_rows)
+    metric_columns = _numeric_columns(focused_rows)
+    primary_metric = _preferred_column(
+        metric_columns,
+        tuple(field for field in (plan.metric_column if plan else None,) if field),
+    ) or _primary_metric(metric_columns, question)
+    folded_question = question.casefold()
+    trend_requested = any(
+        token in folded_question for token in ("趋势", "月度", "按月", "trend", "monthly")
+    )
     formatted: list[ChartResponse] = []
+    if trend_requested and time_column and primary_metric:
+        data = tuple(
+            {
+                time_column: row.get(time_column),
+                primary_metric: row.get(primary_metric),
+            }
+            for row in focused_rows
+            if row.get(time_column) is not None
+            and str(row.get(time_column)).casefold() != "all"
+            and _finite_number(row.get(primary_metric)) is not None
+        )
+        if data:
+            peak = max(data, key=lambda row: float(row[primary_metric]))
+            formatted.append(
+                ChartResponse(
+                    title=f"{_metric_label(primary_metric)}月度趋势",
+                    chart_type="line",
+                    spec={"x": time_column, "y": primary_metric},
+                    data=data,
+                    explanation=(
+                        f"按 {_time_label(time_column)} 展示 {_metric_label(primary_metric)}；"
+                        f"峰值出现在 {peak[time_column]}，为 "
+                        f"{_format_metric_value(primary_metric, peak[primary_metric])}。"
+                    ),
+                    related_finding_ids=finding_titles,
+                )
+            )
+
+    if not trend_requested and focused_rows and primary_metric:
+        dimension_candidates = tuple(
+            column
+            for column in focused_rows[0]
+            if column not in {"evidence_id", "query_index", *metric_columns}
+        )
+        dimension = _preferred_column(
+            dimension_candidates,
+            tuple(
+                field
+                for field in (
+                    plan.category_column if plan else None,
+                    *(plan.requested_dimensions if plan else ()),
+                )
+                if field
+            ),
+        ) or next(
+            (
+                column for column in dimension_candidates
+            ),
+            None,
+        )
+        if dimension:
+            data = tuple(
+                {
+                    dimension: row.get(dimension),
+                    primary_metric: row.get(primary_metric),
+                }
+                for row in focused_rows
+                if row.get(dimension) is not None
+                and _finite_number(row.get(primary_metric)) is not None
+            )
+            if data:
+                formatted.append(
+                    ChartResponse(
+                        title=f"{_metric_label(primary_metric)}分组对比",
+                        chart_type="bar",
+                        spec={"x": dimension, "y": primary_metric},
+                        data=data,
+                        explanation=(
+                            f"按 {dimension} 比较 {_metric_label(primary_metric)}，"
+                            "图表与核心排名使用相同聚合口径。"
+                        ),
+                        related_finding_ids=finding_titles,
+                    )
+                )
+
+    seen = {(chart.title.casefold(), chart.chart_type) for chart in formatted}
+    question_fields = {
+        field.casefold()
+        for row in focused_rows[:1]
+        for field in row
+        if field not in {"evidence_id", "query_index"}
+        and _field_relevant_to_question(field, folded_question)
+    }
     for chart in charts:
+        signature = (chart.title.casefold(), chart.chart_type)
+        if formatted and chart.title in {"SQL 结果图", "占比图"}:
+            continue
+        if signature in seen or (formatted and trend_requested and chart.chart_type in {"line", "pie"}):
+            continue
+        if not _chart_is_suitable(chart):
+            continue
+        chart_context = f"{chart.title} {chart.spec}".casefold()
+        text_chart = any(
+            token in chart_context
+            for token in ("review", "comment", "keyword", "文本", "评论", "关键词")
+        )
+        if text_chart and not any(
+            token in folded_question
+            for token in ("review", "comment", "text", "文本", "评论", "关键词")
+        ):
+            continue
+        if preferred_fields and not _chart_matches_plan(chart, preferred_fields):
+            continue
+        if not preferred_fields and question_fields and not any(
+            field in chart_context for field in question_fields
+        ):
+            continue
         explanation = chart.explanation or _chart_explanation(chart)
         formatted.append(
             ChartResponse(
@@ -668,16 +1115,170 @@ def _format_report_charts(
                 related_finding_ids=chart.related_finding_ids or finding_titles,
             )
         )
+        seen.add(signature)
+        if len(formatted) >= (3 if trend_requested else 6):
+            break
     return tuple(formatted)
+
+
+_DERIVED_CHART_FIELDS = {
+    "bin",
+    "binend",
+    "binstart",
+    "count",
+    "frequency",
+    "label",
+    "name",
+    "value",
+}
+
+
+def _preferred_column(candidates: tuple[str, ...], preferred: tuple[str, ...]) -> str | None:
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if any(_field_names_match(candidate, field) for field in preferred)
+        ),
+        None,
+    )
+
+
+def _chart_matches_plan(chart: ChartResponse, preferred: tuple[str, ...]) -> bool:
+    fields = _chart_semantic_fields(chart)
+    substantive = [
+        field
+        for field in fields
+        if _normalized_field_name(field) not in _DERIVED_CHART_FIELDS
+    ]
+    return bool(substantive) and all(
+        any(_field_names_match(field, expected) for expected in preferred)
+        for field in substantive
+    )
+
+
+def _chart_semantic_fields(chart: ChartResponse) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in ("x", "y", "field", "group_by", "category", "metric", "columns"):
+        value = chart.spec.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, (list, tuple)):
+            values.extend(str(item) for item in value if isinstance(item, str))
+    if not values and chart.data:
+        values.extend(str(field) for field in chart.data[0])
+    return tuple(dict.fromkeys(values))
+
+
+def _field_names_match(left: str, right: str) -> bool:
+    left_name = _normalized_field_name(left)
+    right_name = _normalized_field_name(right)
+    return bool(
+        left_name
+        and right_name
+        and (
+            left_name == right_name
+            or left_name.endswith(right_name)
+            or right_name.endswith(left_name)
+        )
+    )
+
+
+def _normalized_field_name(value: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value.casefold())
+
+
+_BUSINESS_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "sales": ("销售", "销售额", "营收", "收入"),
+    "amount": ("金额", "销售额", "交易额", "营收"),
+    "revenue": ("营收", "收入", "销售额"),
+    "profit": ("利润", "毛利"),
+    "price": ("价格", "单价"),
+    "quantity": ("数量", "销量"),
+    "count": ("数量", "次数", "订单数"),
+    "order": ("订单",),
+    "customer": ("客户", "用户"),
+    "region": ("地区", "区域"),
+    "segment": ("细分", "客群"),
+    "date": ("日期", "时间"),
+    "time": ("时间", "日期"),
+}
+
+
+def _field_relevant_to_question(field: str, folded_question: str) -> bool:
+    normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", field.casefold())
+    normalized_question = re.sub(
+        r"[^0-9a-z\u4e00-\u9fff]+", "", folded_question.casefold()
+    )
+    if normalized and normalized in normalized_question:
+        return True
+    tokens = re.findall(r"[a-z]+|[\u4e00-\u9fff]+", field.casefold().replace("_", " "))
+    return any(
+        alias in normalized_question
+        for token in tokens
+        for alias in _BUSINESS_FIELD_ALIASES.get(token, ())
+    )
+
+
+def _chart_is_suitable(chart: ChartResponse) -> bool:
+    if not chart.data:
+        return False
+    if chart.chart_type == "histogram":
+        sample_size = chart.spec.get("sample_size")
+        if not isinstance(sample_size, int):
+            sample_size = sum(
+                int(value)
+                for row in chart.data
+                if isinstance(row, dict)
+                and isinstance((value := row.get("value")), (int, float))
+            )
+        return sample_size >= 10
+    if chart.chart_type == "box_plot":
+        group_sizes = chart.spec.get("group_sizes")
+        if isinstance(group_sizes, dict):
+            sizes = [int(value) for value in group_sizes.values()]
+        else:
+            group_by = str(chart.spec.get("x") or "")
+            counts: dict[str, int] = {}
+            for row in chart.data:
+                if isinstance(row, dict) and row.get(group_by) is not None:
+                    key = str(row[group_by])
+                    counts[key] = counts.get(key, 0) + 1
+            sizes = list(counts.values())
+        return len(sizes) >= 2 and min(sizes) >= 5
+    if chart.chart_type == "correlation_heatmap":
+        columns = chart.spec.get("columns")
+        sample_size = chart.spec.get("sample_size")
+        return (
+            isinstance(columns, list)
+            and len(columns) >= 3
+            and isinstance(sample_size, int)
+            and sample_size >= 20
+        )
+    return True
 
 
 def _build_final_insights(
     *,
-    python_result: PythonAnalysisResponse,
+    python_result: PythonAnalysisResponse | None,
     sql_result: SQLAnalysisResponse | None,
+    question: str = "",
 ) -> tuple[InsightFindingResponse, ...]:
-    findings: list[InsightFindingResponse] = []
-    for index, insight in enumerate(python_result.insights[:4], 1):
+    findings = list(
+        _sql_findings(
+            question=question,
+            sql_result=sql_result,
+            python_result=python_result,
+        )
+    )
+    if python_result and python_result.insights:
+        findings = findings[:4]
+    for index, insight in enumerate(python_result.insights[:4] if python_result else (), 1):
+        if any(
+            insight == finding.evidence or insight in finding.content
+            for finding in findings
+        ):
+            continue
         findings.append(
             InsightFindingResponse(
                 title=f"发现 {index}",
@@ -690,6 +1291,8 @@ def _build_final_insights(
                 recommended_action="继续用相关字段切分验证该发现。",
             )
         )
+        if len(findings) >= 6:
+            break
     if sql_result and sql_result.rows:
         findings.append(
             InsightFindingResponse(
@@ -703,7 +1306,362 @@ def _build_final_insights(
                 recommended_action="检查排名靠前记录的结构性原因。",
             )
         )
+    return tuple(findings[:6])
+
+
+def _sql_findings(
+    *,
+    question: str,
+    sql_result: SQLAnalysisResponse | None,
+    python_result: PythonAnalysisResponse | None,
+) -> tuple[InsightFindingResponse, ...]:
+    rows = _coherent_sql_rows(sql_result, question)
+    numeric_columns = _numeric_columns(rows)
+    if not rows or not numeric_columns:
+        return ()
+
+    time_column = _time_column(rows)
+    primary_metric = _primary_metric(numeric_columns, question)
+    overall_row = next(
+        (
+            row
+            for row in rows
+            if time_column
+            and str(row.get(time_column) or "").casefold() in {"all", "overall", "total"}
+        ),
+        None,
+    )
+    detail_rows = tuple(row for row in rows if row is not overall_row)
+    values: dict[str, float] = {}
+    for column in numeric_columns:
+        overall_value = (
+            _finite_number(overall_row.get(column)) if overall_row is not None else None
+        )
+        if overall_value is not None:
+            values[column] = overall_value
+            continue
+        numbers = [
+            number
+            for row in detail_rows
+            if (number := _finite_number(row.get(column))) is not None
+        ]
+        if not numbers:
+            continue
+        folded = column.casefold()
+        if len(rows) == 1:
+            values[column] = numbers[0]
+        elif _is_average_metric(column):
+            continue
+        elif any(
+            token in folded
+            for token in (
+                "gmv",
+                "revenue",
+                "sales",
+                "amount",
+                "price",
+                "total",
+                "sum",
+                "count",
+            )
+        ):
+            values[column] = sum(numbers)
+
+    gmv_column = next(
+        (
+            column
+            for column in numeric_columns
+            if any(
+                token in column.casefold()
+                for token in ("gmv", "revenue", "sales", "amount", "price")
+            )
+            and column in values
+        ),
+        None,
+    )
+    count_column = next(
+        (
+            column
+            for column in numeric_columns
+            if "count" in column.casefold() and column in values
+        ),
+        None,
+    )
+    average_column = next(
+        (
+            column
+            for column in numeric_columns
+            if _is_average_metric(column)
+        ),
+        None,
+    )
+    if gmv_column and count_column and average_column and values[count_column]:
+        values[average_column] = values[gmv_column] / values[count_column]
+
+    statistics = (
+        python_result.statistics.get("numeric_summary") or {}
+        if python_result
+        else {}
+    )
+    if isinstance(statistics, dict):
+        for column in numeric_columns:
+            if "rate" not in column.casefold() and "ratio" not in column.casefold():
+                continue
+            candidates = (column, column.removesuffix("_rate"), column.removesuffix("_ratio"))
+            summary = next(
+                (
+                    statistics.get(candidate)
+                    for candidate in candidates
+                    if isinstance(statistics.get(candidate), dict)
+                ),
+                None,
+            )
+            mean = _finite_number((summary or {}).get("mean"))
+            if mean is not None:
+                values[column] = mean
+
+    evidence_ids = tuple(
+        dict.fromkeys(
+            str(row.get("evidence_id"))
+            for row in rows
+            if row.get("evidence_id")
+        )
+    )
+    evidence_ref = "; ".join(f"evidence_id:{item}" for item in evidence_ids)
+    source = "sql_result.rows"
+    findings: list[InsightFindingResponse] = []
+    ordered_values = [column for column in numeric_columns if column in values]
+    if ordered_values:
+        summary = "；".join(
+            f"{_metric_label(column)}={_format_metric_value(column, values[column])}"
+            for column in ordered_values[:6]
+        )
+        findings.append(
+            InsightFindingResponse(
+                title="核心指标概览",
+                content=summary + "。",
+                data_source=source,
+                evidence=(
+                    f"{evidence_ref}; 基于 {len(rows)} 个"
+                    f"{_time_label(time_column) if time_column else '结果'}分组汇总"
+                ).strip("; "),
+                confidence="high",
+                business_impact="形成经营规模、效率和履约表现的统一基线。",
+                recommended_action="按相同指标口径持续监控，并对显著偏离整体水平的期间下钻分析。",
+            )
+        )
+
+    if time_column and primary_metric:
+        ranked = sorted(
+            (
+                (row.get(time_column), number)
+                for row in detail_rows
+                if row.get(time_column) is not None
+                and (number := _finite_number(row.get(primary_metric))) is not None
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if ranked:
+            top = "、".join(
+                f"{period}（{_format_metric_value(primary_metric, value)}）"
+                for period, value in ranked[:3]
+            )
+            detail = f"{_metric_label(primary_metric)}最高的三个期间为 {top}"
+            rate_column = next(
+                (column for column in numeric_columns if "rate" in column.casefold()),
+                None,
+            )
+            if rate_column:
+                rate_rows = [
+                    (row.get(time_column), number)
+                    for row in detail_rows
+                    if row.get(time_column) is not None
+                    and (number := _finite_number(row.get(rate_column))) is not None
+                ]
+                if rate_rows:
+                    period, rate = min(rate_rows, key=lambda item: item[1])
+                    detail += (
+                        f"；{_metric_label(rate_column)}最低出现在 {period}"
+                        f"（{_format_metric_value(rate_column, rate)}）"
+                    )
+            findings.append(
+                InsightFindingResponse(
+                    title="月度趋势与异常期间",
+                    content=detail + "。",
+                    data_source=source,
+                    evidence=(f"{evidence_ref}; {time_column} × {primary_metric}").strip("; "),
+                    confidence="high",
+                    business_impact="峰值与履约低点可用于定位需求、产能或配送压力集中的期间。",
+                    recommended_action="优先复盘峰值月份及履约低点的订单结构、库存和配送环节。",
+                )
+            )
+    elif primary_metric:
+        dimension = next(
+            (
+                column
+                for column in rows[0]
+                if column not in {"evidence_id", "query_index", *numeric_columns}
+            ),
+            None,
+        )
+        if dimension:
+            ranked = sorted(
+                (
+                    (row.get(dimension), number)
+                    for row in rows
+                    if row.get(dimension) is not None
+                    and (number := _finite_number(row.get(primary_metric))) is not None
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if ranked:
+                top = "、".join(
+                    f"{category}（{_format_metric_value(primary_metric, value)}）"
+                    for category, value in ranked[:3]
+                )
+                findings.append(
+                    InsightFindingResponse(
+                        title="分组表现排名",
+                        content=f"按 {_metric_label(primary_metric)} 排名前三的 {dimension} 为 {top}。",
+                        data_source=source,
+                        evidence=(f"{evidence_ref}; {dimension} × {primary_metric}").strip("; "),
+                        confidence="high",
+                        business_impact="头部分组贡献可用于确定优先分析和资源投入方向。",
+                        recommended_action="复核头部分组的规模、结构和持续性，并与低表现分组进行对照。",
+                    )
+                )
     return tuple(findings)
+
+
+def _is_average_metric(column: str) -> bool:
+    folded = column.casefold()
+    return (
+        folded in {"aov", "average_order_value", "avg_order_value"}
+        or folded.startswith(("average_", "avg_", "mean_"))
+    )
+
+
+def _coherent_sql_rows(
+    sql_result: SQLAnalysisResponse | None,
+    question: str,
+) -> tuple[dict[str, Any], ...]:
+    if sql_result is None or not sql_result.rows:
+        return ()
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in sql_result.rows:
+        key = (str(row.get("evidence_id") or ""), str(row.get("query_index") or ""))
+        groups.setdefault(key, []).append(row)
+    folded_question = question.casefold()
+
+    def score(rows: list[dict[str, Any]]) -> tuple[int, int, int]:
+        fields = [field for field in rows[0] if field not in {"evidence_id", "query_index"}]
+        matches = sum(field.casefold() in folded_question for field in fields)
+        return matches, len(_numeric_columns(tuple(rows))), min(len(rows), 200)
+
+    return tuple(max(groups.values(), key=score))
+
+
+def _numeric_columns(rows: tuple[dict[str, Any], ...]) -> tuple[str, ...]:
+    if not rows:
+        return ()
+    return tuple(
+        column
+        for column in rows[0]
+        if column not in {"evidence_id", "query_index"}
+        and any(_finite_number(row.get(column)) is not None for row in rows)
+    )
+
+
+def _time_column(rows: tuple[dict[str, Any], ...]) -> str | None:
+    if not rows:
+        return None
+    return next(
+        (
+            column
+            for column in rows[0]
+            if any(
+                token in column.casefold()
+                for token in ("month", "date", "time", "period", "year", "week", "月份", "日期", "时间")
+            )
+        ),
+        None,
+    )
+
+
+def _primary_metric(columns: tuple[str, ...], question: str) -> str | None:
+    folded_question = question.casefold()
+    return next((column for column in columns if column.casefold() in folded_question), None) or next(
+        (
+            column
+            for column in columns
+            if any(
+                token in column.casefold()
+                for token in (
+                    "gmv",
+                    "revenue",
+                    "sales",
+                    "amount",
+                    "price",
+                    "total",
+                    "sum",
+                    "count",
+                )
+            )
+        ),
+        columns[0] if columns else None,
+    )
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if isfinite(number) else None
+
+
+def _metric_label(column: str) -> str:
+    label = {
+        "gmv": "GMV",
+        "total_amount": "总金额",
+        "order_count": "订单数",
+        "aov": "客单价",
+        "average_amount": "平均金额",
+        "average_order_value": "客单价",
+        "avg_order_value": "客单价",
+        "on_time_rate": "准时率",
+    }.get(column.casefold())
+    if label:
+        return label
+    if column.casefold().startswith("total_"):
+        return f"{column[6:]} 总额"
+    return column
+
+
+def _time_label(column: str) -> str:
+    return {
+        "month": "月份",
+        "date": "日期",
+        "period": "期间",
+        "year": "年份",
+        "week": "周",
+    }.get(column.casefold(), column)
+
+
+def _format_metric_value(column: str, value: Any) -> str:
+    number = _finite_number(value)
+    if number is None:
+        return str(value)
+    folded = column.casefold()
+    if "rate" in folded or "ratio" in folded:
+        return f"{number:.2%}"
+    if "count" in folded and number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.2f}"
 
 
 def _build_validation_issues(
@@ -724,7 +1682,7 @@ def _structured_report(
     question: str,
     profile: DatasetProfileResponse,
     sql_result: SQLAnalysisResponse | None,
-    python_result: PythonAnalysisResponse,
+    python_result: PythonAnalysisResponse | None,
     rounds: tuple[AnalysisRoundResponse, ...],
     final_insights: tuple[InsightFindingResponse, ...],
     validation_issues: tuple[ValidationIssueResponse, ...],
@@ -733,34 +1691,56 @@ def _structured_report(
     provider: str | None = None,
     model: str | None = None,
 ) -> StructuredReportResponse:
-    first_finding = final_insights[0].content if final_insights else "已完成基础数据分析。"
-    report_charts = charts if charts is not None else python_result.charts
+    analysis_row_count = _analysis_row_count(profile, python_result)
+    summary_findings = " ".join(
+        dict.fromkeys(finding.content for finding in final_insights[:2])
+    )
+    report_charts = (
+        charts
+        if charts is not None
+        else python_result.charts
+        if python_result
+        else ()
+    )
     return StructuredReportResponse(
         executive_summary=(
-            f"围绕“{question}”，DataMind 分析了 {profile.row_count} 行、"
-            f"{profile.column_count} 列数据。{first_finding}"
+            f"围绕“{question}”，DataMind 基于 {analysis_row_count} 行、"
+            f"{profile.column_count} 列数据完成分析。"
+            f"{summary_findings or '已完成基础数据分析。'}"
         ),
         analysis_context=(
             analysis_framework.success_criteria
             if analysis_framework
-            else "基于上传数据集的 SQL/Python 分析结果生成。"
+            else "基于上传数据集的可追溯分析证据生成。"
         ),
         key_findings=final_insights,
         charts=report_charts,
         chart_explanations=tuple(chart.explanation for chart in report_charts if chart.explanation),
         sql_results=sql_result.rows if sql_result else (),
-        python_results=python_result.statistics,
+        python_results=python_result.statistics if python_result else {},
         data_gaps=_data_gaps(profile),
         validation_issues=validation_issues,
         recommended_next_steps=tuple(
-            finding.recommended_action
-            for finding in final_insights
-            if finding.recommended_action
+            dict.fromkeys(
+                finding.recommended_action
+                for finding in final_insights
+                if finding.recommended_action
+            )
         )[:5],
         analysis_trace=rounds,
         provider=provider,
         model=model,
     )
+
+
+def _analysis_row_count(
+    profile: DatasetProfileResponse,
+    python_result: PythonAnalysisResponse | None,
+) -> int:
+    value = python_result.statistics.get("rows") if python_result else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return max(0, int(value))
+    return profile.row_count
 
 
 def _chart_explanation(chart: ChartResponse) -> str:
@@ -817,6 +1797,37 @@ def render_structured_report_html(
         for round_item in report.analysis_trace
     )
     next_steps_html = "".join(f"<li>{escape(step)}</li>" for step in report.recommended_next_steps)
+    contract_html = ""
+    if report.analysis_contract:
+        contract = report.analysis_contract
+        contract_html = (
+            "<section class='card contract-grid'>"
+            f"<div><small>目标</small><p>{escape(contract.objective)}</p></div>"
+            f"<div><small>总体</small><p>{escape(contract.population)}</p></div>"
+            f"<div><small>指标</small><p>{escape(contract.metric or '计数/文本分析')}</p></div>"
+            f"<div><small>粒度</small><p>{escape(', '.join(contract.grain))}</p></div>"
+            f"<div class='wide'><small>方法</small><p>{escape(contract.method)}</p></div>"
+            "</section>"
+        )
+    verification_html = ""
+    if report.statistical_verification:
+        verification = report.statistical_verification
+        checks = "".join(
+            (
+                f"<li class='check-{escape(check.status)}'>"
+                f"<strong>{escape(check.status)}</strong> · "
+                f"{escape(check.message)}</li>"
+            )
+            for check in verification.checks
+            if check.status != "not_applicable"
+        )
+        verification_html = (
+            f"<section class='card verification verification-{escape(verification.status)}'>"
+            f"<h2>{escape(verification.summary)}</h2>"
+            f"<p>数值证据覆盖率: {verification.numeric_evidence_coverage:.0%}</p>"
+            f"<ul>{checks}</ul>"
+            "</section>"
+        )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -838,6 +1849,14 @@ def render_structured_report_html(
     th, td {{ padding:10px 12px; border-bottom:1px solid #e5edf5; text-align:left; font-size:14px; }}
     th {{ background:#111827; color:#fff; }}
     .trace-item {{ border-left:4px solid #0f766e; background:#fff; padding:14px 16px; margin:10px 0; border-radius:6px; }}
+    .contract-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px 24px; }}
+    .contract-grid p {{ margin:4px 0 0; }}
+    .contract-grid .wide {{ grid-column:1 / -1; }}
+    .verification-passed {{ border-left:4px solid #059669; }}
+    .verification-warning {{ border-left:4px solid #d97706; }}
+    .verification-failed {{ border-left:4px solid #dc2626; }}
+    .check-failed {{ color:#991b1b; }}
+    .check-warning {{ color:#92400e; }}
     .chart-grid {{ display:grid; grid-template-columns:280px 1fr; gap:20px; align-items:center; }}
     .legend {{ display:grid; gap:8px; font-size:14px; }}
     details {{ margin-top:12px; }}
@@ -854,6 +1873,10 @@ def render_structured_report_html(
     <section class="summary">{escape(report.executive_summary)}</section>
     <h3>Analysis Context</h3>
     <section class="card">{escape(report.analysis_context or "基于当前数据集完成分析。")}</section>
+    <h3>Analysis Contract</h3>
+    {contract_html or "<p class='muted'>暂无分析契约。</p>"}
+    <h3>Statistical Verification</h3>
+    {verification_html or "<p class='muted'>暂无统计审查结果。</p>"}
     <h3>Key Findings</h3>
     {findings_html or "<p class='muted'>暂无核心发现。</p>"}
     <h3>Visualizations</h3>
@@ -1263,7 +2286,14 @@ def _pick_category_column(text: str, categorical_columns: list[str]) -> str | No
             token in lowered for token in ("region", "product", "category", "区域", "产品", "类别")
         ):
             return column
-    return categorical_columns[0]
+    return next(
+        (
+            column
+            for column in categorical_columns
+            if not _looks_like_identifier_column(column)
+        ),
+        None,
+    )
 
 
 def _pick_time_column(profile: DatasetProfileResponse) -> str | None:

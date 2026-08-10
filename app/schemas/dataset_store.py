@@ -50,6 +50,7 @@ class CreateDatasetGroupRequest(ApiModel):
 
 
 class DatasetRelationshipPlan(ApiModel):
+    relationship_id: str | None = None
     left_dataset_id: UUID
     right_dataset_id: UUID
     left_column: str = Field(min_length=1)
@@ -68,6 +69,13 @@ class DatasetRelationshipPlan(ApiModel):
         pattern="^(one_to_one|one_to_many|many_to_one|many_to_many|unknown)$",
     )
     risk_note: str = ""
+    baseline_match_rate: float | None = Field(default=None, ge=0, le=1)
+    last_match_rate: float | None = Field(default=None, ge=0, le=1)
+    match_rate_drift: float = Field(default=0, ge=0, le=1)
+    freshness_status: str = Field(default="fresh", pattern="^(fresh|warning|stale)$")
+    stale_reason: str = ""
+    last_validated_at: str | None = None
+    drift_event_id: UUID | None = None
 
 
 class DatasetGroupTable(ApiModel):
@@ -261,6 +269,10 @@ class CleaningJobResponse(ApiModel):
     updated_at: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
+
+
+class CleaningJobListResponse(ApiModel):
+    jobs: tuple[CleaningJobResponse, ...] = ()
 
 
 class DatasetCleaningRunResponse(ApiModel):

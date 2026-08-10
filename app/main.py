@@ -38,9 +38,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             try:
                 from app.analysis.cleaning_jobs import recover_queued_cleaning_jobs
                 from app.analysis.jobs import recover_queued_analysis_jobs
+                from app.assistant.jobs import recover_queued_assistant_runs
 
                 recover_queued_analysis_jobs(resolved_settings.dataset_store_path)
                 recover_queued_cleaning_jobs(resolved_settings.dataset_store_path)
+                recover_queued_assistant_runs(resolved_settings.dataset_store_path)
             except Exception:
                 logger.exception("Queued analysis job recovery will be retried after startup.")
             recovery_task = asyncio.create_task(
@@ -94,6 +96,7 @@ app = create_app()
 async def _job_recovery_loop(settings: Settings) -> None:
     from app.analysis.cleaning_jobs import recover_queued_cleaning_jobs
     from app.analysis.jobs import recover_queued_analysis_jobs
+    from app.assistant.jobs import recover_queued_assistant_runs
 
     while True:
         await asyncio.sleep(max(30, settings.worker_lease_seconds // 2))
@@ -104,6 +107,10 @@ async def _job_recovery_loop(settings: Settings) -> None:
             )
             await asyncio.to_thread(
                 recover_queued_cleaning_jobs,
+                settings.dataset_store_path,
+            )
+            await asyncio.to_thread(
+                recover_queued_assistant_runs,
                 settings.dataset_store_path,
             )
         except Exception:

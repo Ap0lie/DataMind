@@ -16,6 +16,33 @@ FULL_CAPABILITIES: tuple[str, ...] = (
     "asset_recycle",
 )
 
+ASSET_CAPABILITY_MATRIX: dict[str, tuple[str, ...]] = {
+    "dataset": (
+        "data_prepare",
+        "analysis_manage",
+        "report_manage",
+        "semantic_manage",
+        "asset_recycle",
+    ),
+    "dataset_group": FULL_CAPABILITIES,
+    "report": (
+        "analysis_manage",
+        "report_manage",
+        "asset_recycle",
+    ),
+    "semantic_model": (
+        "semantic_manage",
+        "asset_recycle",
+    ),
+}
+
+
+def capabilities_for_asset(asset_type: str) -> tuple[str, ...]:
+    try:
+        return ASSET_CAPABILITY_MATRIX[asset_type]
+    except KeyError as exc:
+        raise ValueError("Unsupported assistant grant asset type.") from exc
+
 WRITE_TOOL_CAPABILITY: dict[str, str] = {
     "start_analysis": "analysis_manage",
     "start_cleaning": "data_prepare",
@@ -63,6 +90,18 @@ class AssistantPermissionService:
             self.store.get_semantic_model(asset_id)
         else:
             raise ValueError("Unsupported assistant grant asset type.")
+
+    def validate_grant_capabilities(
+        self,
+        asset_type: str,
+        capabilities: tuple[str, ...],
+    ) -> None:
+        allowed = set(capabilities_for_asset(asset_type))
+        unsupported = sorted(set(capabilities) - allowed)
+        if unsupported:
+            raise ValueError(
+                f"Capabilities are not allowed for {asset_type}: {', '.join(unsupported)}."
+            )
 
     def authorize_tool(
         self,
@@ -121,34 +160,53 @@ class AssistantPermissionService:
     ) -> dict[str, Any] | None:
         grants = self.assistant_store.list_permission_grants()
         for grant in grants:
+            if capability not in capabilities_for_asset(grant["asset_type"]):
+                continue
             if capability not in grant["capabilities"]:
                 continue
             if grant["asset_type"] == asset_type and grant["asset_id"] == asset_id:
                 return grant
-            if self._grant_inherits(grant, asset_type, asset_id):
+            if self._grant_inherits(grant, asset_type, asset_id, capability):
                 return grant
         return None
 
-    def _grant_inherits(self, grant: dict[str, Any], asset_type: str, asset_id: UUID) -> bool:
+    def _grant_inherits(
+        self,
+        grant: dict[str, Any],
+        asset_type: str,
+        asset_id: UUID,
+        capability: str,
+    ) -> bool:
         try:
             if asset_type == "report":
                 report = self.store.get_report(asset_id)
-                return self._grant_covers_dataset(grant, UUID(str(report["dataset_id"])))
+                return self._grant_covers_dataset(
+                    grant,
+                    UUID(str(report["dataset_id"])),
+                    capability,
+                )
             if asset_type == "semantic_model":
                 model = self.store.get_semantic_model(asset_id)
                 return grant["asset_type"] == model["scope_type"] and grant["asset_id"] == UUID(
                     str(model["scope_id"])
                 )
             if asset_type == "dataset":
-                return self._grant_covers_dataset(grant, asset_id)
+                return self._grant_covers_dataset(grant, asset_id, capability)
         except RuntimeError:
             return grant["asset_type"] == asset_type and grant["asset_id"] == asset_id
         return False
 
-    def _grant_covers_dataset(self, grant: dict[str, Any], dataset_id: UUID) -> bool:
+    def _grant_covers_dataset(
+        self,
+        grant: dict[str, Any],
+        dataset_id: UUID,
+        capability: str,
+    ) -> bool:
         if grant["asset_type"] == "dataset":
             return grant["asset_id"] == dataset_id
         if grant["asset_type"] == "report":
+            if capability != "analysis_manage":
+                return False
             try:
                 report = self.store.get_report(grant["asset_id"])
             except RuntimeError:

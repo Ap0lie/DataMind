@@ -96,11 +96,16 @@ def force_mock_providers_for_core_tests(
         return
     for name in (
         "DATAMIND_DEFAULT_LLM_PROVIDER",
+        "DATAMIND_CLEANING_LLM_PROVIDER",
         "DATAMIND_PLANNER_LLM_PROVIDER",
         "DATAMIND_SQL_LLM_PROVIDER",
         "DATAMIND_PYTHON_LLM_PROVIDER",
+        "DATAMIND_REFLECTION_LLM_PROVIDER",
         "DATAMIND_REPORT_LLM_PROVIDER",
         "DATAMIND_REVIEW_LLM_PROVIDER",
+        "DATAMIND_MULTIMODAL_LLM_PROVIDER",
+        "DATAMIND_AGENT_LOOP_PROVIDER",
+        "DATAMIND_ASSISTANT_LLM_PROVIDER",
     ):
         monkeypatch.setenv(name, "mock")
     get_settings.cache_clear()

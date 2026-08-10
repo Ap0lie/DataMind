@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
@@ -9,6 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
+from app.analysis.cleaning_diff import build_cleaning_diff_summary
 from app.analysis.cleaning_jobs import start_cleaning_job
 from app.analysis.data_cleaning import DataCleaningService
 from app.analysis.dataset_groups import (
@@ -18,11 +20,18 @@ from app.analysis.dataset_groups import (
 from app.analysis.services import DatasetProfiler, apply_column_metadata_to_profile
 from app.api.v1.deps import current_user_id
 from app.core.settings import get_settings
+from app.data_reliability import DataDriftService
 from app.schemas.analysis import DatasetProfileResponse
+from app.schemas.data_reliability import (
+    DatasetDriftHistoryResponse,
+    DatasetDriftResponse,
+    DatasetGroupDriftResponse,
+)
 from app.schemas.dataset_store import (
     AppendRawRecordsRequest,
     AppendRawRecordsResponse,
     CleaningDiffSummary,
+    CleaningJobListResponse,
     CleaningJobResponse,
     CleaningRulePreviewRequest,
     CleaningRulePreviewResponse,
@@ -73,10 +82,26 @@ from app.schemas.semantic import (
 )
 from app.semantic.service import SemanticLayerService
 from app.services.cleaning_rules import apply_cleaning_rules
-from app.services.tabular_import import records_from_file_bytes, xlsx_sheet_previews_from_bytes
+from app.services.tabular_import import (
+    TabularImportError,
+    record_batches_from_file_path,
+    xlsx_sheet_previews_from_path,
+)
+from app.services.upload_staging import StagedUpload, stage_upload
 from app.storage.dataset_store import DatasetStoreRepository, StoredDataset, StoredDatasetGroup
 
 router = APIRouter()
+
+
+@router.get("/cleaning-jobs", response_model=CleaningJobListResponse)
+def list_cleaning_jobs(
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    user_id: str = Depends(current_user_id),
+) -> CleaningJobListResponse:
+    jobs = _repository(user_id).list_cleaning_jobs(limit=limit)
+    return CleaningJobListResponse(
+        jobs=tuple(_cleaning_job_response(job) for job in jobs)
+    )
 
 
 @router.post("/semantic-models/drafts", response_model=SemanticModelResponse)
@@ -281,6 +306,8 @@ def update_dataset_group_relationships(
             group_id=group_id,
             relationships=tuple(item.model_dump(mode="json") for item in request.relationships),
         )
+        DataDriftService(repository).refresh_group_relationships(group_id)
+        group = repository.get_dataset_group(group_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -301,10 +328,16 @@ def auto_configure_dataset_group_relationships(
         suggestions = suggest_dataset_group_relationships(repository, group_id=group_id)
         stored_group = repository.get_dataset_group(group_id)
         selection = select_automatic_dataset_relationships(stored_group, suggestions.candidates)
-        updated_group = repository.update_dataset_group_relationships(
-            group_id=group_id,
-            relationships=tuple(item.model_dump(mode="json") for item in selection.relationships),
-        )
+        if selection.relationships:
+            repository.update_dataset_group_relationships(
+                group_id=group_id,
+                relationships=tuple(
+                    item.model_dump(mode="json")
+                    for item in selection.relationships
+                ),
+            )
+        DataDriftService(repository).refresh_group_relationships(group_id)
+        updated_group = repository.get_dataset_group(group_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -319,13 +352,14 @@ def auto_configure_dataset_group_relationships(
         issues.append(
             "No relationship passed automatic validation; the dataset group was left unchanged."
         )
+    group_response = _dataset_group_response(repository, updated_group)
     return DatasetRelationshipAutoConfigureResponse(
-        group=_dataset_group_response(repository, updated_group),
+        group=group_response,
         candidates=suggestions.candidates,
         llm_used=suggestions.llm_used,
         compact_context=suggestions.compact_context,
         validation_issues=tuple(issues),
-        saved_relationships=selection.relationships,
+        saved_relationships=group_response.relationships,
         primary_dataset_id=selection.primary_dataset_id,
         unresolved_dataset_ids=selection.unresolved_dataset_ids,
     )
@@ -361,6 +395,80 @@ def get_dataset(
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return _dataset_response(dataset)
+
+
+@router.get(
+    "/datasets/{dataset_id}/drift",
+    response_model=DatasetDriftResponse,
+)
+def get_dataset_drift(
+    dataset_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> DatasetDriftResponse:
+    try:
+        return DataDriftService(_repository(user_id)).latest_dataset_status(dataset_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/datasets/{dataset_id}/drift/scan",
+    response_model=DatasetDriftResponse,
+)
+def scan_dataset_drift(
+    dataset_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> DatasetDriftResponse:
+    try:
+        return DataDriftService(_repository(user_id)).scan_dataset(dataset_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/datasets/{dataset_id}/drift/history",
+    response_model=DatasetDriftHistoryResponse,
+)
+def get_dataset_drift_history(
+    dataset_id: UUID,
+    limit: int = Query(default=50, ge=1, le=200),
+    user_id: str = Depends(current_user_id),
+) -> DatasetDriftHistoryResponse:
+    try:
+        return DataDriftService(_repository(user_id)).dataset_history(
+            dataset_id,
+            limit=limit,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/dataset-groups/{group_id}/drift",
+    response_model=DatasetGroupDriftResponse,
+)
+def get_dataset_group_drift(
+    group_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> DatasetGroupDriftResponse:
+    try:
+        return DataDriftService(_repository(user_id)).latest_group_status(group_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/dataset-groups/{group_id}/drift/scan",
+    response_model=DatasetGroupDriftResponse,
+)
+def scan_dataset_group_drift(
+    group_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> DatasetGroupDriftResponse:
+    try:
+        return DataDriftService(_repository(user_id)).scan_group(group_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.delete("/datasets/{dataset_id}", response_model=DeleteDatasetResponse)
@@ -434,44 +542,68 @@ async def import_dataset_file(
             status_code=400, detail="Only CSV, XLSX, JSON, and TXT files can be imported."
         )
 
-    file_bytes = await file.read()
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    parsed = records_from_file_bytes(
-        file_bytes=file_bytes,
-        source_type=source_type,
-        sheet_name=sheet_name if source_type == "xlsx" else None,
-    )
-    if not parsed.get("ok"):
-        raise HTTPException(
-            status_code=400, detail=str(parsed.get("error") or "File parsing failed.")
-        )
-    records = parsed.get("data")
-    if not isinstance(records, list) or not records:
-        raise HTTPException(
-            status_code=400, detail="No tabular records were parsed from the uploaded file."
-        )
+    settings = get_settings()
+    staged: StagedUpload | None = None
     try:
-        repository = _repository(user_id)
-        dataset = repository.create_dataset(
-            name=dataset_name or file_name,
-            source_type=source_type,
-            source_metadata={
-                "kind": source_type,
-                "name": file_name,
-                "size_kb": round(len(file_bytes) / 1024, 1),
-                "parser": "backend_tabular_import",
-                "sheet_name": sheet_name,
-            },
+        staged = await stage_upload(
+            file,
+            staging_root=Path(settings.dataset_store_path) / ".upload-staging",
+            max_bytes=settings.dataset_upload_max_bytes,
+            suffix=suffix,
         )
-        inserted = repository.append_raw_records(dataset_id=dataset.id, records=records)
+
+        def persist_staged_upload() -> tuple[Any, int, list[dict[str, Any]]]:
+            stream = record_batches_from_file_path(
+                staged.path,
+                source_type=source_type,
+                sheet_name=sheet_name if source_type == "xlsx" else None,
+            )
+            repository = _repository(user_id)
+            dataset = repository.create_dataset(
+                name=dataset_name or file_name,
+                source_type=source_type,
+                source_metadata={
+                    "kind": source_type,
+                    "name": file_name,
+                    "size_kb": round(staged.size_bytes / 1024, 1),
+                    "parser": "backend_tabular_import",
+                    "streaming_import": True,
+                    "sheet_name": stream.selected_sheet_name,
+                },
+            )
+            preview_records: list[dict[str, Any]] = []
+            try:
+                inserted = repository.replace_raw_record_batches(
+                    dataset_id=dataset.id,
+                    batches=stream.batches,
+                    preview=preview_records,
+                    preview_limit=50,
+                )
+                if inserted <= 0:
+                    raise TabularImportError(
+                        "No tabular records were parsed from the uploaded file."
+                    )
+                return dataset, inserted, preview_records
+            except Exception:
+                with suppress(RuntimeError):
+                    repository.hard_delete_dataset(dataset.id)
+                raise
+
+        dataset, inserted, preview_records = await asyncio.to_thread(
+            persist_staged_upload
+        )
+    except ValueError as exc:
+        status_code = 413 if "exceeds" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        if staged is not None:
+            staged.remove()
     return FileDatasetImportResponse(
         dataset=_dataset_response(dataset),
         inserted=inserted,
-        preview_records=tuple(records[:50]),
+        preview_records=tuple(preview_records),
     )
 
 
@@ -482,14 +614,27 @@ async def preview_xlsx_sheets(
     file_name = file.filename or "uploaded.xlsx"
     if Path(file_name).suffix.lower() != ".xlsx":
         raise HTTPException(status_code=400, detail="Only XLSX files support sheet preview.")
-    file_bytes = await file.read()
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    parsed = xlsx_sheet_previews_from_bytes(file_bytes)
-    if not parsed.get("ok"):
-        raise HTTPException(
-            status_code=400, detail=str(parsed.get("error") or "XLSX sheet parsing failed.")
+    settings = get_settings()
+    staged: StagedUpload | None = None
+    try:
+        staged = await stage_upload(
+            file,
+            staging_root=Path(settings.dataset_store_path) / ".upload-staging",
+            max_bytes=settings.dataset_upload_max_bytes,
+            suffix=".xlsx",
         )
+        parsed = await asyncio.to_thread(xlsx_sheet_previews_from_path, staged.path)
+        if not parsed.get("ok"):
+            raise HTTPException(
+                status_code=400,
+                detail=str(parsed.get("error") or "XLSX sheet parsing failed."),
+            )
+    except ValueError as exc:
+        status_code = 413 if "exceeds" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    finally:
+        if staged is not None:
+            staged.remove()
     sheets = parsed.get("sheets")
     if not isinstance(sheets, list):
         raise HTTPException(status_code=400, detail="No XLSX sheets were parsed.")
@@ -889,7 +1034,7 @@ def preview_cleaning_rules(
             [rule.model_dump(mode="json") for rule in request.rules],
         )
         raw_records = repository.read_raw_records(dataset_id)
-        diff_summary = _cleaning_diff_summary(
+        diff_summary = build_cleaning_diff_summary(
             raw_records=raw_records,
             previous_records=base_records,
             current_records=current_records,
@@ -929,7 +1074,7 @@ def apply_cleaning_rule_set(
         raw_summary = _record_summary(raw_records)
         previous_summary = _record_summary(previous_records)
         current_summary = _record_summary(cleaned_records)
-        diff_summary = _cleaning_diff_summary(
+        diff_summary = build_cleaning_diff_summary(
             raw_records=raw_records,
             previous_records=previous_records,
             current_records=cleaned_records,
@@ -1020,7 +1165,7 @@ def run_cleaning_result(
         raw_summary = _record_summary(raw_records)
         previous_summary = _record_summary(previous_records)
         current_summary = _record_summary(cleaning_result.records)
-        diff_summary = _cleaning_diff_summary(
+        diff_summary = build_cleaning_diff_summary(
             raw_records=raw_records,
             previous_records=previous_records,
             current_records=cleaning_result.records,
@@ -1389,62 +1534,6 @@ def _record_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "columns": columns,
         "missing_count": missing_count,
     }
-
-
-def _cleaning_diff_summary(
-    *,
-    raw_records: list[dict[str, Any]],
-    previous_records: list[dict[str, Any]],
-    current_records: list[dict[str, Any]],
-) -> dict[str, Any]:
-    previous = previous_records or raw_records
-    previous_columns = _columns_for(previous)
-    current_columns = _columns_for(current_records)
-    changed_rows = 0
-    changed_cells = 0
-    sample_diffs: list[dict[str, Any]] = []
-    for index in range(min(len(previous), len(current_records))):
-        before = previous[index]
-        after = current_records[index]
-        row_changes: dict[str, dict[str, Any]] = {}
-        for column in sorted(set(before) | set(after)):
-            if before.get(column) != after.get(column):
-                changed_cells += 1
-                row_changes[column] = {
-                    "before": before.get(column),
-                    "after": after.get(column),
-                }
-        if row_changes:
-            changed_rows += 1
-            if len(sample_diffs) < 20:
-                sample_diffs.append(
-                    {
-                        "row_number": index + 1,
-                        "changes": row_changes,
-                    }
-                )
-    return {
-        "raw_row_count": len(raw_records),
-        "previous_row_count": len(previous),
-        "current_row_count": len(current_records),
-        "added_rows": max(len(current_records) - len(previous), 0),
-        "removed_rows": max(len(previous) - len(current_records), 0),
-        "changed_rows": changed_rows,
-        "added_columns": sorted(current_columns - previous_columns),
-        "removed_columns": sorted(previous_columns - current_columns),
-        "changed_cells": changed_cells,
-        "raw_missing_count": _record_summary(raw_records)["missing_count"],
-        "previous_missing_count": _record_summary(previous)["missing_count"],
-        "current_missing_count": _record_summary(current_records)["missing_count"],
-        "sample_diffs": sample_diffs,
-    }
-
-
-def _columns_for(records: list[dict[str, Any]]) -> set[str]:
-    columns: set[str] = set()
-    for record in records:
-        columns.update(str(key) for key in record)
-    return columns
 
 
 def _cleaning_rules_markdown(

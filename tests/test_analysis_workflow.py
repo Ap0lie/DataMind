@@ -1,13 +1,48 @@
 import json
+from types import SimpleNamespace
 
+from app.analysis.analysis_contract import _analysis_type
+from app.analysis.services import PlannedAnalysis
 from app.analysis.workflow import (
     AnalysisWorkflowRunner,
+    _claim_result,
+    _mandatory_evidence_findings,
     _prepare_multimodal_inputs,
+    _preserve_verified_report_findings,
+    _sanitize_report_cardinality_claims,
+    _unsupported_summary_numbers,
     _validate_dataset_select_sql,
 )
+from app.core.settings import get_settings
 from app.mcp.tool_schemas import ModelRouterResponse
-from app.schemas.analysis import MultimodalInputResponse
+from app.schemas.analysis import (
+    InsightFindingResponse,
+    MultimodalInputResponse,
+    StatisticalFindingVerdictResponse,
+    StatisticalVerificationResponse,
+    StructuredReportResponse,
+)
 from app.storage.dataset_store import DatasetStoreRepository
+
+
+def test_negated_reviews_dataset_does_not_select_text_analysis() -> None:
+    question = (
+        "仅使用 customers、orders、order_payments 三张表，过滤 "
+        "order_status=delivered，按 customer_state 统计 payment_value 总额，"
+        "并给出总体支付总额和 SP 州支付总额。不要使用 order_items、reviews、"
+        "products、sellers 或 geolocation，也不要按 order_status 或 "
+        "payment_type 分组。"
+    )
+    plan = PlannedAnalysis(
+        route="sql",
+        category_column="customer_state",
+        metric_column="payment_value",
+        time_column=None,
+        steps=("aggregate",),
+    )
+
+    assert _analysis_type(question, plan) == "descriptive"
+    assert _analysis_type("分析 reviews 评论中的关键词", plan) == "text"
 
 
 class FakeAnalysisModelRouter:
@@ -212,6 +247,14 @@ def test_analysis_workflow_runner_executes_planner_sql_python_report(tmp_path) -
     assert result.python_execution_error is None
     assert "DeepSeek Python Agent completed question-aware analysis." in result.python_result.insights
     assert result.analysis_framework is not None
+    assert result.analysis_contract is not None
+    assert result.analysis_contract.metric == "sales"
+    assert result.statistical_verification is not None
+    assert result.statistical_verification.numeric_evidence_coverage == 1
+    assert result.analysis_lineage is not None
+    assert any(node.node_type == "report" for node in result.analysis_lineage.nodes)
+    assert result.structured_report is not None
+    assert result.structured_report.analysis_lineage == result.analysis_lineage
     assert result.analysis_framework.candidate_dimensions == ("region",)
     assert len(result.rounds) == 3
     assert result.rounds[0].hypothesis.statement == "region explains sales variance"
@@ -227,7 +270,6 @@ def test_analysis_workflow_runner_executes_planner_sql_python_report(tmp_path) -
     assert result.rounds[2].execution_result["fanout_group"] == "rounds_2_3"
     assert "Round Python Agent verified regional sales." in result.python_result.insights
     assert result.final_insights[0].title == "区域销售差异"
-    assert result.structured_report is not None
     assert result.structured_report.executive_summary.startswith("Kimi 结构化总结")
     assert result.structured_report.key_findings[0].title == "Kimi 报告洞察"
     assert result.structured_report.chart_explanations
@@ -239,6 +281,7 @@ def test_analysis_workflow_runner_executes_planner_sql_python_report(tmp_path) -
     assert reports[0]["metadata"]["sql_source"] == "model_router"
     assert reports[0]["metadata"]["python_source"] == "model_router"
     assert reports[0]["metadata"]["python_generated_code"]
+    assert reports[0]["metadata"]["analysis_lineage"]["nodes"]
     assert reports[0]["metadata"]["python_execution_error"] is None
     assert reports[0]["metadata"]["sql_validation_error"] is None
     assert reports[0]["metadata"]["report_source"] == "model_router_structured"
@@ -253,9 +296,10 @@ def test_analysis_workflow_runner_executes_planner_sql_python_report(tmp_path) -
             "iterative_round_1",
             "iterative_fanout_round",
             "iterative_reflect_and_merge",
-            "integrate_insights",
-            "format_charts",
-            "adversarial_validate",
+                "integrate_insights",
+                "format_charts",
+                "statistical_verify",
+                "adversarial_validate",
             "report_agent",
     ]
     agents = [call["metadata"]["agent"] for call in model_router.calls]
@@ -711,7 +755,222 @@ def test_analysis_workflow_report_falls_back_when_structured_json_is_invalid(tmp
     )
 
 
-def test_analysis_workflow_falls_back_when_model_sql_is_unsafe(tmp_path) -> None:
+def test_analysis_workflow_rejects_unsupported_numeric_summary(tmp_path) -> None:
+    report_content = json.dumps(
+        {
+            "executive_summary": (
+                "Kimi 结构化总结：South 区域销售额达到 999，建议继续检查利润率。"
+            ),
+            "analysis_context": "基于 SQL 与 Python 分析生成。",
+            "key_findings": [
+                {
+                    "title": "Kimi 报告洞察",
+                    "content": "South 区域在销售额聚合结果中领先。",
+                    "data_source": "sql_result.rows",
+                    "evidence": "SQL rows show South ranked first.",
+                    "confidence": "high",
+                    "business_impact": "可优先检查 South 的收入结构。",
+                    "recommended_action": "继续检查 South 的利润率。",
+                    "impact_pct": 100,
+                }
+            ],
+            "chart_explanations": [],
+            "data_gaps": [],
+            "validation_issues": [],
+            "recommended_next_steps": ["继续检查利润率。"],
+        },
+        ensure_ascii=False,
+    )
+    repository = DatasetStoreRepository(str(tmp_path))
+    model_router = FakeAnalysisModelRouter(report_content=report_content)
+    dataset = repository.create_dataset(name="sales.csv", source_type="csv", source_metadata={})
+    repository.append_raw_records(
+        dataset_id=dataset.id,
+        records=[
+            {"region": "North", "sales": 100, "profit": 20},
+            {"region": "South", "sales": 180, "profit": 45},
+        ],
+    )
+    result = AnalysisWorkflowRunner(repository, model_router=model_router).run(
+        dataset_id=dataset.id,
+        question="Which region has the highest sales?",
+    )
+    reports = repository.list_reports(dataset.id)
+
+    assert result.structured_report is not None
+    assert "999" not in result.structured_report.executive_summary
+    assert (
+        reports[0]["metadata"]["report_source"]
+        == "model_router_structured_numeric_sanitized"
+    )
+    assert any(
+        issue.finding_ref == "executive_summary" and "999" in issue.issue
+        for issue in result.structured_report.validation_issues
+    )
+
+
+def test_rules_fallback_does_not_restore_rejected_finding() -> None:
+    rejected = InsightFindingResponse(
+        title="已拒绝结论",
+        content="观察结果导致业务增长。",
+        data_source="tool_evidence",
+        evidence="evidence_id:ev_1",
+    )
+    report = StructuredReportResponse(
+        executive_summary="确定性回退报告。",
+        key_findings=(rejected,),
+    )
+    verification = StatisticalVerificationResponse(
+        status="failed",
+        summary="统计审查失败。",
+        finding_verdicts=(
+            StatisticalFindingVerdictResponse(
+                finding_ref="finding_1",
+                title=rejected.title,
+                status="failed",
+            ),
+        ),
+        requires_replan=True,
+        numeric_evidence_coverage=1,
+    )
+
+    preserved = _preserve_verified_report_findings(
+        report,
+        verified_findings=(),
+        verification=verification,
+    )
+
+    assert preserved.key_findings == ()
+
+
+def test_join_cardinality_uses_declared_direction_and_sanitizes_model_claim() -> None:
+    findings = _mandatory_evidence_findings(
+        {
+            "question": "按客户州统计已交付支付总额",
+            "tool_evidence": (
+                {
+                    "evidence_id": "ev_relationships",
+                    "status": "succeeded",
+                    "relationship_guard": True,
+                    "result": {
+                        "relationships": [
+                            {
+                                "left_dataset": "order_payments",
+                                "right_dataset": "orders",
+                                "left_column": "order_id",
+                                "right_column": "order_id",
+                                "relationship_type": "many_to_one",
+                                "left_non_null_count": 5,
+                                "left_distinct_count": 3,
+                                "left_duplicate_count": 2,
+                            }
+                        ]
+                    },
+                },
+                {
+                    "evidence_id": "ev_native",
+                    "status": "succeeded",
+                    "result": {
+                        "native_grain": True,
+                        "source_dataset": "order_payments",
+                        "metric": "payment_value",
+                        "aggregation": "sum",
+                        "source_row_count": 5,
+                        "rows": [{"sum_payment_value": 100.0}],
+                    },
+                },
+            ),
+        }
+    )
+    relationship_finding = next(
+        finding for finding in findings if "多表关系" in finding.title
+    )
+    assert "order_payments.order_id → orders.order_id 为 N:1" in relationship_finding.content
+
+    bad_report = StructuredReportResponse(
+        executive_summary="两次 Join 均为一对一，因此不存在重复风险。",
+        key_findings=(
+            InsightFindingResponse(
+                title="Join 基数",
+                content="order_payments 与 orders 是一对一关系。",
+                data_source="model",
+            ),
+        ),
+    )
+    fallback = StructuredReportResponse(
+        executive_summary=relationship_finding.content,
+        key_findings=(relationship_finding,),
+    )
+
+    sanitized, changed = _sanitize_report_cardinality_claims(
+        report=bad_report,
+        fallback=fallback,
+        verified_findings=(relationship_finding,),
+    )
+
+    assert changed is True
+    assert "一对一" not in sanitized.executive_summary
+    assert "N:1" in sanitized.executive_summary
+    assert sanitized.key_findings == ()
+    assert any(
+        issue.finding_ref == "join_cardinality"
+        for issue in sanitized.validation_issues
+    )
+
+
+def test_executive_summary_cannot_borrow_a_number_from_global_evidence() -> None:
+    verified = InsightFindingResponse(
+        title="SP 支付总额",
+        content="SP 支付总额为100。",
+        data_source="tool_evidence",
+        evidence="evidence_id:ev_states",
+    )
+    verification = StatisticalVerificationResponse(
+        status="passed",
+        summary="统计审查通过。",
+        finding_verdicts=(
+            StatisticalFindingVerdictResponse(
+                finding_ref="finding_1",
+                title=verified.title,
+                status="passed",
+            ),
+        ),
+        requires_replan=False,
+        numeric_evidence_coverage=1,
+    )
+    report = StructuredReportResponse(
+        executive_summary="SP 支付总额为50。",
+        key_findings=(verified,),
+    )
+    state = {
+        "statistical_verification": verification,
+        "final_insights": (verified,),
+        "tool_evidence": (
+            {
+                "evidence_id": "ev_states",
+                "status": "succeeded",
+                "result": {
+                    "rows": [
+                        {"customer_state": "SP", "total_payment": 100.0},
+                        {"customer_state": "MS", "total_payment": 50.0},
+                    ]
+                },
+            },
+        ),
+    }
+
+    assert _unsupported_summary_numbers(
+        state,
+        report,
+        SimpleNamespace(row_count=2, column_count=2),
+    ) == ["50"]
+
+
+def test_analysis_workflow_falls_back_when_model_sql_is_unsafe(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATAMIND_ANALYSIS_FAST_PATH_ENABLED", "false")
+    get_settings.cache_clear()
     repository = DatasetStoreRepository(str(tmp_path))
     model_router = FakeAnalysisModelRouter(
         sql_content='DROP TABLE dataset; SELECT * FROM dataset'
@@ -752,3 +1011,17 @@ def test_sql_validator_allows_only_selects_against_dataset() -> None:
     assert not external_table["ok"]
     assert not comma_join["ok"]
     assert not schema_table["ok"]
+def test_claim_result_keeps_derived_total_for_artifact_backed_rows() -> None:
+    result = _claim_result(
+        {
+            "sql": "SELECT region, SUM(sales) AS total_sales FROM dataset GROUP BY region",
+            "rows": [
+                {"region": "North", "total_sales": 100},
+                {"region": "South", "total_sales": 180},
+            ],
+            "explanation": "grouped result",
+        }
+    )
+
+    assert result is not None
+    assert 280.0 in result["claim_values"]

@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     app_name: str = "DataMind API"
     app_version: str = "0.1.0"
+    build_sha: str = "local"
     api_prefix: str = "/api/v1"
     debug: bool = Field(default=False)
     dataset_store_path: str = "data/datasets"
@@ -29,11 +30,13 @@ class Settings(BaseSettings):
     python_runner_url: str | None = None
     python_runner_shared_secret: SecretStr | None = None
     python_runner_timeout_seconds: float = Field(default=35.0, gt=0)
+    python_runner_container_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     python_sandbox_image: str = "datamind-python-sandbox:latest"
     python_runner_temp_path: str = "/var/lib/datamind-runner"
     python_runner_volume_name: str = "datamind-runner-temp"
     otel_exporter_otlp_endpoint: str | None = None
     environment: str = "development"
+    display_timezone: str = "Asia/Singapore"
     cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
     rate_limits_enabled: bool = False
     login_rate_limit: int = Field(default=10, ge=1)
@@ -59,6 +62,7 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr | None = None
     llm_base_url: str | None = None
     llm_timeout_seconds: float = Field(default=30.0, gt=0)
+    llm_optional_timeout_seconds: float = Field(default=8.0, gt=0, le=30)
     llm_transient_retries: int = Field(default=4, ge=0, le=10)
     llm_retry_backoff_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
     llm_max_tokens: int = Field(default=2048, gt=0)
@@ -83,6 +87,8 @@ class Settings(BaseSettings):
     agent_loop_max_tool_attempts: int = Field(default=3, ge=1, le=8)
     agent_loop_timeout_seconds: float = Field(default=300.0, gt=0, le=1800)
     agent_loop_max_tokens: int = Field(default=50_000, ge=1000)
+    analysis_fast_path_enabled: bool = True
+    analysis_fast_path_max_rows: int = Field(default=1000, ge=1, le=1_000_000)
     cleaning_loop_enabled: bool = True
     cleaning_loop_max_decisions: int = Field(default=8, ge=1, le=32)
     cleaning_loop_max_tool_calls: int = Field(default=5, ge=1, le=20)
@@ -94,11 +100,27 @@ class Settings(BaseSettings):
     report_loop_max_revisions: int = Field(default=2, ge=0, le=5)
     report_loop_timeout_seconds: float = Field(default=60.0, gt=0, le=300)
     report_loop_max_tokens: int = Field(default=8_000, ge=1000)
+    dataset_upload_max_bytes: int = Field(
+        default=209_715_200, ge=1024, le=1_073_741_824
+    )
     assistant_enabled: bool = True
     assistant_llm_provider: str = "kimi"
     assistant_llm_model: str = "kimi-k2.6"
     assistant_max_tool_calls: int = Field(default=8, ge=1, le=20)
     assistant_max_context_chars: int = Field(default=60_000, ge=10_000, le=240_000)
+    assistant_fast_path_enabled: bool = True
+    # Final-answer output is sized dynamically from the question and evidence.
+    # The ask/execute values are per-call ceilings, not fixed allocations.
+    assistant_completion_min_tokens: int = Field(default=1_536, ge=256, le=8_192)
+    assistant_ask_max_tokens: int = Field(default=4_096, ge=512, le=16_384)
+    assistant_execute_max_tokens: int = Field(default=8_192, ge=512, le=32_768)
+    assistant_completion_total_max_tokens: int = Field(
+        default=24_576, ge=1_024, le=65_536
+    )
+    assistant_max_continuations: int = Field(default=5, ge=0, le=12)
+    assistant_retrieval_slow_ms: int = Field(default=3_000, ge=100, le=300_000)
+    assistant_first_token_slow_ms: int = Field(default=15_000, ge=100, le=600_000)
+    assistant_total_slow_ms: int = Field(default=60_000, ge=100, le=1_800_000)
     assistant_llm_timeout_seconds: float = Field(default=120.0, gt=0, le=300)
     assistant_timeout_seconds: float = Field(default=300.0, gt=0, le=1800)
     assistant_image_max_bytes: int = Field(default=5_242_880, ge=1024, le=20_971_520)
@@ -110,7 +132,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_profile(self) -> Settings:
-        if self.environment.lower() != "production":
+        if self.assistant_completion_total_max_tokens < self.assistant_completion_min_tokens:
+            raise ValueError(
+                "Assistant total completion budget must be at least its per-call minimum."
+            )
+        environment = self.environment.lower()
+        runner_secret = (
+            self.python_runner_shared_secret.get_secret_value().strip()
+            if self.python_runner_shared_secret
+            else ""
+        )
+        if environment == "runner":
+            if not runner_secret:
+                raise ValueError(
+                    "Python Runner requires DATAMIND_PYTHON_RUNNER_SHARED_SECRET."
+                )
+            return self
+        if environment != "production":
             return self
         if self.execution_backend.lower() != "celery":
             raise ValueError("Production requires DATAMIND_EXECUTION_BACKEND=celery.")
@@ -120,6 +158,12 @@ class Settings(BaseSettings):
             raise ValueError("Production requires DATAMIND_DATABASE_URL.")
         if not self.session_cookie_secure:
             raise ValueError("Production requires secure session cookies.")
+        if not self.python_runner_url or not self.python_runner_url.strip():
+            raise ValueError("Production requires DATAMIND_PYTHON_RUNNER_URL.")
+        if not runner_secret:
+            raise ValueError(
+                "Production requires DATAMIND_PYTHON_RUNNER_SHARED_SECRET."
+            )
         if self.semantic_embedding_enabled and not self.semantic_embedding_local_files_only:
             raise ValueError("Production semantic embedding must use local files only.")
         if self.semantic_embedding_required and not self.semantic_embedding_enabled:

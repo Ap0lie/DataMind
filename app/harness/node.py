@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,12 +14,30 @@ logger = logging.getLogger("datamind.harness.node")
 
 NodeHandler = Callable[[dict[str, Any]], Mapping[str, Any]]
 NodeEventCallback = Callable[[Any, dict[str, Any]], None]
+_NODE_DEADLINE: ContextVar[float | None] = ContextVar(
+    "datamind_node_deadline", default=None
+)
+
+
+class NodeExecutionTimeout(TimeoutError):
+    """Raised when a node crosses its cooperative wall-clock deadline."""
 
 
 @dataclass(frozen=True)
 class NodeHarnessPolicy:
     transient_retries: int = 1
     backoff_seconds: float = 0.2
+    timeout_seconds: float | None = None
+
+
+def remaining_node_timeout(default: float | None = None) -> float | None:
+    """Return the current node's remaining budget, optionally capped by a default."""
+
+    deadline = _NODE_DEADLINE.get()
+    if deadline is None:
+        return default
+    remaining = max(0.0, deadline - time.monotonic())
+    return remaining if default is None else min(default, remaining)
 
 
 class NodeExecutionHarness:
@@ -35,53 +54,73 @@ class NodeExecutionHarness:
     def wrap(self, node_name: str, handler: Callable[[Any], Any]) -> Callable[[Any], Any]:
         def run(state: Any) -> Any:
             started = time.monotonic()
+            deadline = (
+                started + self._policy.timeout_seconds
+                if self._policy.timeout_seconds is not None
+                else None
+            )
+            deadline_token = _NODE_DEADLINE.set(deadline)
             attempt = 0
-            while True:
-                attempt += 1
-                with tracer("datamind.workflow").start_as_current_span(
-                    f"workflow.node.{node_name}"
-                ) as span:
-                    span.set_attribute("datamind.node", node_name)
-                    span.set_attribute("datamind.attempt", attempt)
-                    try:
-                        output = handler(state)
-                        if not isinstance(output, Mapping):
-                            raise TypeError(
-                                f"LangGraph node '{node_name}' returned "
-                                f"{type(output).__name__}; expected a mapping."
+            try:
+                while True:
+                    attempt += 1
+                    with tracer("datamind.workflow").start_as_current_span(
+                        f"workflow.node.{node_name}"
+                    ) as span:
+                        span.set_attribute("datamind.node", node_name)
+                        span.set_attribute("datamind.attempt", attempt)
+                        try:
+                            _raise_if_expired(node_name, deadline)
+                            output = handler(state)
+                            _raise_if_expired(node_name, deadline)
+                            if not isinstance(output, Mapping):
+                                raise TypeError(
+                                    f"LangGraph node '{node_name}' returned "
+                                    f"{type(output).__name__}; expected a mapping."
+                                )
+                            self._record(node_name, "succeeded", attempt, started)
+                            self._emit(
+                                state,
+                                node_name=node_name,
+                                status="completed",
+                                attempt=attempt,
+                                started=started,
+                                output=output,
                             )
-                        self._record(node_name, "succeeded", attempt, started)
-                        self._emit(
-                            state,
-                            node_name=node_name,
-                            status="completed",
-                            attempt=attempt,
-                            started=started,
-                            output=output,
-                        )
-                        return output
-                    except Exception as exc:
-                        span.record_exception(exc)
-                        retry = attempt <= self._policy.transient_retries and _is_transient(exc)
-                        self._record(
-                            node_name,
-                            "retrying" if retry else "failed",
-                            attempt,
-                            started,
-                            error=exc,
-                        )
-                        self._emit(
-                            state,
-                            node_name=node_name,
-                            status="retrying" if retry else "failed",
-                            attempt=attempt,
-                            started=started,
-                            error=exc,
-                        )
-                        if not retry:
-                            raise
-                        if self._policy.backoff_seconds > 0:
-                            time.sleep(self._policy.backoff_seconds * attempt)
+                            return output
+                        except Exception as exc:
+                            span.record_exception(exc)
+                            expired = deadline is not None and time.monotonic() >= deadline
+                            retry = (
+                                not expired
+                                and not isinstance(exc, NodeExecutionTimeout)
+                                and attempt <= self._policy.transient_retries
+                                and _is_transient(exc)
+                            )
+                            self._record(
+                                node_name,
+                                "retrying" if retry else "failed",
+                                attempt,
+                                started,
+                                error=exc,
+                            )
+                            self._emit(
+                                state,
+                                node_name=node_name,
+                                status="retrying" if retry else "failed",
+                                attempt=attempt,
+                                started=started,
+                                error=exc,
+                            )
+                            if not retry:
+                                raise
+                            delay = self._policy.backoff_seconds * attempt
+                            if deadline is not None:
+                                delay = min(delay, max(0.0, deadline - time.monotonic()))
+                            if delay > 0:
+                                time.sleep(delay)
+            finally:
+                _NODE_DEADLINE.reset(deadline_token)
 
         return run
 
@@ -150,3 +189,8 @@ def _is_transient(exc: Exception) -> bool:
             "http 504",
         )
     )
+
+
+def _raise_if_expired(node_name: str, deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise NodeExecutionTimeout(f"LangGraph node '{node_name}' exceeded its deadline.")

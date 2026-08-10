@@ -4,7 +4,11 @@ import io
 
 import pandas as pd
 
-from app.services.tabular_import import records_from_file_bytes
+from app.services.tabular_import import (
+    record_batches_from_file_path,
+    records_from_file_bytes,
+    xlsx_sheet_previews_from_path,
+)
 
 
 def test_xlsx_import_selects_non_empty_sheet_and_detects_header_offset() -> None:
@@ -120,3 +124,55 @@ def test_txt_import_falls_back_to_line_records() -> None:
         {"line_number": 1, "text": "第一条评论"},
         {"line_number": 2, "text": "第二条评论"},
     ]
+
+
+def test_path_import_streams_csv_and_nested_json_in_bounded_batches(tmp_path) -> None:
+    csv_path = tmp_path / "large.csv"
+    csv_path.write_text(
+        "id,value\n" + "".join(f"{index},{index * 2}\n" for index in range(2505)),
+        encoding="utf-8",
+    )
+    csv_stream = record_batches_from_file_path(
+        csv_path,
+        source_type="csv",
+        batch_size=128,
+    )
+    csv_batches = list(csv_stream.batches)
+
+    json_path = tmp_path / "nested.json"
+    json_path.write_text(
+        '{"records":['
+        + ",".join(f'{{"id":{index},"value":"v{index}"}}' for index in range(205))
+        + "]}",
+        encoding="utf-8",
+    )
+    json_stream = record_batches_from_file_path(
+        json_path,
+        source_type="json",
+        batch_size=64,
+    )
+    json_batches = list(json_stream.batches)
+
+    assert sum(len(batch) for batch in csv_batches) == 2505
+    assert max(map(len, csv_batches)) == 128
+    assert csv_batches[-1][-1] == {"id": "2504", "value": "5008"}
+    assert sum(len(batch) for batch in json_batches) == 205
+    assert max(map(len, json_batches)) == 64
+    assert json_batches[0][0] == {"id": 0, "value": "v0"}
+
+
+def test_path_xlsx_preview_scans_sheets_without_loading_all_at_once(tmp_path) -> None:
+    workbook_path = tmp_path / "multi.xlsx"
+    with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
+        pd.DataFrame([["region", "sales"], ["North", 100]]).to_excel(
+            writer, sheet_name="sales", index=False, header=False
+        )
+        pd.DataFrame([["name", "score"], ["Alice", 95], ["Bob", 88]]).to_excel(
+            writer, sheet_name="scores", index=False, header=False
+        )
+
+    result = xlsx_sheet_previews_from_path(workbook_path)
+
+    assert result["ok"]
+    assert [item["sheet_name"] for item in result["sheets"]] == ["scores", "sales"]
+    assert result["sheets"][0]["selected"] is True

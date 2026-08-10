@@ -10,6 +10,7 @@ import pandas as pd
 from langgraph.graph import END, START, StateGraph
 
 from app.analysis.checkpoints import get_analysis_checkpointer
+from app.analysis.cleaning_diff import build_cleaning_diff_summary
 from app.analysis.cleaning_sandbox import run_generated_cleaning_analysis
 from app.analysis.data_cleaning import (
     _basic_clean_dataframe,
@@ -19,6 +20,7 @@ from app.analysis.data_cleaning import (
 )
 from app.analysis.model_router import AnalysisModelRouter, MCPAnalysisModelRouter
 from app.core.settings import get_settings
+from app.harness.node import NodeExecutionHarness, NodeHarnessPolicy
 from app.storage.dataset_store import DatasetStoreRepository
 
 
@@ -59,6 +61,51 @@ _STRATEGY_TOOL = {
         },
     },
 }
+
+_LOCAL_CLEANING_MARKERS = (
+    "trim",
+    "strip",
+    "whitespace",
+    "deduplicate",
+    "duplicate",
+    "missing",
+    "null",
+    "type conversion",
+    "去空格",
+    "去重",
+    "重复",
+    "缺失",
+    "空值",
+    "类型转换",
+    "数字转换",
+    "日期格式",
+    "通用清洗",
+)
+_SEMANTIC_CLEANING_MARKERS = (
+    "业务语义",
+    "语义标准化",
+    "同义词",
+    "别名",
+    "映射",
+    "归类",
+    "分类",
+    "客户等级",
+    "标签体系",
+    "semantic",
+    "taxonomy",
+    "category mapping",
+)
+
+
+def local_auto_cleaning_decision(requirement: str) -> tuple[str, str] | None:
+    normalized = " ".join(requirement.casefold().split())
+    if any(marker in normalized for marker in _SEMANTIC_CLEANING_MARKERS):
+        return None
+    if not normalized or any(marker in normalized for marker in _LOCAL_CLEANING_MARKERS):
+        return "rules", "local_rule_classifier"
+    if normalized in {"清洗数据", "自动清洗", "分析前清洗", "clean data"}:
+        return "rules", "local_rule_classifier"
+    return None
 
 
 class CleaningWorkflowRunner:
@@ -137,6 +184,26 @@ class CleaningWorkflowRunner:
                 reason = "requested_strategy" if strategy != "fallback" else "strategy_attempts_exhausted"
                 notify("cleaning_decide", 10, f"Selected cleaning strategy: {strategy}.", state=state, event_type="cleaning_decision", strategy=strategy, payload={"reason": reason})
                 return {"decision_count": decisions, "pending_strategy": strategy}
+            local_decision = (
+                local_auto_cleaning_decision(state.get("requirement") or "")
+                if not attempts and not state.get("failures")
+                else None
+            )
+            if local_decision is not None:
+                strategy, reason = local_decision
+                notify(
+                    "cleaning_decide",
+                    10,
+                    "Local rules selected for a deterministic cleaning task.",
+                    state=state,
+                    event_type="cleaning_decision",
+                    strategy=strategy,
+                    payload={"reason": reason, "decision_source": "local_classifier"},
+                )
+                return {
+                    "decision_count": decisions,
+                    "pending_strategy": strategy,
+                }
             strategy, reason, tokens = self._model_decision(state)
             if int(attempts.get(strategy) or 0) >= settings.cleaning_loop_max_strategy_attempts:
                 strategy, reason = "fallback", "selected_strategy_attempts_exhausted"
@@ -224,16 +291,49 @@ class CleaningWorkflowRunner:
                 result_markdown=str(metadata.get("markdown") or f"## 自主清洗完成\n\n- 最终策略：{strategy}\n"),
                 cleaned_dataset={"status": "completed", "source": strategy, "rows": len(records), "columns": len(records[0]) if records else 0, "warnings": [item.get("error") for item in state.get("failures") or []], "records": records},
                 raw_summary=_profile_records(raw), previous_summary=_profile_records(previous), current_summary=_profile_records(records),
-                diff_summary=_diff_summary(raw, previous, records), activate=True, job_id=UUID(state["job_id"]),
+                diff_summary=build_cleaning_diff_summary(
+                    raw_records=raw,
+                    previous_records=previous,
+                    current_records=records,
+                ),
+                activate=True,
+                job_id=UUID(state["job_id"]),
             )
             self.repository.save_cleaned_records(dataset_id=UUID(state["dataset_id"]), records=records, metadata={"job_id": state["job_id"], "strategy": strategy, "cleaning_run_id": str(run_id)})
             result = {"cleaning_run_id": str(run_id), "selected_strategy": strategy, "terminal_reason": state.get("terminal_reason") or "validated", "quality": state.get("quality") or {}, "preview_records": records[:50], "row_count": len(records), "column_count": len(records[0]) if records else 0, "failures": state.get("failures") or []}
             notify("cleaning_commit", 100, "Validated cleaning version committed and activated.", state=state, event_type="cleaning_commit", strategy=strategy, payload={"cleaning_run_id": str(run_id)})
             return {"result": result}
 
+        def harness_event(state: CleaningWorkflowState, payload: dict[str, Any]) -> None:
+            if emit is None:
+                return
+            emit(
+                {
+                    "stage": payload["node"],
+                    "status": payload["status"],
+                    "message": payload["message"],
+                    "event_type": "node_execution",
+                    "iteration": int(state.get("iteration") or 0),
+                    "strategy": state.get("selected_strategy")
+                    or state.get("pending_strategy"),
+                    "payload": {
+                        "attempt": payload["attempt"],
+                        "duration_ms": payload["duration_ms"],
+                        "error_code": payload.get("error_code"),
+                    },
+                }
+            )
+
+        harness = NodeExecutionHarness(
+            NodeHarnessPolicy(
+                transient_retries=0,
+                timeout_seconds=settings.cleaning_loop_timeout_seconds,
+            ),
+            event_callback=harness_event,
+        )
         graph = StateGraph(CleaningWorkflowState)
         for name, node in (("bootstrap", bootstrap), ("decide", decide), ("execute", execute), ("verify", verify), ("repair", repair), ("fallback", fallback), ("commit", commit)):
-            graph.add_node(name, node)
+            graph.add_node(name, harness.wrap(f"cleaning.{name}", node))
         graph.add_edge(START, "bootstrap")
         graph.add_edge("bootstrap", "decide")
         graph.add_conditional_edges("decide", lambda s: "fallback" if s.get("pending_strategy") == "fallback" else "execute", {"fallback": "fallback", "execute": "execute"})
@@ -277,7 +377,7 @@ class CleaningWorkflowRunner:
         failures = (state.get("failures") or [])[-2:]
         response = self.model_router.complete(
             messages=[
-                {"role": "system", "content": "你是 DataMind 受限清洗程序生成器。只返回一个 Python 代码块，定义 clean_dataset(df)，不得 import、读写文件、联网或删除未明确要求的业务行列。运行环境提供 pd。不得要求或假设原始样例值。"},
+                {"role": "system", "content": "你是 DataMind 受限清洗程序生成器。只返回一个 Python 代码块，定义 clean_dataset(df)，不得 import、读写文件、联网或删除未明确要求的业务行列。运行环境提供 pd。不得要求或假设原始样例值。除非用户明确要求日期粒度，否则必须保留时间戳的时分秒、子秒和时区；纯日期才可规范为日期。"},
                 {"role": "user", "content": json.dumps({"requirement": state.get("requirement") or "执行保守清洗", "aggregate_profile": profile, "previous_failures": failures}, ensure_ascii=False)},
             ], temperature=0.0, max_tokens=1800,
             metadata={"agent": "cleaning_execute", "job_id": state["job_id"], "strategy": strategy},
@@ -298,12 +398,3 @@ def _profile_records(records: list[dict[str, Any]]) -> dict[str, Any]:
 def _quality_report(raw: list[dict[str, Any]], cleaned: list[dict[str, Any]]) -> dict[str, Any]:
     before, after = _profile_records(raw), _profile_records(cleaned)
     return {"passed": True, "before": before, "after": after, "row_retention": round(after["row_count"] / max(before["row_count"], 1), 4), "missing_delta": after["missing_count"] - before["missing_count"], "duplicate_delta": after["duplicate_count"] - before["duplicate_count"]}
-
-
-def _diff_summary(raw: list[dict[str, Any]], previous: list[dict[str, Any]], current: list[dict[str, Any]]) -> dict[str, Any]:
-    base = previous or raw
-    before_columns = {str(k) for row in base for k in row}
-    after_columns = {str(k) for row in current for k in row}
-    changed_rows = sum(1 for left, right in zip(base, current, strict=False) if left != right)
-    changed_cells = sum(sum(1 for key in set(left) | set(right) if left.get(key) != right.get(key)) for left, right in zip(base, current, strict=False))
-    return {"raw_row_count": len(raw), "previous_row_count": len(base), "current_row_count": len(current), "added_rows": max(len(current) - len(base), 0), "removed_rows": max(len(base) - len(current), 0), "changed_rows": changed_rows, "added_columns": sorted(after_columns - before_columns), "removed_columns": sorted(before_columns - after_columns), "changed_cells": changed_cells, "raw_missing_count": _profile_records(raw)["missing_count"], "previous_missing_count": _profile_records(base)["missing_count"], "current_missing_count": _profile_records(current)["missing_count"], "sample_diffs": []}

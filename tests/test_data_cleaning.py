@@ -5,6 +5,7 @@ from app.analysis.data_cleaning import (
     DataCleaningService,
     GeneratedCleaningSafetyError,
     _cleaning_messages,
+    _validate_cleaning_quality,
     run_generated_cleaning_script,
 )
 from app.mcp.tool_schemas import ModelRouterResponse
@@ -125,6 +126,139 @@ def test_data_cleaning_rejects_destructive_repairs_and_falls_back() -> None:
     assert any("excessive row loss" in warning for warning in result.warnings)
 
 
+def test_basic_cleaning_preserves_timestamp_precision() -> None:
+    records = [
+        {
+            "order_id": f"order-{second}",
+            "order_purchase_timestamp": f"2017-03-29 13:05:{second:02d}.123456",
+            "order_date": "2017/03/29",
+            "estimated_timestamp": "2017-03-30",
+        }
+        for second in range(12)
+    ]
+    result = DataCleaningService().clean(
+        dataset_id="11111111-1111-1111-1111-111111111111",
+        records=records,
+        requirement="conservative cleaning",
+        use_llm=False,
+    )
+
+    assert result.records[0]["order_purchase_timestamp"] == "2017-03-29T13:05:00.123456"
+    assert result.records[0]["order_date"] == "2017-03-29"
+    assert result.records[0]["estimated_timestamp"] == "2017-03-30"
+    assert len({row["order_purchase_timestamp"] for row in result.records}) == 12
+
+
+def test_cleaning_quality_gate_rejects_mass_timestamp_precision_loss() -> None:
+    fallback = pd.DataFrame(
+        {
+            "order_purchase_timestamp": [
+                f"2017-10-{day:02d}T10:56:{day:02d}"
+                for day in range(1, 13)
+            ],
+            "order_id": [f"order-{day}" for day in range(1, 13)],
+        }
+    )
+    cleaned = fallback.copy()
+    cleaned["order_purchase_timestamp"] = pd.to_datetime(
+        cleaned["order_purchase_timestamp"]
+    ).dt.strftime("%Y-%m-%d")
+
+    with pytest.raises(GeneratedCleaningSafetyError, match="temporal precision loss"):
+        _validate_cleaning_quality(
+            fallback_df=fallback,
+            cleaned_df=cleaned,
+            requirement="conservative cleaning",
+        )
+
+
+def test_cleaning_quality_gate_rejects_timezone_awareness_and_offset_loss() -> None:
+    fallback = pd.DataFrame(
+        {
+            "event_timestamp": [
+                f"2017-10-{day:02d}T00:00:00+03:00" for day in range(1, 7)
+            ]
+        }
+    )
+    timezone_removed = pd.DataFrame(
+        {
+            "event_timestamp": [
+                f"2017-10-{day:02d}T00:00:00" for day in range(1, 7)
+            ]
+        }
+    )
+    offset_changed = pd.DataFrame(
+        {
+            "event_timestamp": [
+                f"2017-10-{day:02d}T00:00:00+00:00" for day in range(1, 7)
+            ]
+        }
+    )
+
+    with pytest.raises(GeneratedCleaningSafetyError, match="timezone-aware values"):
+        _validate_cleaning_quality(
+            fallback_df=fallback,
+            cleaned_df=timezone_removed,
+            requirement="conservative cleaning",
+        )
+    with pytest.raises(GeneratedCleaningSafetyError, match="UTC offsets"):
+        _validate_cleaning_quality(
+            fallback_df=fallback,
+            cleaned_df=offset_changed,
+            requirement="conservative cleaning",
+        )
+
+
+def test_date_sorting_does_not_authorize_timestamp_truncation() -> None:
+    fallback = pd.DataFrame(
+        {
+            "event_timestamp": [
+                f"2017-10-{day:02d}T10:56:{day:02d}" for day in range(1, 7)
+            ]
+        }
+    )
+    cleaned = pd.DataFrame(
+        {
+            "event_timestamp": [
+                f"2017-10-{day:02d}" for day in range(1, 7)
+            ]
+        }
+    )
+
+    with pytest.raises(GeneratedCleaningSafetyError, match="temporal precision loss"):
+        _validate_cleaning_quality(
+            fallback_df=fallback,
+            cleaned_df=cleaned,
+            requirement="按日期排序并保留时分秒，不要去掉时间",
+        )
+    _validate_cleaning_quality(
+        fallback_df=fallback,
+        cleaned_df=cleaned,
+        requirement="仅保留日期，去掉时间部分",
+    )
+
+
+def test_basic_cleaning_detects_timestamp_after_first_two_hundred_rows() -> None:
+    records = [
+        {
+            "event_id": f"event-{index}",
+            "event_timestamp": (
+                "2017-10-01" if index < 220 else "2017-10-01 10:56:42.123456"
+            ),
+        }
+        for index in range(240)
+    ]
+
+    result = DataCleaningService().clean(
+        dataset_id="11111111-1111-1111-1111-111111111111",
+        records=records,
+        requirement="conservative cleaning",
+        use_llm=False,
+    )
+
+    assert result.records[220]["event_timestamp"] == "2017-10-01T10:56:42.123456"
+
+
 def test_cleaning_prompt_bounds_samples_and_marks_data_untrusted() -> None:
     frame = pd.DataFrame(
         [
@@ -144,6 +278,7 @@ def test_cleaning_prompt_bounds_samples_and_marks_data_untrusted() -> None:
     )
 
     assert "untrusted data" in messages[0]["content"]
+    assert "保留时间戳的时分秒、子秒和时区精度" in messages[0]["content"]
     assert "columns_truncated" in messages[1]["content"]
     assert "<redacted:" in messages[1]["content"]
     assert "[truncated]" in messages[1]["content"]
@@ -248,6 +383,9 @@ def test_report_summaries_skip_full_content(tmp_path) -> None:
         markdown="# Score report\n" + ("full report body " * 200),
         metadata={
             "question": "Which segment has the highest score?",
+            "route": "hybrid",
+            "sql_source": "agent_loop",
+            "python_source": "agent_loop",
             "html_report": "<html>" + ("full report html " * 200) + "</html>",
         },
     )
@@ -260,4 +398,7 @@ def test_report_summaries_skip_full_content(tmp_path) -> None:
     assert summary["markdown"] == ""
     assert summary["metadata"] == {
         "question": "Which segment has the highest score?",
+        "route": "hybrid",
+        "sql_source": "agent_loop",
+        "python_source": "agent_loop",
     }

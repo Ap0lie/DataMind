@@ -9,6 +9,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from app.analysis.dataset_scope import resolve_analysis_dataset_scope
 from app.analysis.jobs import revoke_analysis_job, start_analysis_job
 from app.analysis.multidataset import suggest_dataset_joins
 from app.analysis.runtime import build_analysis_runner
@@ -97,14 +98,23 @@ def create_analysis_job(
             limit=settings.job_rate_limit,
             window_seconds=60,
         )
-        job = repository.create_analysis_job(
+        requested_join_plan = request.join_plan or request.relationship_plan
+        dataset_scope = resolve_analysis_dataset_scope(
+            repository,
+            question=request.question,
             dataset_id=request.dataset_id,
-            dataset_group_id=request.dataset_group_id,
             additional_dataset_ids=request.additional_dataset_ids,
-            join_plan=tuple(item.model_dump(mode="json") for item in request.join_plan),
-            relationship_plan=tuple(
-                item.model_dump(mode="json") for item in request.relationship_plan
-            ),
+            join_plan=requested_join_plan,
+        )
+        scoped_plan = tuple(
+            item.model_dump(mode="json") for item in dataset_scope.join_plan
+        )
+        job = repository.create_analysis_job(
+            dataset_id=dataset_scope.dataset_id,
+            dataset_group_id=request.dataset_group_id,
+            additional_dataset_ids=dataset_scope.additional_dataset_ids,
+            join_plan=scoped_plan if request.join_plan else (),
+            relationship_plan=scoped_plan if request.relationship_plan else (),
             question=request.question,
             prompt_overrides=request.prompt_overrides.as_dict(),
             multimodal_inputs=tuple(
@@ -357,6 +367,16 @@ def _planner_decision_response(decision: dict[str, object]) -> PlannerDecisionRe
         else None,
         semantic_source=str(decision.get("semantic_source") or "legacy"),
         semantic_plan=plan,
+        relationship_graph=(
+            plan.get("relationship_graph")
+            if isinstance(plan.get("relationship_graph"), dict)
+            else {}
+        ),
+        grain_plan=(
+            plan.get("grain_plan")
+            if isinstance(plan.get("grain_plan"), dict)
+            else {}
+        ),
         confidence_breakdown=scores,
         raw_confidence=float(decision["raw_confidence"]),
         calibrated_confidence=float(decision["calibrated_confidence"]),

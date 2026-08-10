@@ -38,6 +38,7 @@ def _trace_diagnostics(results: list[dict[str, Any]]) -> dict[str, Any]:
             terminal_reason = ""
             judge_calls: Any = None
             result: dict[str, Any] = {}
+            run_status = ""
             run_failed_for_provider = False
             try:
                 with trace_path.open("r", encoding="utf-8") as handle:
@@ -48,6 +49,7 @@ def _trace_diagnostics(results: list[dict[str, Any]]) -> dict[str, Any]:
                             runs = audit.get("runs") or []
                             if runs and isinstance(runs[-1], dict):
                                 run = runs[-1]
+                                run_status = str(run.get("status") or "").lower()
                                 result = run.get("result") or {}
                                 terminal_reason = str(
                                     result.get("loop_terminal_reason") or ""
@@ -96,7 +98,7 @@ def _trace_diagnostics(results: list[dict[str, Any]]) -> dict[str, Any]:
                 workflow_fallback_trials.append(label)
             if judge_calls:
                 observed_judge = True
-            else:
+            elif run_status in {"completed", "failed"}:
                 missing_judge_candidates.append(label)
     return {
         "total_trials": total_trials,

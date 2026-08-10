@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import sqlite3
 from dataclasses import replace
@@ -10,7 +11,11 @@ from threading import Lock
 from typing import Any, ClassVar
 from uuid import UUID, uuid4
 
-from app.storage.auth_repository import AuthRepositoryMixin, normalize_user_id
+from app.storage.auth_repository import (
+    AuthRepositoryMixin,
+    normalize_login_name,
+    normalize_user_id,
+)
 from app.storage.models import (
     StoredAnalysisJob,
     StoredCleaningJob,
@@ -31,6 +36,12 @@ from app.storage.row_mappers import (
 )
 from app.storage.row_mappers import (
     column_metadata_from_row as _column_metadata_from_row,
+)
+from app.storage.row_mappers import (
+    data_drift_event_from_row as _data_drift_event_from_row,
+)
+from app.storage.row_mappers import (
+    data_snapshot_from_row as _data_snapshot_from_row,
 )
 from app.storage.row_mappers import (
     json_loads as _json_loads,
@@ -56,6 +67,8 @@ from app.storage.row_mappers import (
 from app.storage.row_mappers import (
     stored_dataset_group_from_row as _stored_dataset_group_from_row,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DatasetStoreRepository(AuthRepositoryMixin):
@@ -489,12 +502,55 @@ class DatasetStoreRepository(AuthRepositoryMixin):
                 shutil.rmtree(dataset_dir)
 
     def append_raw_records(self, *, dataset_id: UUID, records: list[dict[str, Any]]) -> int:
-        self._require_dataset_dir(dataset_id)
         if not records:
             return 0
 
-        self._replace_records(dataset_id=dataset_id, source="raw", records=records)
-        return len(records)
+        return self.replace_raw_record_batches(dataset_id=dataset_id, batches=iter((records,)))
+
+    def replace_raw_record_batches(
+        self,
+        *,
+        dataset_id: UUID,
+        batches: Any,
+        preview: list[dict[str, Any]] | None = None,
+        preview_limit: int = 50,
+    ) -> int:
+        """Replace raw records transactionally while retaining one bounded batch."""
+        self._require_dataset_dir(dataset_id)
+        inserted = 0
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM records WHERE dataset_id = ? AND source = ?",
+                (str(dataset_id), "raw"),
+            )
+            for batch in batches:
+                if not batch:
+                    continue
+                rows = []
+                for record in batch:
+                    if not isinstance(record, dict):
+                        raise ValueError("Imported records must be JSON objects.")
+                    inserted += 1
+                    rows.append(
+                        (
+                            str(dataset_id),
+                            "raw",
+                            inserted,
+                            json.dumps(record, ensure_ascii=False, default=str),
+                        )
+                    )
+                    if preview is not None and len(preview) < preview_limit:
+                        preview.append(record)
+                connection.executemany(
+                    """
+                    INSERT INTO records (dataset_id, source, row_number, record)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+        if inserted:
+            self._monitor_dataset_drift(dataset_id)
+        return inserted
 
     def save_cleaned_records(
         self,
@@ -515,6 +571,7 @@ class DatasetStoreRepository(AuthRepositoryMixin):
             },
         )
         self._update_dataset(dataset_id, status="cleaned")
+        self._monitor_dataset_drift(dataset_id)
         return len(records)
 
     def read_raw_records(self, dataset_id: UUID) -> list[dict[str, Any]]:
@@ -594,6 +651,50 @@ class DatasetStoreRepository(AuthRepositoryMixin):
         """Return the active record count without materialising the records in Python."""
         cleaned_count = self._count_records(dataset_id, source="cleaned")
         return cleaned_count or self._count_records(dataset_id, source="raw")
+
+    def analysis_column_cardinality(
+        self,
+        dataset_id: UUID,
+        *,
+        column_name: str,
+    ) -> tuple[int, int]:
+        """Return non-empty value and distinct counts for an active scalar column."""
+        self.get_dataset(dataset_id)
+        if not column_name:
+            return 0, 0
+        source = (
+            "cleaned"
+            if self._count_records(dataset_id, source="cleaned")
+            else "raw"
+        )
+        with self._connect() as connection:
+            dialect = getattr(connection, "dialect_name", "sqlite")
+            if dialect == "postgresql":
+                expression = "jsonb_extract_path_text(CAST(record AS jsonb), ?)"
+                path_parameter = column_name
+            else:
+                expression = "CAST(json_extract(record, ?) AS TEXT)"
+                path_parameter = f"$.{json.dumps(column_name, ensure_ascii=False)}"
+            row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS value_count,
+                       COUNT(DISTINCT lower(trim({expression}))) AS distinct_count
+                FROM records
+                WHERE dataset_id = ? AND source = ?
+                  AND {expression} IS NOT NULL
+                  AND trim({expression}) <> ''
+                """,
+                (
+                    path_parameter,
+                    str(dataset_id),
+                    source,
+                    path_parameter,
+                    path_parameter,
+                ),
+            ).fetchone()
+        if row is None:
+            return 0, 0
+        return int(row["value_count"] or 0), int(row["distinct_count"] or 0)
 
     def _read_records_file(
         self,
@@ -842,7 +943,20 @@ class DatasetStoreRepository(AuthRepositoryMixin):
                 (str(run_id), str(dataset_id), self._user_id),
             )
         self._update_dataset(dataset_id, status="cleaned")
+        self._monitor_dataset_drift(dataset_id)
         return self.get_cleaning_run(dataset_id, run_id)
+
+    def _monitor_dataset_drift(self, dataset_id: UUID) -> None:
+        try:
+            from app.data_reliability import DataDriftService
+
+            DataDriftService(self).scan_dataset(dataset_id)
+        except Exception:
+            logger.warning(
+                "Dataset drift monitoring failed for %s.",
+                dataset_id,
+                exc_info=True,
+            )
 
     def list_column_metadata(self, dataset_id: UUID) -> tuple[dict[str, Any], ...]:
         self.get_dataset(dataset_id)
@@ -962,6 +1076,250 @@ class DatasetStoreRepository(AuthRepositoryMixin):
         return {item["column_name"]: item for item in self.list_column_metadata(dataset_id)}[
             column_name
         ]
+
+    def save_data_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        snapshot_id = UUID(str(payload.get("id") or uuid4()))
+        created_at = str(payload.get("created_at") or _now_iso())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO data_snapshots (
+                    id, user_id, dataset_id, source, row_count, sample_size,
+                    fingerprint, profile, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(snapshot_id),
+                    self._user_id,
+                    str(payload["dataset_id"]),
+                    str(payload.get("source") or "raw"),
+                    int(payload.get("row_count") or 0),
+                    int(payload.get("sample_size") or 0),
+                    str(payload["fingerprint"]),
+                    json.dumps(payload.get("profile") or {}, ensure_ascii=False),
+                    created_at,
+                ),
+            )
+        return self.get_data_snapshot(snapshot_id)
+
+    def get_data_snapshot(self, snapshot_id: UUID) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM data_snapshots WHERE id=? AND user_id=?",
+                (str(snapshot_id), self._user_id),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError(f"Data snapshot was not found: {snapshot_id}")
+        return _data_snapshot_from_row(row)
+
+    def latest_data_snapshot(
+        self,
+        dataset_id: UUID,
+        *,
+        source: str | None = None,
+    ) -> dict[str, Any] | None:
+        self.get_dataset(dataset_id)
+        source_filter = " AND source=?" if source is not None else ""
+        parameters: tuple[object, ...] = (str(dataset_id), self._user_id)
+        if source is not None:
+            parameters += (source,)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT * FROM data_snapshots
+                WHERE dataset_id=? AND user_id=?{source_filter}
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+        return _data_snapshot_from_row(row) if row is not None else None
+
+    def save_data_drift_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        event_id = UUID(str(payload.get("id") or uuid4()))
+        created_at = str(payload.get("created_at") or _now_iso())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO data_drift_events (
+                    id, user_id, dataset_id, baseline_snapshot_id,
+                    current_snapshot_id, status, changes, affected_assets,
+                    recommended_actions, created_at, acknowledged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(event_id),
+                    self._user_id,
+                    str(payload["dataset_id"]),
+                    str(payload["baseline_snapshot_id"]),
+                    str(payload["current_snapshot_id"]),
+                    str(payload.get("status") or "stable"),
+                    json.dumps(payload.get("changes") or [], ensure_ascii=False),
+                    json.dumps(payload.get("affected_assets") or [], ensure_ascii=False),
+                    json.dumps(payload.get("recommended_actions") or [], ensure_ascii=False),
+                    created_at,
+                    _optional_text(payload.get("acknowledged_at")),
+                ),
+            )
+        return self.get_data_drift_event(event_id)
+
+    def get_data_drift_event(self, event_id: UUID) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM data_drift_events WHERE id=? AND user_id=?",
+                (str(event_id), self._user_id),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError(f"Data drift event was not found: {event_id}")
+        return _data_drift_event_from_row(row)
+
+    def latest_data_drift_event(self, dataset_id: UUID) -> dict[str, Any] | None:
+        self.get_dataset(dataset_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM data_drift_events
+                WHERE dataset_id=? AND user_id=?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (str(dataset_id), self._user_id),
+            ).fetchone()
+        return _data_drift_event_from_row(row) if row is not None else None
+
+    def list_data_drift_events(
+        self,
+        *,
+        dataset_id: UUID,
+        limit: int = 50,
+    ) -> tuple[dict[str, Any], ...]:
+        self.get_dataset(dataset_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM data_drift_events
+                WHERE dataset_id=? AND user_id=?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (str(dataset_id), self._user_id, max(1, min(limit, 200))),
+            ).fetchall()
+        return tuple(_data_drift_event_from_row(row) for row in rows)
+
+    def replace_dataset_group_relationship_states(
+        self,
+        *,
+        group_id: UUID,
+        relationships: tuple[dict[str, Any], ...],
+    ) -> None:
+        self.get_dataset_group(group_id)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE dataset_groups
+                SET relationships=?, updated_at=?
+                WHERE id=? AND user_id=?
+                """,
+                (
+                    json.dumps(relationships, ensure_ascii=False, default=str),
+                    _now_iso(),
+                    str(group_id),
+                    self._user_id,
+                ),
+            )
+
+    def mark_semantic_models_stale(
+        self,
+        *,
+        dataset_id: UUID,
+        group_ids: tuple[UUID, ...],
+        drift_event_id: UUID,
+        reason: str,
+    ) -> tuple[UUID, ...]:
+        scopes = {("dataset", str(dataset_id))}
+        scopes.update(("dataset_group", str(group_id)) for group_id in group_ids)
+        changed: list[UUID] = []
+        now = _now_iso()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM semantic_models
+                WHERE user_id=? AND status='published' AND deleted_at IS NULL
+                """,
+                (self._user_id,),
+            ).fetchall()
+            for row in rows:
+                if (str(row["scope_type"]), str(row["scope_id"])) not in scopes:
+                    continue
+                validation = _json_loads(row["validation"], {})
+                validation["drift_event_id"] = str(drift_event_id)
+                validation["stale_reason"] = reason
+                connection.execute(
+                    """
+                    UPDATE semantic_models
+                    SET status='stale', validation=?, updated_at=?
+                    WHERE id=? AND user_id=?
+                    """,
+                    (
+                        json.dumps(validation, ensure_ascii=False),
+                        now,
+                        str(row["id"]),
+                        self._user_id,
+                    ),
+                )
+                changed.append(UUID(str(row["id"])))
+        return tuple(changed)
+
+    def mark_reports_stale(
+        self,
+        *,
+        dataset_id: UUID,
+        group_ids: tuple[UUID, ...],
+        drift_event_id: UUID,
+        reason: str,
+    ) -> tuple[UUID, ...]:
+        group_text = {str(group_id) for group_id in group_ids}
+        changed: list[UUID] = []
+        now = _now_iso()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM reports
+                WHERE user_id=? AND deleted_at IS NULL
+                """,
+                (self._user_id,),
+            ).fetchall()
+            for row in rows:
+                metadata = _json_loads(row["metadata"], {})
+                additional_ids = {
+                    str(item) for item in metadata.get("additional_dataset_ids") or ()
+                }
+                report_group_id = str(metadata.get("dataset_group_id") or "")
+                if (
+                    str(row["dataset_id"]) != str(dataset_id)
+                    and str(dataset_id) not in additional_ids
+                    and report_group_id not in group_text
+                ):
+                    continue
+                metadata.update(
+                    {
+                        "freshness_status": "stale",
+                        "stale_reason": reason,
+                        "drift_event_id": str(drift_event_id),
+                        "stale_at": now,
+                    }
+                )
+                connection.execute(
+                    """
+                    UPDATE reports SET metadata=?, updated_at=?
+                    WHERE id=? AND user_id=?
+                    """,
+                    (
+                        json.dumps(metadata, ensure_ascii=False, default=str),
+                        now,
+                        str(row["id"]),
+                        self._user_id,
+                    ),
+                )
+                changed.append(UUID(str(row["id"])))
+        return tuple(changed)
 
     def save_semantic_model(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = _now_iso()
@@ -1307,50 +1665,69 @@ class DatasetStoreRepository(AuthRepositoryMixin):
         limit: int | None = None,
         include_content: bool = True,
     ) -> tuple[dict[str, Any], ...]:
-        needs_content = include_content or bool(query)
+        needs_content = include_content
         columns = (
             "*"
             if needs_content
             else (
                 "id, dataset_id, user_id, created_at, updated_at, version, title, "
-                "'' AS markdown, '{}' AS metadata, question"
+                "'' AS markdown, metadata, question"
             )
         )
-        sql_limit = " LIMIT ?" if limit is not None and not query else ""
-        with self._connect() as connection:
-            if dataset_id is None:
-                parameters: tuple[object, ...] = (self._user_id,)
-                if sql_limit:
-                    parameters += (max(limit or 0, 0),)
-                rows = connection.execute(
-                    f"SELECT {columns} FROM reports "
-                    f"WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC{sql_limit}",
-                    parameters,
-                ).fetchall()
-            else:
-                self.get_dataset(dataset_id)
-                parameters = (str(dataset_id), self._user_id)
-                if sql_limit:
-                    parameters += (max(limit or 0, 0),)
-                rows = connection.execute(
-                    f"SELECT {columns} FROM reports "
-                    f"WHERE dataset_id = ? AND user_id = ? AND deleted_at IS NULL "
-                    f"ORDER BY created_at DESC{sql_limit}",
-                    parameters,
-                ).fetchall()
-        reports = [_report_from_row(row) for row in rows]
-        if query:
-            needle = query.lower().strip()
-            reports = [
-                report
-                for report in reports
-                if needle in str(report.get("title", "")).lower()
-                or needle in str(report.get("markdown", "")).lower()
-                or needle in json.dumps(report.get("metadata", {}), ensure_ascii=False).lower()
-            ]
+        filters = ["user_id = ?", "deleted_at IS NULL"]
+        parameters: list[object] = [self._user_id]
+        if dataset_id is not None:
+            self.get_dataset(dataset_id)
+            filters.insert(0, "dataset_id = ?")
+            parameters.insert(0, str(dataset_id))
+        needle = str(query or "").strip().lower()
+        if needle:
+            pattern = f"%{needle}%"
+            filters.append(
+                """
+                (
+                    LOWER(COALESCE(title, '')) LIKE ?
+                    OR LOWER(COALESCE(question, '')) LIKE ?
+                    OR LOWER(COALESCE(markdown, '')) LIKE ?
+                    OR LOWER(COALESCE(CAST(metadata AS TEXT), '')) LIKE ?
+                )
+                """
+            )
+            parameters.extend((pattern, pattern, pattern, pattern))
+        sql_limit = " LIMIT ?" if limit is not None else ""
         if limit is not None:
-            reports = reports[: max(limit, 0)]
-        return tuple(reports)
+            parameters.append(max(limit, 0))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM reports "
+                f"WHERE {' AND '.join(filters)} ORDER BY created_at DESC{sql_limit}",
+                tuple(parameters),
+            ).fetchall()
+        reports = tuple(_report_from_row(row) for row in rows)
+        if include_content:
+            return reports
+        summary_keys = {
+            "question",
+            "route",
+            "workflow",
+            "nodes",
+            "planner_source",
+            "sql_source",
+            "python_source",
+            "report_source",
+            "validation_issue_count",
+        }
+        return tuple(
+            {
+                **report,
+                "metadata": {
+                    key: value
+                    for key, value in report["metadata"].items()
+                    if key in summary_keys
+                },
+            }
+            for report in reports
+        )
 
     def get_report(self, report_id: UUID) -> dict[str, Any]:
         with self._connect() as connection:
@@ -2574,6 +2951,7 @@ class DatasetStoreRepository(AuthRepositoryMixin):
                 """
                 CREATE TABLE IF NOT EXISTS users (
                     user_id TEXT PRIMARY KEY,
+                    login_name_normalized TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL,
                     password_hash TEXT NOT NULL,
                     salt TEXT NOT NULL,
@@ -2810,6 +3188,32 @@ class DatasetStoreRepository(AuthRepositoryMixin):
                     PRIMARY KEY (user_id, model_revision, text_hash)
                 );
 
+                CREATE TABLE IF NOT EXISTS data_snapshots (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    dataset_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    sample_size INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    profile TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS data_drift_events (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    dataset_id TEXT NOT NULL,
+                    baseline_snapshot_id TEXT NOT NULL,
+                    current_snapshot_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    changes TEXT NOT NULL DEFAULT '[]',
+                    affected_assets TEXT NOT NULL DEFAULT '[]',
+                    recommended_actions TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    acknowledged_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS planner_decisions (
                     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, dataset_id TEXT NOT NULL,
                     dataset_group_id TEXT, question TEXT NOT NULL, semantic_model_id TEXT,
@@ -2844,10 +3248,48 @@ class DatasetStoreRepository(AuthRepositoryMixin):
                 CREATE INDEX IF NOT EXISTS idx_dataset_groups_user_id ON dataset_groups(user_id);
                 CREATE INDEX IF NOT EXISTS idx_user_sessions_token_hash ON user_sessions(token_hash);
                 CREATE INDEX IF NOT EXISTS idx_semantic_models_scope ON semantic_models(user_id, scope_type, scope_id);
+                CREATE INDEX IF NOT EXISTS idx_data_snapshots_dataset ON data_snapshots(user_id, dataset_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_data_drift_events_dataset ON data_drift_events(user_id, dataset_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_planner_decisions_user ON planner_decisions(user_id, created_at);
                 """
             )
             _ensure_column(connection, "datasets", "user_id", "TEXT NOT NULL DEFAULT 'default'")
+            _ensure_column(connection, "users", "login_name_normalized", "TEXT")
+            existing_login_names = {
+                str(row["login_name_normalized"])
+                for row in connection.execute(
+                    """
+                    SELECT login_name_normalized
+                    FROM users
+                    WHERE login_name_normalized IS NOT NULL
+                    """
+                ).fetchall()
+                if row["login_name_normalized"]
+            }
+            for row in connection.execute(
+                """
+                SELECT user_id,display_name
+                FROM users
+                WHERE login_name_normalized IS NULL OR login_name_normalized=''
+                """
+            ).fetchall():
+                candidate = normalize_login_name(str(row["display_name"]))
+                if not candidate:
+                    candidate = str(row["user_id"])
+                if candidate in existing_login_names:
+                    candidate = f"{candidate}#{row['user_id']}"
+                connection.execute(
+                    "UPDATE users SET login_name_normalized=? WHERE user_id=?",
+                    (candidate, str(row["user_id"])),
+                )
+                existing_login_names.add(candidate)
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_users_login_name_normalized
+                ON users(login_name_normalized)
+                """
+            )
             for table in ("datasets", "dataset_groups", "reports", "semantic_models"):
                 _ensure_column(connection, table, "deleted_at", "TEXT")
                 _ensure_column(connection, table, "purge_after", "TEXT")

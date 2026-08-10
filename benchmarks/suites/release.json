@@ -95,6 +95,62 @@
       "timeout_seconds": 45
     },
     {
+      "case_id": "schema-drift-critical",
+      "name": "Critical schema and missing-rate drift is detected",
+      "subsystem": "data_reliability",
+      "operation": "data.drift",
+      "input": {
+        "previous": {
+          "row_count": 100,
+          "columns": [
+            {"name": "amount", "dtype": "number", "missing_rate": 0.0, "unique_rate": 0.8, "mean": 10, "std": 2, "value_signature": ["a", "b"]},
+            {"name": "region", "dtype": "text", "missing_rate": 0.0, "unique_rate": 0.1, "value_signature": ["c"]}
+          ]
+        },
+        "current": {
+          "row_count": 150,
+          "columns": [
+            {"name": "sales_amount", "dtype": "number", "missing_rate": 0.0, "unique_rate": 0.8, "mean": 10, "std": 2, "value_signature": ["a", "b"]},
+            {"name": "region", "dtype": "text", "missing_rate": 0.4, "unique_rate": 0.1, "value_signature": ["c"]}
+          ]
+        }
+      },
+      "expected": {"change_types": ["column_renamed", "missing_rate_drift", "row_count_drift"]},
+      "validators": [
+        {"type": "exact", "path": "detected", "expected": true}
+      ]
+    },
+    {
+      "case_id": "relationship-grain-expansion-blocked",
+      "name": "One-to-many metric expansion is blocked",
+      "subsystem": "relationships",
+      "operation": "relationship.grain",
+      "input": {
+        "metric_ids": ["revenue"],
+        "dimension_ids": ["item_type"],
+        "definition": {
+          "entities": [
+            {"id": "orders", "entity_type": "fact", "grain": "one row per order"},
+            {"id": "items", "entity_type": "dimension", "grain": "one row per item"}
+          ],
+          "relationships": [
+            {"id": "orders_items", "left_entity_id": "orders", "right_entity_id": "items", "cardinality": "one_to_many", "enabled": true}
+          ],
+          "metrics": [
+            {"id": "revenue", "formula": {"op": "sum", "args": [{"op": "field", "entity_id": "orders", "field_id": "amount"}]}}
+          ],
+          "dimensions": [
+            {"id": "item_type", "entity_id": "items", "field_id": "item_type"}
+          ]
+        }
+      },
+      "expected": {"safe": false},
+      "validators": [
+        {"type": "exact", "path": "safe", "expected": false},
+        {"type": "exact", "path": "strategies", "expected": ["pre_aggregate_before_join"]}
+      ]
+    },
+    {
       "case_id": "report-evidence-complete",
       "name": "Every numeric finding has valid evidence",
       "subsystem": "report",
@@ -113,6 +169,95 @@
         {"type": "exact", "path": "coverage", "expected": 1.0},
         {"type": "exact", "path": "numeric_accuracy", "expected": 1.0},
         {"type": "exact", "path": "invalid_evidence_ids", "expected": []}
+      ]
+    },
+    {
+      "case_id": "statistical-comparison-supported",
+      "name": "Comparison claims include deterministic statistical support",
+      "subsystem": "analysis",
+      "operation": "analysis.statistical_verification",
+      "input": {
+        "question": "比较 A 与 B 的销售额",
+        "records": [
+          {"segment": "A", "amount": 12},
+          {"segment": "A", "amount": 14},
+          {"segment": "A", "amount": 16},
+          {"segment": "B", "amount": 8},
+          {"segment": "B", "amount": 9},
+          {"segment": "B", "amount": 10}
+        ],
+        "contract": {
+          "analysis_type": "comparison",
+          "metric": "amount",
+          "dimensions": ["segment"],
+          "grain": ["segment"],
+          "method": "分组比较",
+          "causal_claim_allowed": false
+        },
+        "findings": [
+          {
+            "title": "A 组销售额更高",
+            "content": "A 组平均销售额 14，高于 B 组的 9。",
+            "data_source": "tool_evidence",
+            "evidence": "evidence_id:ev_1"
+          }
+        ],
+        "evidence": [
+          {
+            "evidence_id": "ev_1",
+            "status": "succeeded",
+            "result": {
+              "metric": "amount",
+              "aggregation": "avg",
+              "grain": ["segment"],
+              "filters": [],
+              "rows": [
+                {"segment": "A", "avg_amount": 14},
+                {"segment": "B", "avg_amount": 9}
+              ]
+            }
+          }
+        ]
+      },
+      "expected": {"status": "passed"},
+      "validators": [
+        {"type": "exact", "path": "status", "expected": "passed"},
+        {"type": "exact", "path": "numeric_evidence_coverage", "expected": 1.0}
+      ]
+    },
+    {
+      "case_id": "statistical-join-grain-rejected",
+      "name": "Expanded Join without native-grain evidence is rejected",
+      "subsystem": "analysis",
+      "operation": "analysis.statistical_verification",
+      "input": {
+        "question": "计算多表总销售额",
+        "records": [
+          {"order_id": "O1", "amount": 10},
+          {"order_id": "O1", "amount": 10},
+          {"order_id": "O2", "amount": 20}
+        ],
+        "contract": {
+          "analysis_type": "descriptive",
+          "metric": "amount",
+          "dimensions": [],
+          "grain": ["order_id"],
+          "method": "跨表汇总",
+          "causal_claim_allowed": false
+        },
+        "findings": [],
+        "evidence": [],
+        "join_summary": {
+          "mode": "joined",
+          "row_expansion_ratio": 1.5,
+          "skipped_join_count": 0
+        }
+      },
+      "expected": {"status": "failed"},
+      "validators": [
+        {"type": "exact", "path": "status", "expected": "failed"},
+        {"type": "exact", "path": "requires_replan", "expected": true},
+        {"type": "exact", "path": "check_statuses.join_grain", "expected": "failed"}
       ]
     },
     {
@@ -137,8 +282,11 @@
     {"metric": "security_pass_rate", "direction": "exact", "value": 1.0, "hard_gate": true},
     {"metric": "semantic_top1", "direction": "minimum", "value": 0.9, "hard_gate": true},
     {"metric": "relationship_precision", "direction": "minimum", "value": 0.95, "hard_gate": true},
+    {"metric": "drift_detection_accuracy", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "relationship_grain_accuracy", "direction": "exact", "value": 1.0, "hard_gate": true},
     {"metric": "report_evidence_coverage", "direction": "exact", "value": 1.0, "hard_gate": true},
     {"metric": "report_numeric_accuracy", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "statistical_contract_accuracy", "direction": "exact", "value": 1.0, "hard_gate": true},
     {"metric": "legal_tool_rate", "direction": "minimum", "value": 0.95, "hard_gate": true},
     {"metric": "repair_success_rate", "direction": "minimum", "value": 0.9, "hard_gate": true},
     {"metric": "loop_mean_tool_calls", "direction": "maximum", "value": 4.0, "hard_gate": true},

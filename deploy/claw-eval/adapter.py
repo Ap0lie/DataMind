@@ -22,7 +22,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 SCENARIO_RE = re.compile(r"\[DATAMIND_SCENARIO=(DM\d{3})\]", re.IGNORECASE)
-PROJECT_ROOT = Path(os.environ.get("DATAMIND_EVAL_PROJECT_ROOT", "D:/datamind")).resolve()
+PROJECT_ROOT = Path(
+    os.environ.get(
+        "DATAMIND_EVAL_PROJECT_ROOT",
+        str(Path(__file__).resolve().parents[2]),
+    )
+).resolve()
 SOURCE_DIR = Path(
     os.environ.get("DATAMIND_EVAL_SOURCE_DIR", str(Path.home() / "Downloads"))
 ).resolve()
@@ -34,7 +39,11 @@ MANIFEST_PATH = FIXTURE_DIR / "scenarios.json"
 STORE_DIR = RUNTIME_DIR / "store"
 ADAPTER_PORT = int(os.environ.get("PORT", "9320"))
 DATAMIND_PORT = int(os.environ.get("DATAMIND_EVAL_API_PORT", "9310"))
-DATAMIND_URL = f"http://127.0.0.1:{DATAMIND_PORT}/api/v1"
+EXTERNAL_DATAMIND_URL = os.environ.get("DATAMIND_EVAL_API_URL", "").strip()
+DATAMIND_URL = EXTERNAL_DATAMIND_URL.rstrip("/") or (
+    f"http://127.0.0.1:{DATAMIND_PORT}/api/v1"
+)
+EXTERNAL_AUTH_MODE = os.environ.get("DATAMIND_EVAL_AUTH_MODE", "session").lower()
 ANALYSIS_TIMEOUT_SECONDS = float(os.environ.get("DATAMIND_EVAL_TIMEOUT_SECONDS", "900"))
 
 _state_lock = threading.RLock()
@@ -51,6 +60,19 @@ def _resolve_datamind_python() -> Path:
         if path.exists():
             return path
         raise RuntimeError(f"DATAMIND_EVAL_PYTHON does not exist: {path}")
+
+    if PROJECT_ROOT.exists():
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", "import app, pandas, uvicorn"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                timeout=20,
+            )
+            if completed.returncode == 0:
+                return Path(sys.executable)
+        except Exception:
+            pass
 
     conda = shutil.which("conda")
     if conda:
@@ -71,22 +93,9 @@ def _resolve_datamind_python() -> Path:
                         return python
         except Exception:
             pass
-
-    if PROJECT_ROOT.exists():
-        try:
-            completed = subprocess.run(
-                [sys.executable, "-c", "import app, pandas, uvicorn"],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                timeout=20,
-            )
-            if completed.returncode == 0:
-                return Path(sys.executable)
-        except Exception:
-            pass
     raise RuntimeError(
         "Cannot locate the DataMind Python environment. Set DATAMIND_EVAL_PYTHON "
-        "to the python executable for the datamind-py312 environment."
+        "to a Python executable with the DataMind runtime dependencies installed."
     )
 
 
@@ -204,6 +213,18 @@ def _stop_datamind() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _datamind_process
+    if EXTERNAL_DATAMIND_URL:
+        if not MANIFEST_PATH.exists() or os.environ.get("DATAMIND_EVAL_REBUILD_FIXTURES") == "1":
+            await asyncio.to_thread(_ensure_fixtures, Path(sys.executable))
+        response = await asyncio.to_thread(
+            httpx.get,
+            f"{DATAMIND_URL}/health/ready",
+            timeout=10,
+            trust_env=False,
+        )
+        response.raise_for_status()
+        yield
+        return
     python = await asyncio.to_thread(_resolve_datamind_python)
     await asyncio.to_thread(_ensure_fixtures, python)
     _datamind_process = await asyncio.to_thread(_start_datamind, python)
@@ -241,6 +262,27 @@ def _extract_scenario(payload: dict[str, Any]) -> tuple[str, str]:
 
 def _manifest() -> dict[str, Any]:
     return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
+def _authenticate(client: httpx.Client, user: str) -> None:
+    if not EXTERNAL_DATAMIND_URL or EXTERNAL_AUTH_MODE == "legacy":
+        return
+    response = client.post(
+        f"{DATAMIND_URL}/auth/login",
+        json={"username": user, "password": uuid.uuid4().hex},
+    )
+    response.raise_for_status()
+    body = response.json()
+    session = response.cookies.get("datamind_session")
+    csrf = body.get("csrf_token") if isinstance(body, dict) else None
+    if not session or not csrf:
+        raise RuntimeError("DataMind session login did not return session and CSRF tokens.")
+    client.headers.update(
+        {
+            "Cookie": f"datamind_session={session}",
+            "X-CSRF-Token": str(csrf),
+        }
+    )
 
 
 def _request(
@@ -417,6 +459,7 @@ def _run_scenario(scenario_id: str, question: str) -> dict[str, Any]:
             _audit["runs"].append(run_record)
         try:
             with httpx.Client(timeout=180, trust_env=False) as client:
+                _authenticate(client, user)
                 dataset_ids = _import_files(
                     client, scenario, manifest["generated"], user=user
                 )
@@ -598,7 +641,9 @@ async def _stream_completion(scenario_id: str, question: str) -> AsyncIterator[s
 @app.get("/health")
 @app.post("/health")
 def health() -> dict[str, Any]:
-    process_ready = _datamind_process is not None and _datamind_process.poll() is None
+    process_ready = bool(EXTERNAL_DATAMIND_URL) or (
+        _datamind_process is not None and _datamind_process.poll() is None
+    )
     return {
         "status": "ok" if process_ready and MANIFEST_PATH.exists() else "starting",
         "datamind": process_ready,

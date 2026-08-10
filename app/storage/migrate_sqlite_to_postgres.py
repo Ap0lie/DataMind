@@ -22,6 +22,8 @@ TABLES = (
     "analysis_job_events",
     "semantic_models",
     "semantic_embedding_cache",
+    "data_snapshots",
+    "data_drift_events",
     "planner_decisions",
     "planner_feedback",
     "planner_calibrators",

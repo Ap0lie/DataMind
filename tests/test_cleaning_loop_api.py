@@ -36,6 +36,9 @@ async def test_async_cleaning_job_api_returns_traceable_result(tmp_path, monkeyp
         )
         assert queued.status_code == 200, queued.text
         job_id = queued.json()["job_id"]
+        listed = await client.get("/api/v1/store/cleaning-jobs?limit=10")
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["jobs"][0]["job_id"] == job_id
         job = queued.json()
         for _ in range(100):
             response = await client.get(

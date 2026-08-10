@@ -174,6 +174,8 @@ def _cleaning_messages(
                 "clean_dataset(df: pd.DataFrame) -> pd.DataFrame。不要 import。不要读取或写入文件。"
                 "不要使用网络、系统调用、open、eval、exec、compile、query。运行环境已经提供 pd。"
                 "函数必须复制输入 df，返回完整清洗后的 DataFrame。"
+                "除非用户明确要求日期粒度，否则必须保留时间戳的时分秒、子秒和时区精度；"
+                "只有原始值本身为纯日期时才规范为日期。"
                 f" {UNTRUSTED_INPUT_NOTICE} "
                 "只执行用户明确要求或由画像直接证明的清洗，不得凭样本猜测业务规则，不得虚构值。"
                 "除非用户明确要求，不得删除业务列、过滤业务行或填充未知值。"
@@ -248,6 +250,166 @@ def _validate_cleaning_quality(
         )
     if int(cleaned_df.shape[1]) > baseline_columns + 10:
         raise GeneratedCleaningSafetyError("Cleaning quality gate rejected excessive new columns.")
+    _validate_temporal_precision(
+        fallback_df=fallback_df,
+        cleaned_df=cleaned_df,
+        requirement=requirement,
+    )
+
+
+def _validate_temporal_precision(
+    *,
+    fallback_df: pd.DataFrame,
+    cleaned_df: pd.DataFrame,
+    requirement: str,
+) -> None:
+    if _allows_temporal_precision_loss(requirement):
+        return
+    for column in fallback_df.columns:
+        if column not in cleaned_df.columns or not _looks_temporal_column(str(column)):
+            continue
+        baseline = pd.to_datetime(fallback_df[column], errors="coerce", format="mixed")
+        current = pd.to_datetime(cleaned_df[column], errors="coerce", format="mixed")
+        baseline_values = baseline.dropna()
+        current_values = current.dropna()
+        if len(baseline_values) < 5 or len(current_values) < 2:
+            continue
+        baseline_timed_rate = _explicit_time_component_rate(fallback_df[column])
+        current_timed_rate = _explicit_time_component_rate(cleaned_df[column])
+        baseline_timezone_rate, baseline_offsets = _timezone_profile(baseline_values)
+        current_timezone_rate, current_offsets = _timezone_profile(current_values)
+        same_temporal_count = len(baseline_values) == len(current_values)
+        baseline_unique = int(baseline_values.nunique())
+        current_unique = int(current_values.nunique())
+        comparable_unique = min(baseline_unique, len(current_values))
+        time_components_collapsed = (
+            baseline_timed_rate > 0
+            and (
+                (same_temporal_count and current_timed_rate < baseline_timed_rate)
+                or (
+                    baseline_timed_rate >= 0.5
+                    and current_timed_rate < baseline_timed_rate * 0.25
+                )
+            )
+        )
+        timestamp_cardinality_collapsed = (
+            baseline_unique >= 10
+            and comparable_unique >= 5
+            and current_unique / comparable_unique < 0.5
+        )
+        timezone_awareness_collapsed = (
+            baseline_timezone_rate > 0
+            and (
+                (same_temporal_count and current_timezone_rate < baseline_timezone_rate)
+                or (
+                    baseline_timezone_rate >= 0.5
+                    and current_timezone_rate < baseline_timezone_rate * 0.5
+                )
+            )
+        )
+        timezone_offsets_changed = (
+            baseline_timezone_rate >= 0.5
+            and current_timezone_rate >= 0.5
+            and same_temporal_count
+            and baseline_offsets != current_offsets
+        )
+        if (
+            time_components_collapsed
+            or timestamp_cardinality_collapsed
+            or timezone_awareness_collapsed
+            or timezone_offsets_changed
+        ):
+            raise GeneratedCleaningSafetyError(
+                "Cleaning quality gate rejected temporal precision loss "
+                f"in column {column}: timed values {baseline_timed_rate:.0%} -> "
+                f"{current_timed_rate:.0%}, unique timestamps "
+                f"{baseline_unique} -> {current_unique}, timezone-aware values "
+                f"{baseline_timezone_rate:.0%} -> {current_timezone_rate:.0%}, "
+                f"UTC offsets {sorted(baseline_offsets)} -> {sorted(current_offsets)}."
+            )
+
+
+def _allows_temporal_precision_loss(requirement: str) -> bool:
+    lowered = requirement.lower()
+    if any(
+        token in lowered
+        for token in (
+            "保留时间",
+            "保留时分秒",
+            "保留时区",
+            "不要去掉时间",
+            "不得去掉时间",
+            "不删除时间",
+            "preserve time",
+            "keep time",
+            "retain time",
+            "preserve timezone",
+            "keep timezone",
+        )
+    ):
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "仅保留日期",
+            "只保留日期",
+            "转为纯日期",
+            "转换为日期",
+            "日期粒度",
+            "去掉时间",
+            "移除时间",
+            "删除时间",
+            "截断到日期",
+            "date only",
+            "truncate to date",
+            "day granularity",
+            "drop time",
+            "remove time",
+        )
+    )
+
+
+def _time_component_rate(values: pd.Series) -> float:
+    timed = sum(
+        bool(
+            value.hour
+            or value.minute
+            or value.second
+            or value.microsecond
+            or getattr(value, "nanosecond", 0)
+        )
+        for value in values
+    )
+    return timed / max(len(values), 1)
+
+
+def _explicit_time_component_rate(values: pd.Series) -> float:
+    present = values.dropna()
+    if present.empty:
+        return 0.0
+    timed = present.astype("string").str.contains(
+        r"(?:^|[T\s])\d{1,2}:\d{2}(?::\d{2})?",
+        regex=True,
+        na=False,
+    )
+    return float(timed.sum()) / len(present)
+
+
+def _timezone_profile(values: pd.Series) -> tuple[float, set[int]]:
+    if values.empty:
+        return 0.0, set()
+    aware_count = 0
+    offsets: set[int] = set()
+    for value in values:
+        try:
+            offset = value.utcoffset()
+        except (AttributeError, TypeError, ValueError):
+            offset = None
+        if offset is None:
+            continue
+        aware_count += 1
+        offsets.add(round(offset.total_seconds()))
+    return aware_count / len(values), offsets
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
@@ -287,10 +449,19 @@ def _basic_clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                 continue
             lowered_name = str(column).lower()
             if any(token in lowered_name for token in ("date", "日期", "time", "时间")):
-                parsed = pd.to_datetime(cleaned[column], errors="coerce")
+                parsed = pd.to_datetime(cleaned[column], errors="coerce", format="mixed")
                 parsed_count = int(parsed.notna().sum())
                 if non_null_count and parsed_count / non_null_count >= 0.75:
-                    cleaned[column] = parsed.dt.strftime("%Y-%m-%d")
+                    if _should_preserve_time(cleaned[column], parsed):
+                        cleaned[column] = parsed.map(
+                            lambda value: value.isoformat() if pd.notna(value) else pd.NA
+                        )
+                    else:
+                        cleaned[column] = parsed.map(
+                            lambda value: value.strftime("%Y-%m-%d")
+                            if pd.notna(value)
+                            else pd.NA
+                        )
     cleaned = cleaned.drop_duplicates().reset_index(drop=True)
     return cleaned.where(pd.notna(cleaned), None)
 
@@ -303,6 +474,20 @@ def _dedupe_columns(values: list[str]) -> list[str]:
         counts[base] = counts.get(base, 0) + 1
         columns.append(base if counts[base] == 1 else f"{base}_{counts[base]}")
     return columns
+
+
+def _looks_temporal_column(column: str) -> bool:
+    lowered = column.lower()
+    return any(token in lowered for token in ("date", "日期", "time", "时间"))
+
+
+def _should_preserve_time(
+    original: pd.Series,
+    parsed: pd.Series,
+) -> bool:
+    if _explicit_time_component_rate(original) > 0:
+        return True
+    return _time_component_rate(parsed.dropna()) > 0
 
 
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:

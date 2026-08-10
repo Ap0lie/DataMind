@@ -20,6 +20,11 @@ AssistantCapability = Literal[
 AssistantAssetType = Literal["dataset", "dataset_group", "report", "semantic_model"]
 
 
+class AssistantCitationReliabilityResponse(ApiModel):
+    status: Literal["verified", "warning", "rejected", "unverified"] = "unverified"
+    summary: str = "未提供统计审查状态。"
+
+
 class AssistantCitationResponse(ApiModel):
     source_type: Literal["dataset", "analysis_job", "report"]
     source_id: UUID
@@ -27,6 +32,9 @@ class AssistantCitationResponse(ApiModel):
     excerpt: str = ""
     dataset_id: UUID | None = None
     artifact_role: Literal["evidence", "deliverable"] = "evidence"
+    reliability: AssistantCitationReliabilityResponse = Field(
+        default_factory=AssistantCitationReliabilityResponse
+    )
 
 
 class AssistantConversationCreateRequest(ApiModel):
@@ -48,6 +56,7 @@ class AssistantConversationResponse(ApiModel):
     scope_id: UUID | None = None
     summary: str = ""
     active_run_id: UUID | None = None
+    active_run_status: str | None = None
     created_at: str
     updated_at: str
     last_message_at: str | None = None

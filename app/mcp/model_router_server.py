@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
+from collections.abc import AsyncIterator, Callable
 from typing import Any, Protocol
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+import httpx
 
 from app.core.enums import McpCapability
 from app.core.settings import Settings
@@ -96,9 +96,6 @@ class DeepSeekModelRouterBackend:
         self._settings = settings
 
     async def complete(self, request: ModelRouterRequest) -> ModelRouterResponse:
-        return await asyncio.to_thread(self._complete_sync, request)
-
-    def _complete_sync(self, request: ModelRouterRequest) -> ModelRouterResponse:
         api_key = _secret_value(self._settings.deepseek_api_key) or _secret_value(
             self._settings.llm_api_key
         )
@@ -124,25 +121,23 @@ class DeepSeekModelRouterBackend:
             payload["tools"] = request.tools
             payload["tool_choice"] = request.tool_choice or "auto"
 
-        http_request = Request(
-            f"{base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
         try:
-            with urlopen(
-                http_request,
-                timeout=_provider_timeout_seconds(self._settings, request),
-            ) as response:
-                response_data = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            message = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"DeepSeek API error {exc.code}: {message}") from exc
-        except URLError as exc:
+            response_data = await _post_json(
+                f"{base_url}/chat/completions",
+                payload=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout_seconds=_provider_timeout_seconds(self._settings, request),
+            )
+        except _ProviderHTTPError as exc:
+            raise RuntimeError(
+                f"DeepSeek API error {exc.status_code}: {exc.body}"
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise TimeoutError("DeepSeek API request timed out.") from exc
+        except httpx.RequestError as exc:
             raise RuntimeError(f"DeepSeek API connection failed: {exc}") from exc
 
         return _model_router_response("deepseek", model, response_data)
@@ -153,9 +148,6 @@ class KimiModelRouterBackend:
         self._settings = settings
 
     async def complete(self, request: ModelRouterRequest) -> ModelRouterResponse:
-        return await asyncio.to_thread(self._complete_sync, request)
-
-    def _complete_sync(self, request: ModelRouterRequest) -> ModelRouterResponse:
         api_key = _secret_value(self._settings.kimi_api_key) or _secret_value(
             self._settings.llm_api_key
         )
@@ -181,23 +173,58 @@ class KimiModelRouterBackend:
             payload["tools"] = request.tools
             payload["tool_choice"] = request.tool_choice or "auto"
 
-        http_request = Request(
+        response_data = await _kimi_request_with_transient_retry(
             f"{base_url}/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            payload=payload,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            method="POST",
-        )
-        response_data = _kimi_request_with_transient_retry(
-            http_request,
             timeout_seconds=_provider_timeout_seconds(self._settings, request),
-            max_retries=self._settings.llm_transient_retries,
+            max_retries=_provider_retry_count(self._settings, request),
             backoff_seconds=self._settings.llm_retry_backoff_seconds,
         )
 
         return _model_router_response("kimi", model, response_data)
+
+    async def stream_complete(
+        self,
+        request: ModelRouterRequest,
+        on_delta: Callable[[str], None],
+    ) -> ModelRouterResponse:
+        api_key = _secret_value(self._settings.kimi_api_key) or _secret_value(
+            self._settings.llm_api_key
+        )
+        if not api_key:
+            raise RuntimeError("Kimi API key is not configured.")
+
+        model = request.model or self._settings.kimi_model or "moonshot-v1-32k"
+        base_url = (self._settings.kimi_base_url or "https://api.moonshot.cn/v1").rstrip("/")
+        temperature = 1.0 if model.strip().lower() == "kimi-k2.6" else request.temperature
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": _kimi_provider_messages(request.messages),
+            "temperature": temperature,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if request.max_tokens is not None:
+            payload["max_tokens"] = request.max_tokens
+
+        return await _stream_kimi_response(
+            f"{base_url}/chat/completions",
+            payload=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+            fallback_model=model,
+            timeout_seconds=_provider_timeout_seconds(self._settings, request),
+            max_retries=_provider_retry_count(self._settings, request),
+            backoff_seconds=self._settings.llm_retry_backoff_seconds,
+            on_delta=on_delta,
+        )
 
 
 def _model_router_response(
@@ -229,9 +256,60 @@ _TRANSIENT_PROVIDER_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504}
 _MAX_PROVIDER_BACKOFF_SECONDS = 30.0
 
 
-def _kimi_request_with_transient_retry(
-    http_request: Request,
+class _ProviderHTTPError(RuntimeError):
+    def __init__(self, status_code: int, body: str) -> None:
+        super().__init__(f"Provider API error {status_code}: {body}")
+        self.status_code = status_code
+        self.body = body
+
+
+async def _post_json(
+    url: str,
     *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    if timeout_seconds <= 0:
+        raise TimeoutError("Provider API request deadline has expired.")
+    timeout = httpx.Timeout(timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url, json=payload, headers=headers)
+    if response.status_code >= 400:
+        raise _ProviderHTTPError(response.status_code, response.text)
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Provider API returned invalid JSON.") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Provider API returned an invalid response envelope.")
+    return data
+
+
+async def _stream_json_events(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> AsyncIterator[str]:
+    if timeout_seconds <= 0:
+        raise TimeoutError("Provider API request deadline has expired.")
+    timeout = httpx.Timeout(timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, json=payload, headers=headers) as response:
+            if response.status_code >= 400:
+                body = (await response.aread()).decode("utf-8", errors="replace")
+                raise _ProviderHTTPError(response.status_code, body)
+            async for line in response.aiter_lines():
+                yield line
+
+
+async def _kimi_request_with_transient_retry(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
     timeout_seconds: float,
     max_retries: int,
     backoff_seconds: float,
@@ -243,37 +321,188 @@ def _kimi_request_with_transient_retry(
     prevents a paid request from being repeated when retrying cannot help.
     """
 
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
     attempt = 0
     while True:
         attempt += 1
         try:
-            with urlopen(http_request, timeout=timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            message = exc.read().decode("utf-8", errors="replace")
-            if exc.code not in _TRANSIENT_PROVIDER_STATUS_CODES or attempt > max_retries:
+            return await _post_json(
+                url,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=_remaining_provider_timeout(deadline, "Kimi"),
+            )
+        except _ProviderHTTPError as exc:
+            if (
+                exc.status_code not in _TRANSIENT_PROVIDER_STATUS_CODES
+                or attempt > max_retries
+            ):
                 suffix = f" after {attempt} attempts" if attempt > 1 else ""
                 raise RuntimeError(
-                    f"Kimi API error {exc.code}{suffix}: {message}"
+                    f"Kimi API error {exc.status_code}{suffix}: {exc.body}"
                 ) from exc
-        except (URLError, TimeoutError) as exc:
+        except httpx.TimeoutException as exc:
+            if attempt > max_retries:
+                raise TimeoutError(
+                    f"Kimi API request timed out after {attempt} attempts."
+                ) from exc
+        except httpx.RequestError as exc:
             if attempt > max_retries:
                 suffix = f" after {attempt} attempts" if attempt > 1 else ""
                 raise RuntimeError(f"Kimi API connection failed{suffix}: {exc}") from exc
 
-        if backoff_seconds > 0:
-            time.sleep(
-                min(
-                    backoff_seconds * (2 ** (attempt - 1)),
-                    _MAX_PROVIDER_BACKOFF_SECONDS,
-                )
+        await _sleep_before_retry(
+            min(
+                backoff_seconds * (2 ** (attempt - 1)),
+                _MAX_PROVIDER_BACKOFF_SECONDS,
             )
+            if backoff_seconds > 0
+            else 0.0,
+            deadline=deadline,
+            provider="Kimi",
+        )
+
+
+async def _stream_kimi_response(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    fallback_model: str,
+    timeout_seconds: float,
+    max_retries: int,
+    backoff_seconds: float,
+    on_delta: Callable[[str], None],
+) -> ModelRouterResponse:
+    """Consume Kimi's provider SSE and retry only before the first visible token."""
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    attempt = 0
+    while True:
+        attempt += 1
+        emitted = False
+        content_parts: list[str] = []
+        usage: dict[str, int] = {}
+        model = fallback_model
+        finish_reason: str | None = None
+        try:
+            async for line in _stream_json_events(
+                url,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=_remaining_provider_timeout(deadline, "Kimi"),
+            ):
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                event = json.loads(data)
+                model = str(event.get("model") or model)
+                raw_usage = event.get("usage") or {}
+                if isinstance(raw_usage, dict):
+                    usage = {
+                        "prompt_tokens": int(raw_usage.get("prompt_tokens") or 0),
+                        "completion_tokens": int(raw_usage.get("completion_tokens") or 0),
+                        "total_tokens": int(raw_usage.get("total_tokens") or 0),
+                    }
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0] if isinstance(choices[0], dict) else {}
+                finish_reason = str(choice.get("finish_reason") or "") or finish_reason
+                delta = choice.get("delta") or {}
+                content = delta.get("content") if isinstance(delta, dict) else None
+                if content:
+                    text = str(content)
+                    emitted = True
+                    content_parts.append(text)
+                    on_delta(text)
+            return ModelRouterResponse(
+                provider="kimi",
+                model=model,
+                content="".join(content_parts),
+                finish_reason=finish_reason,
+                token_usage=usage,
+            )
+        except _ProviderHTTPError as exc:
+            retry = (
+                not emitted
+                and exc.status_code in _TRANSIENT_PROVIDER_STATUS_CODES
+                and attempt <= max_retries
+            )
+            if not retry:
+                suffix = f" after {attempt} attempts" if attempt > 1 else ""
+                raise RuntimeError(
+                    f"Kimi API error {exc.status_code}{suffix}: {exc.body}"
+                ) from exc
+        except httpx.TimeoutException as exc:
+            retry = not emitted and attempt <= max_retries
+            if not retry:
+                raise TimeoutError(
+                    f"Kimi API request timed out after {attempt} attempts."
+                ) from exc
+        except httpx.RequestError as exc:
+            retry = not emitted and attempt <= max_retries
+            if not retry:
+                suffix = f" after {attempt} attempts" if attempt > 1 else ""
+                raise RuntimeError(f"Kimi API connection failed{suffix}: {exc}") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"Kimi API returned an invalid SSE event: {exc}") from exc
+
+        await _sleep_before_retry(
+            min(
+                backoff_seconds * (2 ** (attempt - 1)),
+                _MAX_PROVIDER_BACKOFF_SECONDS,
+            )
+            if backoff_seconds > 0
+            else 0.0,
+            deadline=deadline,
+            provider="Kimi",
+        )
+
+
+def _remaining_provider_timeout(deadline: float, provider: str) -> float:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise TimeoutError(f"{provider} API request deadline has expired.")
+    return remaining
+
+
+async def _sleep_before_retry(
+    delay_seconds: float,
+    *,
+    deadline: float,
+    provider: str,
+) -> None:
+    remaining = _remaining_provider_timeout(deadline, provider)
+    if delay_seconds >= remaining:
+        await asyncio.sleep(remaining)
+        raise TimeoutError(f"{provider} API request deadline has expired.")
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
 
 
 def _provider_timeout_seconds(settings: Settings, request: ModelRouterRequest) -> float:
-    if str(request.metadata.get("agent") or "").strip().lower() == "assistant":
-        return min(settings.assistant_llm_timeout_seconds, settings.assistant_timeout_seconds)
-    return settings.llm_timeout_seconds
+    configured: float
+    agent = str(request.metadata.get("agent") or "").strip().lower()
+    if agent == "assistant" or agent.startswith("assistant_"):
+        configured = min(
+            settings.assistant_llm_timeout_seconds,
+            settings.assistant_timeout_seconds,
+        )
+    elif request.metadata.get("optional_stage") is True:
+        configured = min(settings.llm_timeout_seconds, settings.llm_optional_timeout_seconds)
+    else:
+        configured = settings.llm_timeout_seconds
+    requested = request.metadata.get("timeout_seconds")
+    if isinstance(requested, (int, float)) and not isinstance(requested, bool) and requested > 0:
+        configured = min(configured, float(requested))
+    return configured
+
+
+def _provider_retry_count(settings: Settings, request: ModelRouterRequest) -> int:
+    return 0 if request.metadata.get("optional_stage") is True else settings.llm_transient_retries
 
 
 class ConfiguredModelRouterBackend:
@@ -290,7 +519,7 @@ class ConfiguredModelRouterBackend:
         if provider == "kimi":
             try:
                 return await self._kimi.complete(request)
-            except RuntimeError:
+            except (RuntimeError, TimeoutError):
                 allow_fallback = request.metadata.get("allow_provider_fallback")
                 if allow_fallback is None:
                     allow_fallback = self._settings.llm_allow_provider_fallback
@@ -305,6 +534,35 @@ class ConfiguredModelRouterBackend:
         if provider == "mock":
             return await self._mock.complete(request)
         raise RuntimeError(f"Unsupported LLM provider: {provider}")
+
+    async def stream_complete(
+        self,
+        request: ModelRouterRequest,
+        on_delta: Callable[[str], None],
+    ) -> ModelRouterResponse:
+        provider = _provider_for_request(request, self._settings)
+        if provider == "kimi":
+            try:
+                return await self._kimi.stream_complete(request, on_delta)
+            except (RuntimeError, TimeoutError):
+                allow_fallback = request.metadata.get("allow_provider_fallback")
+                if allow_fallback is None:
+                    allow_fallback = self._settings.llm_allow_provider_fallback
+                if allow_fallback is False:
+                    raise
+                fallback_request = request.model_copy(
+                    update={"provider": "deepseek", "model": None}
+                )
+                response = await self._deepseek.complete(fallback_request)
+        elif provider == "deepseek":
+            response = await self._deepseek.complete(request)
+        elif provider == "mock":
+            response = await self._mock.complete(request)
+        else:
+            raise RuntimeError(f"Unsupported LLM provider: {provider}")
+        if response.content:
+            on_delta(response.content)
+        return response
 
 
 def _provider_for_request(request: ModelRouterRequest, settings: Settings) -> str:
@@ -321,13 +579,13 @@ def _provider_for_request(request: ModelRouterRequest, settings: Settings) -> st
             provider = settings.sql_llm_provider
         case "python" | "python_agent" | "round_python":
             provider = settings.python_llm_provider
-        case "reflect" | "reflection":
+        case "reflect" | "reflection" | "integrate" | "chart_refine":
             provider = settings.reflection_llm_provider
         case "review":
             provider = settings.review_llm_provider
         case "multimodal" | "vision":
             provider = settings.multimodal_llm_provider
-        case "report" | "integrate" | "chart_refine":
+        case "report" | "report_decide" | "report_execute" | "report_repair":
             provider = settings.report_llm_provider
         case _:
             provider = settings.default_llm_provider

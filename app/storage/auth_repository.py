@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -20,42 +21,54 @@ class AuthRepositoryMixin:
     """User and server-side session persistence for the dataset-store facade."""
 
     def login_or_create_user(self, *, username: str, password: str) -> dict[str, Any]:
-        user_id = normalize_user_id(username)
-        if not user_id:
+        display_name = username.strip()
+        login_name = normalize_login_name(username)
+        if not login_name:
             raise RuntimeError("Username is required.")
         if not password:
             raise RuntimeError("Password is required.")
         now = _now_iso()
         with self._connect() as connection:  # type: ignore[attr-defined]
             row = connection.execute(
-                "SELECT * FROM users WHERE user_id = ?",
-                (user_id,),
+                "SELECT * FROM users WHERE login_name_normalized = ?",
+                (login_name,),
             ).fetchone()
             if row is None:
+                user_id = str(uuid4())
                 password_hash, salt = _new_password_hash(password)
                 cursor = connection.execute(
                     """
                     INSERT INTO users (
-                        user_id, display_name, password_hash, salt, created_at, last_login_at
+                        user_id, login_name_normalized, display_name,
+                        password_hash, salt, created_at, last_login_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (user_id) DO NOTHING
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (login_name_normalized) DO NOTHING
                     """,
-                    (user_id, username.strip(), password_hash, salt, now, now),
+                    (
+                        user_id,
+                        login_name,
+                        display_name,
+                        password_hash,
+                        salt,
+                        now,
+                        now,
+                    ),
                 )
                 if cursor.rowcount > 0:
                     return {
                         "user_id": user_id,
-                        "display_name": username.strip(),
+                        "display_name": display_name,
                         "created": True,
                     }
                 row = connection.execute(
-                    "SELECT * FROM users WHERE user_id = ?",
-                    (user_id,),
+                    "SELECT * FROM users WHERE login_name_normalized = ?",
+                    (login_name,),
                 ).fetchone()
                 if row is None:
                     raise RuntimeError("User creation failed.")
 
+            user_id = str(row["user_id"])
             expected_hash = str(row["password_hash"])
             salt = str(row["salt"])
             if not _verify_password(password, expected_hash, salt):
@@ -179,10 +192,14 @@ class AuthRepositoryMixin:
 
 
 def normalize_user_id(value: str) -> str:
-    normalized = "".join(
-        char.lower() if char.isalnum() else "_" for char in value.strip()
-    ).strip("_")
-    return normalized or "default"
+    normalized = value.strip()
+    if not normalized:
+        raise RuntimeError("User ID is required.")
+    return normalized
+
+
+def normalize_login_name(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).strip().lower()
 
 
 def _hash_password(password: str, salt: str) -> str:

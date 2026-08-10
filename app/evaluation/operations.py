@@ -18,14 +18,24 @@ from app.analysis.agent_loop import _validate_safe_dataset_sql
 from app.analysis.data_cleaning import _basic_clean_dataframe
 from app.analysis.dataset_groups import suggest_dataset_group_relationships
 from app.analysis.model_router import MCPAnalysisModelRouter
+from app.analysis.services import DatasetProfiler
+from app.analysis.statistical_verifier import verify_statistical_analysis
 from app.assistant.permissions import AssistantPermissionService
+from app.data_reliability.drift import compare_snapshots
 from app.evaluation.agent_loop import AgentLoopBenchmarkOutcome, evaluate_agent_loop_benchmark
 from app.evaluation.benchmarking import BenchmarkObservation
 from app.evaluation.corpus import external_corpus_status, generated_rows
 from app.evaluation.models import BenchmarkCase
 from app.harness.models import TokenUsage
+from app.schemas.analysis import (
+    AnalysisContractResponse,
+    DatasetReferenceResponse,
+    InsightFindingResponse,
+    MultiDatasetProfileResponse,
+)
 from app.semantic.embedding import MockEmbeddingProvider
 from app.semantic.ranking import SemanticCandidateRanker
+from app.semantic.relationship_graph import plan_relationship_path
 from app.storage.dataset_store import DatasetStoreRepository
 
 
@@ -37,6 +47,9 @@ def release_executors() -> dict[str, Any]:
         "loop.release_gate": _loop_release_gate,
         "relationship.inference": _relationship_inference,
         "report.evidence": _report_evidence,
+        "analysis.statistical_verification": _statistical_verification,
+        "data.drift": _data_drift,
+        "relationship.grain": _relationship_grain,
         "assistant.permission": _assistant_permission,
     }
 
@@ -260,6 +273,104 @@ def _report_evidence(case: BenchmarkCase) -> BenchmarkObservation:
         metrics={
             "report_evidence_coverage": coverage,
             "report_numeric_accuracy": numeric_accuracy,
+        },
+    )
+
+
+def _statistical_verification(case: BenchmarkCase) -> BenchmarkObservation:
+    frame = pd.DataFrame(case.input["records"])
+    dataset_id = uuid4()
+    profile = DatasetProfiler().profile(
+        dataset_id=dataset_id,
+        records=frame.to_dict(orient="records"),
+    )
+    contract_payload = {
+        **dict(case.input["contract"]),
+        "objective": str(case.input.get("question") or "Benchmark analysis"),
+        "population": f"{len(frame)} benchmark records",
+        "dataset_ids": [str(dataset_id)],
+    }
+    contract = AnalysisContractResponse.model_validate(contract_payload)
+    findings = tuple(
+        InsightFindingResponse.model_validate(item)
+        for item in case.input["findings"]
+    )
+    evidence = tuple(dict(item) for item in case.input.get("evidence") or [])
+    context = None
+    join_summary = case.input.get("join_summary")
+    if isinstance(join_summary, dict):
+        reference = DatasetReferenceResponse(
+            dataset_id=dataset_id,
+            name="benchmark.csv",
+            status="cleaned",
+            row_count=len(frame),
+            column_count=len(frame.columns),
+            columns=tuple(str(column) for column in frame.columns),
+        )
+        context = MultiDatasetProfileResponse(
+            primary_dataset=reference,
+            join_summary=join_summary,
+            joined_profile=profile,
+        )
+    verification = verify_statistical_analysis(
+        contract=contract,
+        profile=profile,
+        dataframe=frame,
+        findings=findings,
+        evidence=evidence,
+        multi_dataset_context=context,
+    )
+    expected_status = str(case.expected.get("status") or "passed")
+    correct = verification.status == expected_status
+    return BenchmarkObservation(
+        actual={
+            "status": verification.status,
+            "requires_replan": verification.requires_replan,
+            "numeric_evidence_coverage": verification.numeric_evidence_coverage,
+            "check_statuses": {
+                check.code: check.status for check in verification.checks
+            },
+        },
+        metrics={
+            "statistical_contract_accuracy": 1.0 if correct else 0.0,
+            "statistical_numeric_evidence_coverage": (
+                verification.numeric_evidence_coverage
+            ),
+        },
+    )
+
+
+def _data_drift(case: BenchmarkCase) -> BenchmarkObservation:
+    changes = compare_snapshots(
+        dict(case.input["previous"]),
+        dict(case.input["current"]),
+    )
+    change_types = sorted({item.change_type for item in changes})
+    expected = {str(item) for item in case.expected.get("change_types") or ()}
+    detected = expected.issubset(change_types)
+    return BenchmarkObservation(
+        actual={"change_types": change_types, "detected": detected},
+        metrics={"drift_detection_accuracy": 1.0 if detected else 0.0},
+    )
+
+
+def _relationship_grain(case: BenchmarkCase) -> BenchmarkObservation:
+    result = plan_relationship_path(
+        dict(case.input["definition"]),
+        metric_ids=tuple(str(item) for item in case.input["metric_ids"]),
+        dimension_ids=tuple(str(item) for item in case.input["dimension_ids"]),
+    )
+    expected_safe = bool(case.expected["safe"])
+    return BenchmarkObservation(
+        actual={
+            "safe": bool(result["safe"]),
+            "strategies": [str(item["strategy"]) for item in result["steps"]],
+            "warnings": list(result["warnings"]),
+        },
+        metrics={
+            "relationship_grain_accuracy": (
+                1.0 if bool(result["safe"]) == expected_safe else 0.0
+            )
         },
     )
 
