@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 import urllib.error
 import urllib.request
@@ -237,10 +238,21 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[min(len(ordered) - 1, max(0, math.ceil(len(ordered) * fraction) - 1))]
 
 
+def _default_origin() -> str:
+    configured = os.getenv("DATAMIND_PUBLIC_ORIGIN", "https://localhost")
+    return next(
+        (origin.strip() for origin in configured.split(",") if origin.strip()),
+        "https://localhost",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the real DataMind production-stack smoke flow.")
     parser.add_argument("--base-url", default="http://127.0.0.1:8010/api/v1")
-    parser.add_argument("--origin", default="https://localhost")
+    parser.add_argument(
+        "--origin",
+        default=_default_origin(),
+    )
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--benchmark-output", type=Path)
     args = parser.parse_args()

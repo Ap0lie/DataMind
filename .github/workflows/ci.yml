@@ -18,9 +18,9 @@ jobs:
       DATAMIND_EXECUTION_BACKEND: local
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -46,7 +46,7 @@ jobs:
 
       - name: Upload release benchmark
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: datamind-release-benchmark
           path: artifacts/benchmarks/release
@@ -57,13 +57,13 @@ jobs:
 
       - name: Upload memory benchmark
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: datamind-memory-benchmark
           path: artifacts/benchmarks/memory
           if-no-files-found: warn
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
           cache: npm

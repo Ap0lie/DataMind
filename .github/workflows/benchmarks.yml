@@ -15,9 +15,9 @@ jobs:
       DATAMIND_RATE_LIMITS_ENABLED: "false"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -36,8 +36,8 @@ jobs:
           python -m app.evaluation.cli run --suite provider --repeats 3 --output artifacts/benchmarks/provider
 
       - name: Upload provider benchmark
-        if: always()
-        uses: actions/upload-artifact@v4
+        if: always() && env.DATAMIND_DEEPSEEK_API_KEY != '' && env.DATAMIND_KIMI_API_KEY != ''
+        uses: actions/upload-artifact@v6
         with:
           name: datamind-provider-benchmark
           path: artifacts/benchmarks/provider
@@ -65,9 +65,9 @@ jobs:
       DATAMIND_SEMANTIC_EMBEDDING_REQUIRED: "false"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -80,7 +80,7 @@ jobs:
         run: docker compose up -d --build postgres redis python-sandbox python-runner migrate api worker
 
       - name: Run production smoke and capture SSE latency
-        run: python scripts/production_smoke.py --timeout 420 --benchmark-output artifacts/benchmarks/production-smoke.json
+        run: python scripts/production_smoke.py --origin "$DATAMIND_PUBLIC_ORIGIN" --timeout 420 --benchmark-output artifacts/benchmarks/production-smoke.json
 
       - name: Run performance benchmark
         run: python -m app.evaluation.cli run --suite performance --backend compose --output artifacts/benchmarks/performance
@@ -90,7 +90,7 @@ jobs:
 
       - name: Upload production benchmark
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: datamind-production-benchmark
           path: artifacts/benchmarks

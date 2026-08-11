@@ -32,9 +32,9 @@ jobs:
       DATAMIND_REPORT_LOOP_ENABLED: "true"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -45,11 +45,11 @@ jobs:
         run: docker compose exec -T api python -m app.python_runner.smoke
 
       - name: Run Cookie, cleaning, Celery, Loop and report smoke flow
-        run: python scripts/production_smoke.py --timeout 420 --benchmark-output artifacts/benchmarks/production-smoke.json
+        run: python scripts/production_smoke.py --origin "$DATAMIND_PUBLIC_ORIGIN" --timeout 420 --benchmark-output artifacts/benchmarks/production-smoke.json
 
       - name: Upload production smoke metrics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: datamind-production-smoke-metrics
           path: artifacts/benchmarks/production-smoke.json
