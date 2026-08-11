@@ -17,6 +17,10 @@ NodeEventCallback = Callable[[Any, dict[str, Any]], None]
 _NODE_DEADLINE: ContextVar[float | None] = ContextVar(
     "datamind_node_deadline", default=None
 )
+_NODE_NAME: ContextVar[str | None] = ContextVar("datamind_node_name", default=None)
+_NODE_EVENT: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar(
+    "datamind_node_event", default=None
+)
 
 
 class NodeExecutionTimeout(TimeoutError):
@@ -40,6 +44,36 @@ def remaining_node_timeout(default: float | None = None) -> float | None:
     return remaining if default is None else min(default, remaining)
 
 
+def current_node_name() -> str | None:
+    return _NODE_NAME.get()
+
+
+def emit_context_event(
+    event_type: str,
+    *,
+    status: str,
+    message: str,
+    payload: dict[str, Any],
+) -> None:
+    callback = _NODE_EVENT.get()
+    if callback is None:
+        return
+    callback(
+        {
+            "node": current_node_name() or "context_budget",
+            "status": status,
+            "attempt": 0,
+            "duration_ms": payload.get("duration_ms", 0),
+            "provider": None,
+            "model": None,
+            "error_code": None,
+            "message": message,
+            "event_type": event_type,
+            "payload": payload,
+        }
+    )
+
+
 class NodeExecutionHarness:
     """Reliability boundary around LangGraph nodes without becoming a scheduler."""
 
@@ -60,6 +94,12 @@ class NodeExecutionHarness:
                 else None
             )
             deadline_token = _NODE_DEADLINE.set(deadline)
+            name_token = _NODE_NAME.set(node_name)
+            event_token = _NODE_EVENT.set(
+                (lambda payload: self._event_callback(state, payload))
+                if self._event_callback is not None
+                else None
+            )
             attempt = 0
             try:
                 while True:
@@ -120,6 +160,8 @@ class NodeExecutionHarness:
                             if delay > 0:
                                 time.sleep(delay)
             finally:
+                _NODE_EVENT.reset(event_token)
+                _NODE_NAME.reset(name_token)
                 _NODE_DEADLINE.reset(deadline_token)
 
         return run

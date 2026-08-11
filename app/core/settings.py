@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     llm_retry_backoff_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
     llm_max_tokens: int = Field(default=2048, gt=0)
     llm_prompt_max_chars: int = Field(default=120_000, ge=10_000)
+    context_budget_enabled: bool = True
+    context_budget_mode: str = Field(default="shadow", pattern="^(shadow|enforce)$")
+    llm_context_window_tokens: int = Field(default=65_536, ge=8_192, le=2_000_000)
+    context_safety_ratio: float = Field(default=0.15, ge=0.05, le=0.40)
     llm_allow_provider_fallback: bool = True
     semantic_embedding_enabled: bool = False
     semantic_embedding_model: str = "BAAI/bge-small-zh-v1.5"

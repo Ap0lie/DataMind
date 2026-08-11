@@ -30,6 +30,7 @@ from app.evaluation.agent_loop import AgentLoopBenchmarkOutcome, evaluate_agent_
 from app.evaluation.benchmarking import BenchmarkObservation
 from app.evaluation.corpus import external_corpus_status, generated_rows
 from app.evaluation.models import BenchmarkCase
+from app.harness.context import ContextBudgetManager, PromptEnvelope
 from app.harness.models import TokenUsage
 from app.schemas.analysis import (
     AnalysisContractResponse,
@@ -57,6 +58,7 @@ def release_executors() -> dict[str, Any]:
         "relationship.grain": _relationship_grain,
         "assistant.permission": _assistant_permission,
         "memory.trust": _memory_trust,
+        "context.budget": _context_budget,
     }
 
 
@@ -89,6 +91,80 @@ def _cleaning_basic(case: BenchmarkCase) -> BenchmarkObservation:
             "duplicate_rows": int(cleaned.duplicated().sum()),
         },
         metrics={"cleaning_correctness": 1.0},
+    )
+
+
+def _context_budget(case: BenchmarkCase) -> BenchmarkObservation:
+    sample_count = max(100, int(case.input.get("sample_count") or 1_000))
+    messages = [
+        {
+            "role": "system",
+            "content": "Preserve the system contract, current question, analysis contract and evidence IDs.",
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "question": "按客户州汇总总支付金额",
+                    "analysis_contract": {
+                        "metric": "payment_value",
+                        "dimension": "customer_state",
+                    },
+                    "evidence": [
+                        {"evidence_id": f"ev_{index}", "summary": "x" * 300}
+                        for index in range(8)
+                    ],
+                    "sample_records": [
+                        {
+                            "customer_state": f"state-{index % 27}",
+                            "payment_value": index / 10,
+                            "note": "context-noise-" + ("x" * 240),
+                        }
+                        for index in range(sample_count)
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    manager = ContextBudgetManager(
+        enabled=True,
+        mode="enforce",
+        context_window_tokens=65_536,
+        max_chars=120_000,
+        safety_ratio=0.15,
+    )
+    started = time.perf_counter()
+    prepared = manager.prepare(
+        PromptEnvelope.from_messages(messages),
+        profile="planner",
+        output_tokens=2_048,
+    )
+    duration_ms = (time.perf_counter() - started) * 1_000
+    payload = json.loads(prepared.messages[-1]["content"])
+    required_preserved = (
+        payload.get("question") == "按客户州汇总总支付金额"
+        and payload.get("analysis_contract")
+        == {"metric": "payment_value", "dimension": "customer_state"}
+        and [item.get("evidence_id") for item in payload.get("evidence", [])]
+        == [f"ev_{index}" for index in range(8)]
+    )
+    reduction = 1.0 - (
+        prepared.report.proposed_tokens / max(prepared.report.original_tokens, 1)
+    )
+    return BenchmarkObservation(
+        actual={
+            "over_budget_requests": int(not prepared.report.fits),
+            "required_preservation": float(required_preserved),
+            "token_reduction": reduction,
+            "compression_ms": duration_ms,
+        },
+        metrics={
+            "context_over_budget_requests": float(not prepared.report.fits),
+            "context_required_preservation": float(required_preserved),
+            "context_token_reduction": reduction,
+            "context_compression_p95_ms": duration_ms,
+        },
     )
 
 

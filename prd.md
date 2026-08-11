@@ -415,6 +415,8 @@ Current context-control requirement:
 - Large SQL/Python/chart payloads must be compacted before being sent to LLM review/report prompts to avoid provider context-length or HTTP 413 errors.
 - Dataset group relationship prompts must use compressed table schema, field statistics, sample values, and short previews only; full uploaded records must not be sent to the LLM.
 - Every model call enforces a configurable text budget (`DATAMIND_LLM_PROMPT_MAX_CHARS`); inline image bytes are excluded from the text calculation while their descriptions and extracted text remain bounded.
+- Every cleaning, analysis, review, report, and Assistant model call also passes through the shared `ContextBudgetManager`, which combines a conservative Token estimate with the character hard limit. Node Harness supplies the execution identity, domain reducers preserve contracts/evidence while compacting optional payloads, and Model Router performs final admission.
+- Context budgeting starts in `shadow` mode: proposed reductions and suppressed sections are observable but provider input remains unchanged. `enforce` mode sends the deterministic bounded prompt and rejects a request when required system policy, current question, contract, errors, or evidence cannot fit.
 - User questions, file names, column names, cell values, preview rows, multimodal descriptions, and extracted file text are untrusted prompt data. Agent system prompts explicitly reject instructions embedded in those values.
 - Planner, SQL, and Python prompts receive compact multi-dataset provenance, join status, row expansion, key uniqueness, and a grain rule that prevents duplicated `SUM`/`AVG` after one-to-many joins.
 - Experience-library context is selected per agent; execution agents receive priority guidance only, while review/report stages may receive concise historical summaries. Incompatible plan schemas are not injected into agent output contracts.
@@ -1200,6 +1202,7 @@ Implemented:
 - Report generation uses a bounded decide/execute/verify/repair-or-fallback/commit sub-loop with evidence-ID validation, at most two revisions, at most one request for additional analysis evidence, and idempotent commit by job ID.
 - Workflow modularization phase 1: reusable prompt trust/experience/multi-dataset context lives in `app/analysis/workflow_prompt_context.py`.
 - LangGraph nodes execute through a unified Node Harness for transient retry classification, validation, timing, and trace events.
+- Unified context budget v1 covers cleaning, Planner, SQL/Python, Reviewer, Report and Kimi calls with stage-specific Token ceilings, deterministic domain reduction, Python repair-error preservation, character admission, and privacy-safe context budget events. The deterministic `context` Benchmark gates required-context preservation, oversized-request rate, Token reduction and compression latency; production remains in shadow mode until five valid calibration batches pass.
 - Process-level internal MCP Runtime reuse for API and Worker model/tool calls.
 - Chart support for bar, line, pie, histogram, box plot, and correlation heatmap.
 - Text analysis support in Python agent/rules fallback.

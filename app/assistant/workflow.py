@@ -89,6 +89,17 @@ class AssistantWorkflowRunner:
         def emit(**kwargs: Any) -> None:
             self.assistant_store.append_event(run_id, **kwargs)
 
+        def harness_event(_state: AssistantState, payload: dict[str, Any]) -> None:
+            event_type = str(payload.get("event_type") or "")
+            if not event_type.startswith("context."):
+                return
+            emit(
+                event_type=event_type,
+                status=str(payload.get("status") or "completed"),
+                message=str(payload.get("message") or "Context budget evaluated."),
+                payload=payload.get("payload") or {},
+            )
+
         tools = AssistantToolRuntime(
             store=self.store,
             assistant_store=self.assistant_store,
@@ -817,13 +828,15 @@ class AssistantWorkflowRunner:
             }
 
         harness = NodeExecutionHarness(
-            NodeHarnessPolicy(timeout_seconds=self.settings.assistant_timeout_seconds)
+            NodeHarnessPolicy(timeout_seconds=self.settings.assistant_timeout_seconds),
+            event_callback=harness_event,
         )
         streaming_harness = NodeExecutionHarness(
             NodeHarnessPolicy(
                 transient_retries=0,
                 timeout_seconds=self.settings.assistant_timeout_seconds,
-            )
+            ),
+            event_callback=harness_event,
         )
         graph.add_node("retrieve_context", harness.wrap("assistant.retrieve_context", retrieve))
         graph.add_node("decide_tools", harness.wrap("assistant.decide_tools", decide))

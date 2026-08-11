@@ -8,6 +8,7 @@ or several minutes of runtime.
 ```bash
 python -m app.evaluation.cli run --suite release
 python -m app.evaluation.cli run --suite memory
+python -m app.evaluation.cli run --suite context
 python -m app.evaluation.cli run --suite provider --repeats 3
 python -m app.evaluation.cli run --suite performance --backend compose
 python -m app.evaluation.cli run --suite resilience --backend compose

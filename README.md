@@ -152,6 +152,9 @@ Compose. The most important settings are:
 | `DATAMIND_KIMI_API_KEY` | Reviewer, report, multimodal, and Assistant provider |
 | `DATAMIND_PYTHON_RUNNER_URL` | Controlled container runner endpoint |
 | `DATAMIND_AGENT_LOOP_DEFAULT_MODE` | Default `loop`; `legacy` is compatibility mode |
+| `DATAMIND_CONTEXT_BUDGET_MODE` | Unified context-budget mode: `shadow` or `enforce` |
+| `DATAMIND_LLM_CONTEXT_WINDOW_TOKENS` | Conservative provider context-window token budget |
+| `DATAMIND_CONTEXT_SAFETY_RATIO` | Reserve for output and token-estimation variance |
 | `DATAMIND_SEMANTIC_EMBEDDING_ENABLED` | Enables local semantic embedding ranking |
 | `DATAMIND_ASSISTANT_MEMORY_ENABLED` | Enables Kimi conversation summaries and long-term memory |
 | `DATAMIND_ASSISTANT_MEMORY_RELEVANCE_THRESHOLD` | Minimum combined relevance for ordinary recalled memory |
@@ -162,6 +165,14 @@ Compose. The most important settings are:
 
 Agent-level provider routing is configured independently. Kimi and DeepSeek are
 defaults, not hard requirements; tests use the mock provider.
+
+Every cleaning, analysis, review, report, and Kimi model call passes through the
+shared context budget manager. System policy, the current question, analysis
+contract, errors, and evidence are retained first; profiles, samples, SQL/Python
+results, charts, history, and tool output use deterministic domain reducers. The
+default `shadow` mode records proposed compression without changing provider input;
+`enforce` sends the bounded prompt. Router admission uses both conservative token
+estimation and the existing character hard limit.
 
 ## Kimi Data Assistant
 

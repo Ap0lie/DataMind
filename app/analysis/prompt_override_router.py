@@ -6,6 +6,7 @@ from typing import Any
 
 from app.analysis.model_router import AnalysisModelRouter
 from app.analysis.prompt_utils import UNTRUSTED_INPUT_NOTICE
+from app.harness.context import PromptEnvelope
 from app.mcp.tool_schemas import ModelRouterResponse
 from app.schemas.prompt_overrides import AgentPromptOverrides
 
@@ -53,12 +54,13 @@ class PromptOverrideModelRouter:
         metadata: dict[str, object] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        context: PromptEnvelope | None = None,
     ) -> ModelRouterResponse:
         resolved_metadata = dict(metadata or {})
         agent = str(resolved_metadata.get("agent") or "").strip().lower()
         stage = _AGENT_STAGE.get(agent)
         instructions = self._instructions_for(stage)
-        prepared_messages = list(messages)
+        prepared_messages = context.render() if context is not None else list(messages)
         if instructions:
             prepared_messages.append(
                 {
@@ -80,6 +82,9 @@ class PromptOverrideModelRouter:
             resolved_metadata["prompt_override_hash"] = hashlib.sha256(
                 instructions.encode("utf-8")
             ).hexdigest()
+        delegate_kwargs: dict[str, Any] = {}
+        if context is not None:
+            delegate_kwargs["context"] = PromptEnvelope.from_messages(prepared_messages)
         return self._delegate.complete(
             messages=prepared_messages,
             provider=provider,
@@ -89,6 +94,7 @@ class PromptOverrideModelRouter:
             metadata=resolved_metadata,
             tools=tools,
             tool_choice=tool_choice,
+            **delegate_kwargs,
         )
 
     def _instructions_for(self, stage: str | None) -> str:

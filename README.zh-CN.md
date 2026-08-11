@@ -138,6 +138,9 @@ Celery Beat、受控 Python Runner 和无网络 Sandbox 镜像。DNS、HTTPS、�
 | `DATAMIND_KIMI_API_KEY` | Reviewer、Report、多模态与 Assistant |
 | `DATAMIND_PYTHON_RUNNER_URL` | 受控容器 Runner 地址 |
 | `DATAMIND_AGENT_LOOP_DEFAULT_MODE` | 默认 `loop`，`legacy` 仅用于兼容 |
+| `DATAMIND_CONTEXT_BUDGET_MODE` | 统一上下文预算的 `shadow` 或 `enforce` 模式 |
+| `DATAMIND_LLM_CONTEXT_WINDOW_TOKENS` | Provider 上下文窗口的保守 Token 预算 |
+| `DATAMIND_CONTEXT_SAFETY_RATIO` | 为输出和 Token 估算偏差预留的安全比例 |
 | `DATAMIND_SEMANTIC_EMBEDDING_ENABLED` | 启用本地语义向量排序 |
 | `DATAMIND_ASSISTANT_MEMORY_ENABLED` | 启用 Kimi 对话摘要与长期记忆 |
 | `DATAMIND_ASSISTANT_MEMORY_RELEVANCE_THRESHOLD` | 普通记忆进入上下文的最低综合相关性 |
@@ -148,6 +151,12 @@ Celery Beat、受控 Python Runner 和无网络 Sandbox 镜像。DNS、HTTPS、�
 
 各 Agent 可以独立配置模型供应商。Kimi 和 DeepSeek 是默认选择，并非测试环境的
 硬依赖；自动化测试统一使用 Mock Provider。
+
+所有清洗、分析、审查、报告和 Kimi 模型调用都会经过统一上下文预算器。系统规则、
+当前问题、分析契约、错误与证据优先保留；Profile、样本、SQL/Python 结果、图表、
+历史消息和工具输出按领域规则确定性压缩。默认 `shadow` 仅记录压缩建议，校准通过后
+切换到 `enforce` 才会发送压缩后的 Prompt。最终 Router 同时执行 Token 估算与字符
+硬上限检查，不会把超限请求发送给 Provider。
 
 ## Kimi 数据分析助手
 

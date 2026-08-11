@@ -63,6 +63,17 @@ jobs:
           path: artifacts/benchmarks/memory
           if-no-files-found: warn
 
+      - name: Context budget benchmark
+        run: python -m app.evaluation.cli run --suite context --output artifacts/benchmarks/context
+
+      - name: Upload context budget benchmark
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: datamind-context-benchmark
+          path: artifacts/benchmarks/context
+          if-no-files-found: warn
+
       - uses: actions/setup-node@v6
         with:
           node-version: "24"

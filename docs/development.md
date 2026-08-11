@@ -41,6 +41,9 @@ mypy app tests
 - Prioritize the dataset analysis flow from the PRD.
 - LangGraph is the only workflow scheduler.
 - Agent nodes execute through `NodeExecutionHarness` for validation, transient retries, and trace events.
+- Model calls use the shared context budget manager. Keep `DATAMIND_CONTEXT_BUDGET_MODE=shadow`
+  while calibrating a provider/model pair, run `python -m app.evaluation.cli run --suite context`,
+  and switch to `enforce` only after the required-contract and latency gates pass.
 - LLM calls must enter through Model Router MCP.
 - The internal MCP Runtime is reused once per API or Worker process.
 - Dataset/file access should enter through Filesystem MCP or a local service boundary.

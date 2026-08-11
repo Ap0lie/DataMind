@@ -1,18 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Protocol
 
 from app.analysis.prompt_utils import enforce_prompt_budget
 from app.core.settings import Settings, get_settings
-from app.harness.node import remaining_node_timeout
+from app.harness.context import (
+    ContextBudgetExceeded,
+    ContextBudgetManager,
+    PromptEnvelope,
+    resolve_context_profile,
+)
+from app.harness.node import (
+    current_node_name,
+    emit_context_event,
+    remaining_node_timeout,
+)
 from app.mcp.bootstrap import build_mcp_runtime
 from app.mcp.models import MCPInvocationStatus
 from app.mcp.runtime import InMemoryMCPRuntime
 from app.mcp.tool_schemas import ModelRouterRequest, ModelRouterResponse
 from app.security.rate_limit import enforce_rate_limit
+
+logger = logging.getLogger("datamind.context_budget")
 
 
 class AnalysisModelRouter(Protocol):
@@ -27,6 +41,7 @@ class AnalysisModelRouter(Protocol):
         metadata: dict[str, object] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        context: PromptEnvelope | None = None,
     ) -> ModelRouterResponse:
         """Call the DeepSeek model completion endpoint through MCP."""
 
@@ -40,6 +55,7 @@ class AnalysisModelRouter(Protocol):
         temperature: float = 0.2,
         max_tokens: int | None = None,
         metadata: dict[str, object] | None = None,
+        context: PromptEnvelope | None = None,
     ) -> ModelRouterResponse:
         """Stream visible answer tokens and return the final provider metadata."""
 
@@ -52,6 +68,7 @@ class MCPAnalysisModelRouter:
     ) -> None:
         self._settings = settings or get_settings()
         self._runtime = runtime
+        self._context_budget = ContextBudgetManager.from_settings(self._settings)
 
     def complete(
         self,
@@ -64,19 +81,32 @@ class MCPAnalysisModelRouter:
         metadata: dict[str, object] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        context: PromptEnvelope | None = None,
     ) -> ModelRouterResponse:
+        resolved_max_tokens = max_tokens or self._settings.llm_max_tokens
+        messages, budget_metadata = self._prepare_messages(
+            messages=messages,
+            context=context,
+            metadata=metadata,
+            max_tokens=resolved_max_tokens,
+            streaming=False,
+        )
         prompt_chars = enforce_prompt_budget(
             messages,
             max_chars=self._settings.llm_prompt_max_chars,
         )
-        request_metadata = {**(metadata or {}), "prompt_chars": prompt_chars}
+        request_metadata = {
+            **(metadata or {}),
+            "prompt_chars": prompt_chars,
+            "context_budget": budget_metadata,
+        }
         return _run_async(
             self._complete_async(
                 messages=messages,
                 provider=provider,
                 model=model,
                 temperature=temperature,
-                max_tokens=max_tokens,
+                max_tokens=resolved_max_tokens,
                 metadata=request_metadata,
                 tools=tools or [],
                 tool_choice=tool_choice,
@@ -93,12 +123,25 @@ class MCPAnalysisModelRouter:
         temperature: float = 0.2,
         max_tokens: int | None = None,
         metadata: dict[str, object] | None = None,
+        context: PromptEnvelope | None = None,
     ) -> ModelRouterResponse:
+        resolved_max_tokens = max_tokens or self._settings.llm_max_tokens
+        messages, budget_metadata = self._prepare_messages(
+            messages=messages,
+            context=context,
+            metadata=metadata,
+            max_tokens=resolved_max_tokens,
+            streaming=True,
+        )
         prompt_chars = enforce_prompt_budget(
             messages,
             max_chars=self._settings.llm_prompt_max_chars,
         )
-        request_metadata = {**(metadata or {}), "prompt_chars": prompt_chars}
+        request_metadata = {
+            **(metadata or {}),
+            "prompt_chars": prompt_chars,
+            "context_budget": budget_metadata,
+        }
         return _run_async(
             self._stream_complete_async(
                 messages=messages,
@@ -106,10 +149,76 @@ class MCPAnalysisModelRouter:
                 provider=provider,
                 model=model,
                 temperature=temperature,
-                max_tokens=max_tokens,
+                max_tokens=resolved_max_tokens,
                 metadata=request_metadata,
             )
         )
+
+    def _prepare_messages(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        context: PromptEnvelope | None,
+        metadata: dict[str, object] | None,
+        max_tokens: int,
+        streaming: bool,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        agent = str((metadata or {}).get("agent") or "")
+        profile = resolve_context_profile(
+            agent=agent,
+            node_name=current_node_name(),
+            streaming=streaming,
+        )
+        try:
+            prepared = self._context_budget.prepare(
+                context or PromptEnvelope.from_messages(messages),
+                profile=profile,
+                output_tokens=max_tokens,
+            )
+        except ContextBudgetExceeded as exc:
+            payload = {"profile": profile, "error": str(exc)}
+            logger.error("context.budget_exceeded %s", json.dumps(payload, ensure_ascii=False))
+            emit_context_event(
+                "context.budget_exceeded",
+                status="failed",
+                message="Required model context exceeds its configured budget.",
+                payload=payload,
+            )
+            raise
+        report = prepared.report.as_metadata()
+        logger.info("context.budget_evaluated %s", json.dumps(report, ensure_ascii=False))
+        emit_context_event(
+            "context.budget_evaluated",
+            status="completed" if report["fits"] else "warning",
+            message="Model context budget evaluated.",
+            payload=report,
+        )
+        if report["compressed"]:
+            emit_context_event(
+                "context.compressed",
+                status="completed",
+                message="Model context was deterministically compressed.",
+                payload=report,
+            )
+        if report["suppressed_sections"]:
+            emit_context_event(
+                "context.section_suppressed",
+                status="completed",
+                message="Optional model context sections were suppressed.",
+                payload={
+                    "profile": profile,
+                    "sections": report["suppressed_sections"],
+                    "duration_ms": report["duration_ms"],
+                },
+            )
+        if not report["fits"]:
+            emit_context_event(
+                "context.budget_exceeded",
+                status="warning",
+                message="Shadow context proposal could not fit the configured budget.",
+                payload=report,
+            )
+        return prepared.messages, report
 
     async def _complete_async(
         self,

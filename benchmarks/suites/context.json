@@ -1,0 +1,30 @@
+{
+  "suite_id": "context",
+  "version": "1.0.0",
+  "description": "Deterministic context budgeting, required-contract preservation and compression latency gates.",
+  "mode": "deterministic",
+  "corpus_checksum": "auto",
+  "max_duration_seconds": 30,
+  "cases": [
+    {
+      "case_id": "context-large-analysis-prompt",
+      "name": "Large analysis context is safely compressed",
+      "subsystem": "context_budget",
+      "operation": "context.budget",
+      "input": {"sample_count": 1000},
+      "validators": [
+        {"type": "exact", "path": "over_budget_requests", "expected": 0},
+        {"type": "exact", "path": "required_preservation", "expected": 1.0},
+        {"type": "minimum", "path": "token_reduction", "expected": 0.25},
+        {"type": "maximum", "path": "compression_ms", "expected": 100}
+      ],
+      "tags": ["context", "deterministic", "release"]
+    }
+  ],
+  "thresholds": [
+    {"metric": "context_over_budget_requests", "direction": "exact", "value": 0, "hard_gate": true},
+    {"metric": "context_required_preservation", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "context_token_reduction", "direction": "minimum", "value": 0.25, "hard_gate": true},
+    {"metric": "context_compression_p95_ms", "direction": "maximum", "value": 100, "hard_gate": true}
+  ]
+}

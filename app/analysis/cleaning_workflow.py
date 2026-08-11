@@ -312,7 +312,7 @@ class CleaningWorkflowRunner:
                     "stage": payload["node"],
                     "status": payload["status"],
                     "message": payload["message"],
-                    "event_type": "node_execution",
+                    "event_type": payload.get("event_type") or "node_execution",
                     "iteration": int(state.get("iteration") or 0),
                     "strategy": state.get("selected_strategy")
                     or state.get("pending_strategy"),
@@ -320,6 +320,7 @@ class CleaningWorkflowRunner:
                         "attempt": payload["attempt"],
                         "duration_ms": payload["duration_ms"],
                         "error_code": payload.get("error_code"),
+                        **(payload.get("payload") or {}),
                     },
                 }
             )
