@@ -423,6 +423,7 @@ for (const submitMethod of ["click", "enter"] as const) {
 test("Kimi initialization disables manual creation and produces one active conversation", async ({ page }, testInfo) => {
   let initialConversationRead = true;
   let creationPosts = 0;
+  const idempotencyKeys: string[] = [];
   let releaseInitialConversationRead!: () => void;
   const initialConversationReadGate = new Promise<void>((resolve) => {
     releaseInitialConversationRead = resolve;
@@ -430,6 +431,7 @@ test("Kimi initialization disables manual creation and produces one active conve
   page.on("request", (request) => {
     if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/assistant/conversations")) {
       creationPosts += 1;
+      idempotencyKeys.push(request.headers()["idempotency-key"] ?? "");
     }
   });
 
@@ -460,12 +462,51 @@ test("Kimi initialization disables manual creation and produces one active conve
   await expect(newConversation).toBeEnabled();
   await page.waitForTimeout(250);
   expect(creationPosts).toBe(1);
+  expect(idempotencyKeys).toHaveLength(1);
+  expect(idempotencyKeys[0]).toMatch(/^[0-9a-f-]{36}$/);
+});
+
+test("Kimi conversation creation reuses its idempotency key after a lost response", async ({ page }, testInfo) => {
+  const requestKeys: string[] = [];
+  let dropFirstResponse = true;
+
+  await page.goto("/");
+  await page.getByLabel("用户名").fill(`qa_assistant_idempotency_${testInfo.project.name.replace(/\W/g, "_")}_${Date.now()}`);
+  await page.getByLabel("密码").fill("qa-reliability-password");
+  await page.getByRole("button", { name: /Log in|登录/ }).click();
+  await page.getByRole("button", { name: "Kimi" }).click();
+  await expect(page.locator(".assistant-conversation")).toHaveCount(1);
+
+  await page.route("**/api/v1/assistant/conversations", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    requestKeys.push(route.request().headers()["idempotency-key"] ?? "");
+    if (dropFirstResponse) {
+      dropFirstResponse = false;
+      await route.fetch();
+      await route.abort("failed");
+      return;
+    }
+    await route.fallback();
+  });
+
+  if (testInfo.project.name.includes("mobile")) {
+    await page.getByTitle("打开消息记录").click();
+  }
+  await page.getByRole("button", { name: "新建对话" }).click();
+  await expect(page.locator(".assistant-conversation")).toHaveCount(2);
+  await expect.poll(() => requestKeys.length).toBeGreaterThanOrEqual(2);
+  expect(new Set(requestKeys).size).toBe(1);
+  expect(requestKeys[0]).toMatch(/^[0-9a-f-]{36}$/);
 });
 
 for (const submitMethod of ["click", "enter"] as const) {
   test(`manual Kimi creation clears search and routes an immediate ${submitMethod} send exactly once`, async ({ page }, testInfo) => {
     const question = `新建后立即发送（${submitMethod}）`;
     let creationPosts = 0;
+    const creationKeys: string[] = [];
     let createdConversationId = "";
     const messagePosts: string[] = [];
     page.on("request", (request) => {
@@ -489,6 +530,7 @@ for (const submitMethod of ["click", "enter"] as const) {
         return;
       }
       creationPosts += 1;
+      creationKeys.push(route.request().headers()["idempotency-key"] ?? "");
       const response = await route.fetch();
       const body = await response.json() as { conversation_id: string };
       createdConversationId = body.conversation_id;
@@ -513,6 +555,8 @@ for (const submitMethod of ["click", "enter"] as const) {
     await expect(search).toHaveValue("");
     await expect(newConversation).toBeDisabled();
     await expect.poll(() => creationPosts).toBe(1);
+    expect(creationKeys).toHaveLength(1);
+    expect(creationKeys[0]).toMatch(/^[0-9a-f-]{36}$/);
     if (testInfo.project.name.includes("mobile")) {
       await page.locator(".assistant-history").getByRole("button", { name: "关闭", exact: true }).click();
     }

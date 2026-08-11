@@ -184,6 +184,9 @@ bounded cleaning, relationship, analysis, report, and semantic-model operations.
 Server-side scope checks inject user identity; the model cannot expand its own
 permissions. Mutations are idempotent and audited, while soft deletion always
 requires confirmation and remains recoverable for 30 days.
+Conversation creation also accepts `Idempotency-Key`: retries, remounts, and
+concurrent tabs resolve to one user-scoped conversation, while a new explicit
+creation intent still creates a new conversation.
 
 Attachments support JPEG, PNG, WebP, CSV, XLSX, JSON, and TXT. Large data files are
 streamed to protected staging storage and parsed one file at a time. Final answers

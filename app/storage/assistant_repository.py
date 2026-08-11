@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,6 +13,12 @@ from uuid import UUID, uuid4
 
 from app.core.settings import get_settings
 from app.storage.dataset_store import DatasetStoreRepository
+
+logger = logging.getLogger(__name__)
+
+
+class AssistantConversationIdempotencyConflict(RuntimeError):
+    """The same creation intent was replayed with incompatible state."""
 
 
 def _now() -> str:
@@ -118,6 +125,13 @@ class AssistantRepository:
                 WHERE 1 = 0
                 """
             )
+            connection.execute(
+                """
+                SELECT idempotency_key, request_fingerprint
+                FROM assistant_conversations
+                WHERE 1 = 0
+                """
+            )
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -136,8 +150,14 @@ class AssistantRepository:
                 ("assistant_conversations", "summary_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("assistant_conversations", "summary_updated_at", "TEXT"),
                 ("assistant_conversations", "summary_payload", "TEXT NOT NULL DEFAULT '{}'"),
+                ("assistant_conversations", "idempotency_key", "TEXT"),
+                ("assistant_conversations", "request_fingerprint", "TEXT"),
             ):
                 _ensure_column(connection, table, column, definition)
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_assistant_conversation_idempotency
+                   ON assistant_conversations(user_id,idempotency_key)"""
+            )
             connection.execute(
                 """
                 UPDATE assistant_runs
@@ -160,18 +180,103 @@ class AssistantRepository:
                 """
             )
 
-    def create_conversation(self, *, title: str, scope_type: str, scope_id: UUID | None) -> dict[str, Any]:
+    def create_conversation(
+        self,
+        *,
+        title: str,
+        scope_type: str,
+        scope_id: UUID | None,
+        idempotency_key: str | None = None,
+        request_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_title = _normalize_conversation_title(title)
+        normalized_key = idempotency_key.strip() if idempotency_key else None
+        fingerprint = request_fingerprint or _conversation_request_fingerprint(
+            title=normalized_title,
+            scope_type=scope_type,
+            scope_id=scope_id,
+        )
+        if normalized_key:
+            existing = self._resolve_idempotent_conversation(
+                normalized_key, fingerprint
+            )
+            if existing is not None:
+                return existing
+
         self._validate_scope(scope_type, scope_id)
         conversation_id = uuid4()
         now = _now()
-        with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO assistant_conversations
-                   (id,user_id,title,scope_type,scope_id,summary,deleted_at,created_at,updated_at,last_message_at)
-                   VALUES (?,?,?,?,?,'',NULL,?,?,NULL)""",
-                (str(conversation_id), self.user_id, title.strip() or "新对话", scope_type, str(scope_id) if scope_id else None, now, now),
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """INSERT INTO assistant_conversations
+                       (id,user_id,title,scope_type,scope_id,summary,deleted_at,created_at,
+                        updated_at,last_message_at,idempotency_key,request_fingerprint)
+                       VALUES (?,?,?,?,?,'',NULL,?,?,NULL,?,?)""",
+                    (
+                        str(conversation_id),
+                        self.user_id,
+                        normalized_title,
+                        scope_type,
+                        str(scope_id) if scope_id else None,
+                        now,
+                        now,
+                        normalized_key,
+                        fingerprint if normalized_key else None,
+                    ),
+                )
+        except Exception as exc:
+            if not normalized_key or not _is_integrity_error(exc):
+                raise
+            existing = self._resolve_idempotent_conversation(
+                normalized_key, fingerprint
             )
+            if existing is None:
+                raise
+            return existing
         return self.get_conversation(conversation_id)
+
+    def _resolve_idempotent_conversation(
+        self, idempotency_key: str, request_fingerprint: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT c.*,
+                   (SELECT id FROM assistant_runs r WHERE r.conversation_id=c.id AND r.user_id=c.user_id
+                    AND r.status IN ('queued','running','pause_requested','paused','awaiting_confirmation') ORDER BY r.created_at DESC LIMIT 1) active_run_id,
+                   (SELECT status FROM assistant_runs r WHERE r.conversation_id=c.id AND r.user_id=c.user_id
+                    AND r.status IN ('queued','running','pause_requested','paused','awaiting_confirmation') ORDER BY r.created_at DESC LIMIT 1) active_run_status
+                   FROM assistant_conversations c
+                   WHERE c.user_id=? AND c.idempotency_key=?""",
+                (self.user_id, idempotency_key),
+            ).fetchone()
+        if row is None:
+            return None
+        key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:12]
+        if str(row["request_fingerprint"] or "") != request_fingerprint:
+            logger.warning(
+                "Assistant conversation idempotency conflict key_hash=%s user_id=%s",
+                key_hash,
+                self.user_id,
+            )
+            raise AssistantConversationIdempotencyConflict(
+                "Idempotency key conflict: request content does not match the original creation."
+            )
+        if row["deleted_at"]:
+            logger.info(
+                "Assistant conversation idempotency replay rejected for deleted resource key_hash=%s user_id=%s",
+                key_hash,
+                self.user_id,
+            )
+            raise AssistantConversationIdempotencyConflict(
+                "Idempotency key belongs to a deleted conversation."
+            )
+        logger.debug(
+            "Assistant conversation idempotency replay key_hash=%s user_id=%s",
+            key_hash,
+            self.user_id,
+        )
+        return self._conversation(row)
 
     def list_conversations(self) -> tuple[dict[str, Any], ...]:
         with self._connect() as connection:
@@ -1006,7 +1111,7 @@ class AssistantRepository:
 
 
 _ASSISTANT_SCHEMA = """
-CREATE TABLE IF NOT EXISTS assistant_conversations (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,title TEXT NOT NULL,scope_type TEXT NOT NULL,scope_id TEXT,summary TEXT NOT NULL DEFAULT '',summary_payload TEXT NOT NULL DEFAULT '{}',summary_through_message_id TEXT,summary_version INTEGER NOT NULL DEFAULT 0,summary_updated_at TEXT,deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,last_message_at TEXT);
+CREATE TABLE IF NOT EXISTS assistant_conversations (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,title TEXT NOT NULL,scope_type TEXT NOT NULL,scope_id TEXT,summary TEXT NOT NULL DEFAULT '',summary_payload TEXT NOT NULL DEFAULT '{}',summary_through_message_id TEXT,summary_version INTEGER NOT NULL DEFAULT 0,summary_updated_at TEXT,deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,last_message_at TEXT,idempotency_key TEXT,request_fingerprint TEXT);
 CREATE TABLE IF NOT EXISTS assistant_messages (id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,status TEXT NOT NULL,provider TEXT,model TEXT,token_usage TEXT NOT NULL DEFAULT '{}',citations TEXT NOT NULL DEFAULT '[]',metadata TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS assistant_runs (id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,user_id TEXT NOT NULL,user_message_id TEXT NOT NULL,assistant_message_id TEXT NOT NULL,status TEXT NOT NULL,current_stage TEXT NOT NULL,analysis_job_id TEXT,pending_confirmation TEXT NOT NULL DEFAULT '{}',error TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0,broker_task_id TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,lease_owner TEXT,lease_expires_at TEXT,heartbeat_at TEXT,checkpoint_thread_id TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,execution_mode TEXT NOT NULL DEFAULT 'ask',execution_plan TEXT NOT NULL DEFAULT '{}',current_action_id TEXT,required_permission TEXT,next_event_sequence INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS assistant_run_events (run_id TEXT NOT NULL,sequence INTEGER NOT NULL,event_type TEXT NOT NULL,status TEXT NOT NULL,message TEXT NOT NULL,tool_name TEXT,payload TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL,PRIMARY KEY(run_id,sequence));
@@ -1033,6 +1138,34 @@ def _ensure_column(connection: Any, table: str, column: str, definition: str) ->
         columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _normalize_conversation_title(title: str) -> str:
+    return " ".join(title.split()) or "新对话"
+
+
+def _conversation_request_fingerprint(
+    *, title: str, scope_type: str, scope_id: UUID | None
+) -> str:
+    payload = {
+        "scope_id": str(scope_id) if scope_id else None,
+        "scope_type": scope_type.strip().lower(),
+        "title": _normalize_conversation_title(title),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_integrity_error(error: Exception) -> bool:
+    if isinstance(error, sqlite3.IntegrityError):
+        return True
+    try:
+        from sqlalchemy.exc import IntegrityError
+    except ImportError:
+        return False
+    return isinstance(error, IntegrityError)
 
 
 def _grant(row: Any) -> dict[str, Any]:

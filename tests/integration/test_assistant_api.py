@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -40,6 +41,85 @@ async def test_assistant_conversation_message_and_user_isolation(assistant_setti
         assert [item["role"] for item in messages.json()["messages"]] == ["user", "assistant"]
         hidden = await client.get(f"/api/v1/assistant/conversations/{conversation_id}", headers={"X-DataMind-User": "bob"})
         assert hidden.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_assistant_conversation_creation_is_idempotent_and_user_scoped(
+    assistant_settings,
+) -> None:
+    app = create_app(assistant_settings)
+    transport = httpx.ASGITransport(app=app)
+    alice = {
+        "X-DataMind-User": "alice",
+        "Idempotency-Key": "conversation-create-1",
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first, concurrent_replay = await asyncio.gather(
+            client.post(
+                "/api/v1/assistant/conversations",
+                json={"title": "  销售  复盘 ", "scope_type": "auto"},
+                headers=alice,
+            ),
+            client.post(
+                "/api/v1/assistant/conversations",
+                json={"title": "销售 复盘", "scope_type": "auto"},
+                headers=alice,
+            ),
+        )
+        assert first.status_code == concurrent_replay.status_code == 201
+        conversation_id = first.json()["conversation_id"]
+        assert concurrent_replay.json()["conversation_id"] == conversation_id
+
+        conflict = await client.post(
+            "/api/v1/assistant/conversations",
+            json={"title": "不同请求", "scope_type": "auto"},
+            headers=alice,
+        )
+        assert conflict.status_code == 409
+
+        bob = await client.post(
+            "/api/v1/assistant/conversations",
+            json={"title": "销售 复盘", "scope_type": "auto"},
+            headers={
+                "X-DataMind-User": "bob",
+                "Idempotency-Key": "conversation-create-1",
+            },
+        )
+        assert bob.status_code == 201
+        assert bob.json()["conversation_id"] != conversation_id
+
+        legacy_first = await client.post(
+            "/api/v1/assistant/conversations",
+            json={"scope_type": "auto"},
+            headers={"X-DataMind-User": "alice"},
+        )
+        legacy_second = await client.post(
+            "/api/v1/assistant/conversations",
+            json={"scope_type": "auto"},
+            headers={"X-DataMind-User": "alice"},
+        )
+        assert legacy_first.status_code == legacy_second.status_code == 201
+        assert legacy_first.json()["conversation_id"] != legacy_second.json()["conversation_id"]
+
+        deleted = await client.delete(
+            f"/api/v1/assistant/conversations/{conversation_id}",
+            headers={"X-DataMind-User": "alice"},
+        )
+        assert deleted.status_code == 204
+        deleted_replay = await client.post(
+            "/api/v1/assistant/conversations",
+            json={"title": "销售 复盘", "scope_type": "auto"},
+            headers=alice,
+        )
+        assert deleted_replay.status_code == 409
+        listed = await client.get(
+            "/api/v1/assistant/conversations",
+            headers={"X-DataMind-User": "alice"},
+        )
+        listed_ids = {
+            item["conversation_id"] for item in listed.json()["conversations"]
+        }
+        assert conversation_id not in listed_ids
 
 
 @pytest.mark.asyncio

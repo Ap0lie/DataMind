@@ -741,7 +741,7 @@ Remaining gaps:
 
 ## Kimi Assistant Page
 
-- Persistent user-scoped conversation history with create, rename, soft-delete, and cross-page run recovery.
+- Persistent user-scoped conversation history with create, rename, soft-delete, and cross-page run recovery. Conversation creation is database-idempotent per `(user_id, Idempotency-Key)` so retries, response loss, remounts, and concurrent tabs cannot duplicate one creation intent.
 - Cursor-based conversation summaries compress older completed messages after 12 unsummarized messages or 24,000 characters while preserving the latest eight messages verbatim.
 - User-scoped and asset-scoped long-term memory persists approved preferences, terminology, metric definitions, workflow preferences, and business context across conversations. Explicit durable statements are activated automatically; inferred candidates require confirmation in the Kimi workbench.
 - Trustworthy Memory v2 stores immutable semantic-memory version chains. Explicit conflicts supersede the current version transactionally; inferred conflicts remain pending. Structured summaries retain source message IDs, while every actual recall is recorded with lexical, embedding, scope, recency, and selection-reason evidence.
@@ -877,7 +877,7 @@ Authentication extensions:
 
 Kimi Assistant extensions:
 
-- `POST/GET /api/v1/assistant/conversations`
+- `POST/GET /api/v1/assistant/conversations`; `POST` optionally accepts `Idempotency-Key`, returns the original conversation for an identical replay, and returns `409` when the same key carries a different normalized title/scope or refers to a soft-deleted conversation.
 - `GET/PATCH/DELETE /api/v1/assistant/conversations/{conversation_id}`
 - `GET /api/v1/assistant/conversations/{conversation_id}/messages`
 - `POST /api/v1/assistant/conversations/{conversation_id}/messages`
@@ -1045,6 +1045,7 @@ migrations/
     0011_assistant_memory.py
     0012_trustworthy_memory.py
     0013_memory_effectiveness.py
+    0014_conversation_idempotency.py
 ```
 
 ---
@@ -1089,6 +1090,7 @@ Embedding configuration:
 - `assistant_memories` and conversation summary cursors are introduced by `0011_assistant_memory` and included in SQLite-to-PostgreSQL migration. The dedicated Memory Repository keeps long-term context separate from run/checkpoint persistence.
 - `0012_trustworthy_memory` adds immutable memory version chains, structured summaries, per-user settings, recall usage records, resumable background maintenance jobs, and validated episodic analysis experience. It reuses the application database and BGE cache rather than introducing a vector database.
 - `0013_memory_effectiveness` adds typed entity/predicate/value facts, per-candidate selection and suppression audit, idempotent user feedback, utility signals, reversible dormancy, and effectiveness aggregation. Background Kimi extraction remains outside the first-token path and every model candidate is revalidated against its source user message.
+- `0014_conversation_idempotency` adds nullable conversation creation keys and normalized request fingerprints with a unique `(user_id, idempotency_key)` index. Legacy clients without the header retain the existing create-every-time behavior; replay never restores a soft-deleted conversation.
 - `analysis_jobs.prompt_overrides` and `cleaning_jobs.prompt_overrides` are introduced by `0008_agent_prompt_overrides`; retries preserve the original stage preferences and reports retain them as audit metadata.
 - API and Worker share protected attachment storage; image and data-file bytes are never exposed as a public static directory.
 - Local lifespan and production Celery Beat run daily expiry cleanup; permanent purge is not exposed to Kimi or public HTTP APIs.
@@ -1265,6 +1267,7 @@ Implemented:
 - The deterministic Memory benchmark blocks releases on isolation, current-instruction precedence, superseded-use rate, Precision@8, Recall@8, conflict correctness, and 500-memory local retrieval latency.
 - Trustworthy Memory v2 reverified 2026-08-12: Ruff passed; 211 Unit, 82 Workflow, 89 Integration, and 9 Sandbox tests passed; deterministic release and Memory benchmarks passed; the frontend production build and all 60 desktop/mobile Playwright cases passed. Alembic `0001 -> 0012`, `0012 -> 0011`, and re-upgrade to `0012` passed on fresh SQLite and PostgreSQL 16 databases, including Repository conflict-chain and lease smoke tests.
 - Memory v3 reverified 2026-08-12: Ruff passed; 213 Unit, 82 Workflow, and 89 Integration tests passed; deterministic release and Memory v3 benchmarks passed with `Precision@8=97.5%`, `Recall@8=97.5%`, harmful-memory adoption `0%`, and 500-memory retrieval P95 `79.3ms`; the frontend production build and all 60 desktop/mobile Playwright cases passed. Alembic `0001 -> 0013`, `0013 -> 0012`, and re-upgrade to `0013` passed on fresh SQLite; the running PostgreSQL stack upgraded from `0012` to `0013`, and Docker Compose readiness passed.
+- Conversation creation idempotency reverified 2026-08-12: Ruff passed; 395 Unit/Workflow/Integration tests and all 62 desktop/mobile Playwright cases passed; the frontend production build passed; Alembic `0001 -> 0014`, `0014 -> 0013`, and re-upgrade to `0014` passed on fresh SQLite and PostgreSQL 16 databases. Browser response-loss coverage confirms that retries reuse one key without duplicating the conversation or expiring the session.
 - Kimi ask-mode report fast path, database-level Top-N report retrieval, bounded summary-plus-cursor context, segmented first-answer latency telemetry, combined token accounting, and Benchmark P50/P95 aggregation.
 - Kimi report revision with frozen analytical evidence, deterministic evidence fingerprints, no analysis rerun, and one audited primary report deliverable per message.
 - Assistant LangGraph and local/Celery execution path with ordered SSE tool/analysis/message events, immediate terminal cancellation, checkpoint-safe pause/resume, low-confidence semantic-plan confirmation, and analysis-job reuse. Cancel and final-answer commits are atomic so a late model response cannot overwrite the user's stop action.

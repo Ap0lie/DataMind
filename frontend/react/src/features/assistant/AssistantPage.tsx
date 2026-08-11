@@ -21,7 +21,15 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { apiDelete, apiGet, apiPatch, apiPost, apiPostForm } from "../../api-client";
+import {
+  apiDelete,
+  apiGet,
+  apiPatch,
+  apiPost,
+  apiPostForm,
+  apiPostIdempotent,
+  loadAuthUser,
+} from "../../api-client";
 import { AssistantAttachmentImage } from "./AssistantAttachmentImage";
 import { AssistantControlPanel } from "./AssistantControlPanel";
 import { AssistantConversationHeader } from "./AssistantConversationHeader";
@@ -58,6 +66,37 @@ type ConversationDialogState = {
   kind: "rename" | "delete";
   conversation: AssistantConversation;
 };
+
+const INITIAL_CONVERSATION_KEY_PREFIX = "datamind:assistant-initial-conversation-key:v1";
+
+function newConversationIdempotencyKey() {
+  return window.crypto.randomUUID();
+}
+
+function initialConversationStorageKey() {
+  return `${INITIAL_CONVERSATION_KEY_PREFIX}:${loadAuthUser()?.user_id ?? "anonymous"}`;
+}
+
+function getOrCreateInitialConversationKey() {
+  const storageKey = initialConversationStorageKey();
+  const sessionKey = window.sessionStorage.getItem(storageKey);
+  if (sessionKey) return sessionKey;
+  const sharedKey = window.localStorage.getItem(storageKey);
+  const key = sharedKey || newConversationIdempotencyKey();
+  window.sessionStorage.setItem(storageKey, key);
+  window.localStorage.setItem(storageKey, key);
+  return key;
+}
+
+function clearInitialConversationKey(expectedKey?: string) {
+  const storageKey = initialConversationStorageKey();
+  if (!expectedKey || window.sessionStorage.getItem(storageKey) === expectedKey) {
+    window.sessionStorage.removeItem(storageKey);
+  }
+  if (!expectedKey || window.localStorage.getItem(storageKey) === expectedKey) {
+    window.localStorage.removeItem(storageKey);
+  }
+}
 
 export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsChange, onActiveRunChange, onAssetsChanged, onOpenDataset, onOpenAnalysis, onOpenReport }: Props) {
   const [conversations, setConversations] = useState<AssistantConversation[]>([]);
@@ -178,7 +217,26 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
         if (!state.selected && state.conversations.length === 0) {
           const pendingCreation = createConversationPromiseRef.current;
           if (pendingCreation) await pendingCreation;
-          else if (!currentIdRef.current && conversationsRef.current.length === 0) await createConversation();
+          else if (!currentIdRef.current && conversationsRef.current.length === 0) {
+            const createIfStillMissing = async () => {
+              const latest = await refreshConversations();
+              if (latest.conversations.length > 0) {
+                clearInitialConversationKey();
+                return;
+              }
+              await createConversation("initialization");
+            };
+            if (navigator.locks) {
+              await navigator.locks.request(
+                `${INITIAL_CONVERSATION_KEY_PREFIX}:${loadAuthUser()?.user_id ?? "anonymous"}`,
+                createIfStillMissing,
+              );
+            } else {
+              await createIfStillMissing();
+            }
+          }
+        } else if (state.conversations.length > 0) {
+          clearInitialConversationKey();
         }
       } catch (cause) {
         setError(messageOf(cause));
@@ -229,16 +287,24 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, events, run?.status]);
 
-  const createConversation = () => {
+  const createConversation = (intent: "initialization" | "manual" = "manual") => {
     setHistorySearch("");
     if (createConversationPromiseRef.current) return createConversationPromiseRef.current;
 
     setCreatingConversation(true);
     setError(null);
+    const idempotencyKey = intent === "initialization"
+      ? getOrCreateInitialConversationKey()
+      : newConversationIdempotencyKey();
     const knownConversationIds = new Set(conversationsRef.current.map((item) => item.conversation_id));
     const request = (async (): Promise<AssistantConversation | null> => {
       try {
-        const created = await apiPost<AssistantConversation>("/assistant/conversations", { scope_type: "auto" });
+        const created = await apiPostIdempotent<AssistantConversation>(
+          "/assistant/conversations",
+          { scope_type: "auto" },
+          idempotencyKey,
+        );
+        if (intent === "initialization") clearInitialConversationKey(idempotencyKey);
         setConversations((items) => {
           const next = [created, ...items.filter((item) => item.conversation_id !== created.conversation_id)];
           conversationsRef.current = next;
@@ -257,6 +323,7 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
           const reconciledState = await refreshConversations();
           const reconciled = reconciledState.conversations.find((item) => !knownConversationIds.has(item.conversation_id));
           if (reconciled) {
+            if (intent === "initialization") clearInitialConversationKey(idempotencyKey);
             selectConversationId(reconciled.conversation_id);
             setHistoryOpen(false);
             return reconciled;

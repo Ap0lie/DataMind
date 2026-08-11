@@ -71,7 +71,11 @@ from app.services.tabular_import import (
     xlsx_sheet_previews_from_path,
 )
 from app.storage.assistant_memory_repository import AssistantMemoryRepository
-from app.storage.assistant_repository import AssistantRepository, StoredAssistantRun
+from app.storage.assistant_repository import (
+    AssistantConversationIdempotencyConflict,
+    AssistantRepository,
+    StoredAssistantRun,
+)
 from app.storage.dataset_store import DatasetStoreRepository
 
 router = APIRouter()
@@ -110,19 +114,28 @@ def _memory_response(memory: dict[str, Any]) -> AssistantMemoryResponse:
 
 @router.post("/conversations", response_model=AssistantConversationResponse, status_code=201)
 def create_conversation(
-    request: AssistantConversationCreateRequest, user_id: str = Depends(current_user_id)
+    request: AssistantConversationCreateRequest,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", max_length=255)
+    ] = None,
+    user_id: str = Depends(current_user_id),
 ) -> AssistantConversationResponse:
     settings = get_settings()
     if not settings.assistant_enabled:
         raise HTTPException(status_code=503, detail="Kimi assistant is disabled.")
+    if idempotency_key is not None and not idempotency_key.strip():
+        raise HTTPException(status_code=400, detail="Idempotency-Key cannot be empty.")
     try:
         return AssistantConversationResponse.model_validate(
             _repository(user_id).create_conversation(
                 title=request.title or "新对话",
                 scope_type=request.scope_type,
                 scope_id=request.scope_id,
+                idempotency_key=idempotency_key,
             )
         )
+    except AssistantConversationIdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

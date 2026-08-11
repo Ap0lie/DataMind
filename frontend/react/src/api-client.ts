@@ -2,6 +2,7 @@ const AUTH_STORAGE_KEY = "datamind.authUser.v1";
 export const AUTH_EXPIRED_EVENT = "datamind:auth-expired";
 const GET_RETRY_ATTEMPTS = 2;
 const GET_RETRY_DELAY_MS = 350;
+const IDEMPOTENT_POST_RETRY_ATTEMPTS = 2;
 
 export const API_BASE_URL =
   import.meta.env.VITE_DATAMIND_API_BASE_URL ?? "http://127.0.0.1:8010/api/v1";
@@ -62,6 +63,54 @@ export async function apiPost<T>(path: string, payload: unknown, timeoutMs = 300
   } finally {
     window.clearTimeout(timer);
   }
+}
+
+export async function apiPostIdempotent<T>(
+  path: string,
+  payload: unknown,
+  idempotencyKey: string,
+  timeoutMs = 30000,
+): Promise<T> {
+  const key = idempotencyKey.trim();
+  if (!key) throw new Error("Idempotency key is required.");
+  let lastError: unknown = new Error("Request failed.");
+  for (let attempt = 0; attempt < IDEMPOTENT_POST_RETRY_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetchApi(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": key,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }, false);
+      if (!response.ok) {
+        const error = new Error(await readableError(response));
+        if (attempt + 1 < IDEMPOTENT_POST_RETRY_ATTEMPTS && isTransientGetStatus(response.status)) {
+          lastError = error;
+          await waitForGetRetry(attempt);
+          continue;
+        }
+        throw error;
+      }
+      return (await response.json()) as T;
+    } catch (error) {
+      lastError = error;
+      const retryable = error instanceof DOMException && error.name === "AbortError"
+        || isFetchNetworkError(error);
+      if (attempt + 1 < IDEMPOTENT_POST_RETRY_ATTEMPTS && retryable) {
+        await waitForGetRetry(attempt);
+        continue;
+      }
+      throw normalizeFetchError(error);
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+  throw normalizeFetchError(lastError);
 }
 
 export async function apiPostForm<T>(path: string, formData: FormData, timeoutMs = 30000): Promise<T> {
@@ -288,14 +337,14 @@ export function saveAuthUser(user: AuthUser | null) {
   }
 }
 
-async function fetchApi(path: string, init?: RequestInit) {
+async function fetchApi(path: string, init?: RequestInit, allowLocalFallback = true) {
   const requestInit = withAuthHeader(init);
   try {
     const response = await fetch(`${API_BASE_URL}${path}`, requestInit);
     await notifyAuthenticationFailure(path, response);
     return response;
   } catch (error) {
-    if (!isFetchNetworkError(error) || !API_FALLBACK_BASE_URL || requestInit.signal?.aborted) throw error;
+    if (!allowLocalFallback || !isFetchNetworkError(error) || !API_FALLBACK_BASE_URL || requestInit.signal?.aborted) throw error;
     const response = await fetch(`${API_FALLBACK_BASE_URL}${path}`, requestInit);
     await notifyAuthenticationFailure(path, response);
     return response;
