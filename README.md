@@ -43,18 +43,20 @@ deployed microservices.
 
 [![DataMind system architecture](docs/assets/datamind-architecture-en.png)](docs/assets/datamind-architecture-en.svg)
 
-<p align="center"><sub>Product experience → API and control plane → LangGraph agent runtime → durable services and execution boundaries. Select the image to open the vector version.</sub></p>
+<p align="center"><sub>Product experience → API and control plane → LangGraph agent runtime → governed model execution and durable services. Select the image to open the vector version.</sub></p>
 
-The shared runtime-services boundary is bidirectional. LangGraph reads and writes
-data and checkpoints, invokes BGE, the Python Runner, governed tools, and model
-providers, and exchanges jobs and events through Redis/Celery. Solid horizontal
-arrows show workflow control; the dashed path shows bounded repair or replanning.
+Every model call crosses the Node Harness, shared context budget, Model Router,
+and provider boundary. The separate runtime-services boundary is bidirectional:
+LangGraph reads and writes data and checkpoints, invokes BGE, the Python Runner
+and governed tools, and exchanges jobs and events through Redis/Celery. Solid
+horizontal arrows show workflow control; the dashed path shows bounded repair or
+replanning.
 
 ## End-to-End Workflow
 
 [![DataMind end-to-end workflow](docs/assets/datamind-workflow-en.png)](docs/assets/datamind-workflow-en.svg)
 
-<p align="center"><sub>Trusted data preparation → bounded analysis and verification → evidence-backed delivery and follow-up. Select the image to open the vector version.</sub></p>
+<p align="center"><sub>Trusted data preparation → governed model context → bounded analysis and verification → evidence-backed delivery and follow-up. Select the image to open the vector version.</sub></p>
 
 The loops are bounded by tool, decision, token, retry, and wall-clock budgets.
 Failed generated Python code is returned to the model for at most two repairs;

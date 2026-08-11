@@ -6,8 +6,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDir = resolve(root, "docs", "assets");
 const width = 1400;
-const height = 795;
-const workflowHeight = 685;
+const height = 870;
+const workflowHeight = 716;
 
 const locales = {
   en: {
@@ -45,9 +45,12 @@ const locales = {
       ["Python Runner", "Disposable container", "No network"],
       ["Checkpoints", "Resume · Idempotency", "Ordered events"],
       ["Tool runtime", "Schema · Policy", "Invocation"],
-      ["LLM providers", "DeepSeek · Kimi", "Role routing"],
       ["Redis + Celery", "Broker · Worker", "Beat"],
     ],
+    modelBoundary: {
+      label: "Model execution boundary",
+      steps: ["Node Harness", "Context Budget", "Model Router", "LLM Provider"],
+    },
     flowLabels: [
       "HTTPS",
       "dispatch",
@@ -85,9 +88,12 @@ const locales = {
       ["Python Runner", "一次性容器", "禁止网络"],
       ["Checkpoint", "恢复 · 幂等", "有序事件"],
       ["工具运行时", "Schema · 策略", "调用控制"],
-      ["LLM Provider", "DeepSeek · Kimi", "按角色路由"],
       ["Redis + Celery", "Broker · Worker", "Beat"],
     ],
+    modelBoundary: {
+      label: "模型执行边界",
+      steps: ["节点 Harness", "上下文预算", "模型路由", "LLM Provider"],
+    },
     flowLabels: [
       "HTTPS",
       "任务调度",
@@ -130,6 +136,8 @@ const workflowLocales = {
       "bounded repair / replan",
       "Durable jobs · checkpoints · ordered SSE events",
     ],
+    modelGuard:
+      "Every model call · Node Harness → budget evaluation → deterministic reduction → Router gate",
   },
   zh: {
     output: "datamind-workflow-zh.svg",
@@ -155,6 +163,7 @@ const workflowLocales = {
       ["后续行动", "追问 · 重新分析", "可审计 · 可恢复", "control"],
     ],
     labels: ["有边界的修复 / 重规划", "持久任务 · Checkpoint · 有序 SSE 事件"],
+    modelGuard: "所有模型调用 · 节点 Harness → 预算评估 → 确定性压缩 → Router 门禁",
   },
 };
 
@@ -240,12 +249,12 @@ function render(locale) {
   const experienceX = [63, 388, 713, 1038];
   const controlX = [...experienceX];
   const agentX = Array.from({ length: 7 }, (_, index) => 22 + index * 196);
+  const infrastructureX = Array.from({ length: 6 }, (_, index) => 22 + index * 229);
   const agentTones = ["loop", "loop", "loop", "verify", "verify", "report", "loop"];
   const infrastructureTones = [
     "infrastructure",
     "infrastructure",
     "runner",
-    "infrastructure",
     "infrastructure",
     "infrastructure",
     "infrastructure",
@@ -263,7 +272,7 @@ function render(locale) {
   parts.push(band(locale.layers[0], 16, 150, "#f8fffc"));
   parts.push(band(locale.layers[1], 181, 140, "#f8fbff"));
   parts.push(band(locale.layers[2], 336, 220, "#fbfdfc"));
-  parts.push(band(locale.layers[3], 571, 208, "#fafbfc"));
+  parts.push(band(locale.layers[3], 571, 283, "#fafbfc"));
 
   locale.experience.forEach(([title, detail], index) => {
     parts.push(
@@ -311,10 +320,10 @@ function render(locale) {
   locale.infrastructure.forEach(([title, ...details], index) => {
     parts.push(
       card({
-        x: agentX[index],
-        y: 648,
-        w: 180,
-        h: 124,
+        x: infrastructureX[index],
+        y: 714,
+        w: 211,
+        h: 128,
         title,
         details,
         tone: infrastructureTones[index],
@@ -333,14 +342,34 @@ function render(locale) {
   }
 
   const agentCenters = agentX.map((x) => x + 90);
+  parts.push(sharedConnection(700, 556, 700, 610));
   parts.push(
-    `<rect x="226" y="604" width="948" height="30" rx="8" fill="#eef2f7" stroke="#94a3b8"/>`,
+    `<rect x="226" y="610" width="948" height="46" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>`,
   );
   parts.push(
-    `<text x="700" y="624" text-anchor="middle" class="service-bus">${escapeXml(locale.flowLabels[3])}</text>`,
+    `<text x="244" y="638" class="service-bus">${escapeXml(locale.modelBoundary.label)}</text>`,
   );
-  parts.push(sharedConnection(700, 556, 700, 604));
-  agentCenters.forEach((x) => parts.push(serviceLink(x, 634, x, 648)));
+  const boundaryX = [452, 638, 824, 1010];
+  locale.modelBoundary.steps.forEach((step, index) => {
+    parts.push(
+      `<rect x="${boundaryX[index]}" y="618" width="148" height="30" rx="7" fill="#eff6ff" stroke="#60a5fa"/>`,
+    );
+    parts.push(
+      `<text x="${boundaryX[index] + 74}" y="638" text-anchor="middle" class="service-bus" fill="#1e3a8a">${escapeXml(step)}</text>`,
+    );
+    if (index < boundaryX.length - 1) {
+      parts.push(arrow(boundaryX[index] + 148, 633, boundaryX[index + 1], 633));
+    }
+  });
+  parts.push(
+    `<rect x="226" y="670" width="948" height="30" rx="8" fill="#eef2f7" stroke="#94a3b8"/>`,
+  );
+  parts.push(
+    `<text x="700" y="690" text-anchor="middle" class="service-bus">${escapeXml(locale.flowLabels[3])}</text>`,
+  );
+  parts.push(serviceLink(700, 656, 700, 670));
+  const infrastructureCenters = infrastructureX.map((x) => x + 105.5);
+  infrastructureCenters.forEach((x) => parts.push(serviceLink(x, 700, x, 714)));
 
   const reportCenter = agentCenters[5];
   const plannerCenter = agentCenters[1];
@@ -365,8 +394,14 @@ function renderWorkflow(locale) {
   ];
 
   parts.push(band(locale.layers[0], 16, 180, "#f8fffc"));
-  parts.push(band(locale.layers[1], 211, 260, "#fbfdfc"));
-  parts.push(band(locale.layers[2], 486, 183, "#fafbff"));
+  parts.push(
+    `<rect x="230" y="204" width="940" height="28" rx="8" fill="#eff6ff" stroke="#60a5fa"/>`,
+  );
+  parts.push(
+    `<text x="700" y="223" text-anchor="middle" class="service-bus" fill="#1e3a8a">${escapeXml(locale.modelGuard)}</text>`,
+  );
+  parts.push(band(locale.layers[1], 242, 260, "#fbfdfc"));
+  parts.push(band(locale.layers[2], 517, 183, "#fafbff"));
 
   locale.preparation.forEach(([title, ...rest], index) => {
     const tone = rest.pop();
@@ -389,7 +424,7 @@ function renderWorkflow(locale) {
     parts.push(
       card({
         x: analysisX[index],
-        y: 261,
+        y: 292,
         w: 240,
         h: 130,
         title,
@@ -405,7 +440,7 @@ function renderWorkflow(locale) {
     parts.push(
       card({
         x: deliveryX[index],
-        y: 536,
+        y: 567,
         w: 300,
         h: 110,
         title,
@@ -420,28 +455,28 @@ function renderWorkflow(locale) {
     parts.push(arrow(preparationX[index] + 290, 118, preparationX[index + 1], 118));
   }
   parts.push(
-    `<path d="M 1183 171 V 203 H 160 V 261" class="arrow" marker-end="url(#arrow)"/>`,
+    `<path d="M 1183 171 V 236 H 160 V 292" class="arrow" marker-end="url(#arrow)"/>`,
   );
 
   for (let index = 0; index < analysisX.length - 1; index += 1) {
-    parts.push(arrow(analysisX[index] + 240, 326, analysisX[index + 1], 326));
+    parts.push(arrow(analysisX[index] + 240, 357, analysisX[index + 1], 357));
   }
   parts.push(
-    `<path d="M 1240 391 C 1240 425, 160 425, 160 391" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>`,
+    `<path d="M 1240 422 C 1240 456, 160 456, 160 422" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>`,
   );
-  parts.push(label(locale.labels[0], 700, 418));
+  parts.push(label(locale.labels[0], 700, 449));
   parts.push(
-    `<rect x="230" y="439" width="940" height="24" rx="8" fill="#eef2f7" stroke="#94a3b8"/>`,
-  );
-  parts.push(
-    `<text x="700" y="456" text-anchor="middle" class="service-bus">${escapeXml(locale.labels[1])}</text>`,
+    `<rect x="230" y="470" width="940" height="24" rx="8" fill="#eef2f7" stroke="#94a3b8"/>`,
   );
   parts.push(
-    `<path d="M 1360 326 H 1372 V 479 H 350 V 536" class="arrow" marker-end="url(#arrow)"/>`,
+    `<text x="700" y="487" text-anchor="middle" class="service-bus">${escapeXml(locale.labels[1])}</text>`,
+  );
+  parts.push(
+    `<path d="M 1360 357 H 1372 V 510 H 350 V 567" class="arrow" marker-end="url(#arrow)"/>`,
   );
 
   for (let index = 0; index < deliveryX.length - 1; index += 1) {
-    parts.push(arrow(deliveryX[index] + 300, 591, deliveryX[index + 1], 591));
+    parts.push(arrow(deliveryX[index] + 300, 622, deliveryX[index + 1], 622));
   }
 
   parts.push(`</svg>`);

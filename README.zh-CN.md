@@ -40,17 +40,18 @@ LangGraph 专职节点。它们共享一个可持久化的 Workflow State，并�
 
 [![DataMind 系统架构](docs/assets/datamind-architecture-zh.png)](docs/assets/datamind-architecture-zh.svg)
 
-<p align="center"><sub>产品交互层 → API 与控制平面 → LangGraph 数据智能体运行时 → 持久服务与执行边界。点击图片可打开矢量版本。</sub></p>
+<p align="center"><sub>产品交互层 → API 与控制平面 → LangGraph 数据智能体运行时 → 受控模型执行与持久服务。点击图片可打开矢量版本。</sub></p>
 
-运行时与底层服务之间是双向关系：LangGraph 读写数据与 Checkpoint，调用 BGE、
-Python Runner、受控工具和模型服务，并通过 Redis/Celery 交换任务与事件。横向实线
-表示工作流控制，虚线回路表示有边界的修复或重规划。
+每次模型调用都会经过节点 Harness、统一上下文预算、模型路由和 Provider 边界。
+独立的运行支撑边界保持双向关系：LangGraph 读写数据与 Checkpoint，调用 BGE、
+Python Runner 和受控工具，并通过 Redis/Celery 交换任务与事件。横向实线表示工作流
+控制，虚线回路表示有边界的修复或重规划。
 
 ## 端到端流程
 
 [![DataMind 端到端流程](docs/assets/datamind-workflow-zh.png)](docs/assets/datamind-workflow-zh.svg)
 
-<p align="center"><sub>可信数据准备 → 有边界的自主分析与验证 → 证据化交付与后续行动。点击图片可打开矢量版本。</sub></p>
+<p align="center"><sub>可信数据准备 → 受控模型上下文 → 有边界的自主分析与验证 → 证据化交付与后续行动。点击图片可打开矢量版本。</sub></p>
 
 所有 Loop 都受工具次数、决策次数、Token、重试和总时限约束。LLM 生成的
 Python 代码执行失败后，错误会被反馈给模型，最多进行两次修复；无法获得可信结果时，
