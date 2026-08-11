@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -10,6 +10,7 @@ from PIL import Image
 
 from app.core.settings import get_settings
 from app.main import create_app
+from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.assistant_repository import AssistantRepository
 
 
@@ -31,7 +32,7 @@ async def test_assistant_conversation_message_and_user_isolation(assistant_setti
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         created = await client.post("/api/v1/assistant/conversations", json={"scope_type": "auto"}, headers={"X-DataMind-User": "alice"})
-        assert created.status_code == 201
+        assert created.status_code == 201, created.text
         conversation_id = created.json()["conversation_id"]
         run = await client.post(f"/api/v1/assistant/conversations/{conversation_id}/messages", json={"content": "总结我的报告", "attachment_ids": []}, headers={"X-DataMind-User": "alice"})
         assert run.status_code == 202
@@ -39,6 +40,107 @@ async def test_assistant_conversation_message_and_user_isolation(assistant_setti
         assert [item["role"] for item in messages.json()["messages"]] == ["user", "assistant"]
         hidden = await client.get(f"/api/v1/assistant/conversations/{conversation_id}", headers={"X-DataMind-User": "bob"})
         assert hidden.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_assistant_memory_crud_confirmation_and_user_isolation(assistant_settings) -> None:
+    app = create_app(assistant_settings)
+    transport = httpx.ASGITransport(app=app)
+    alice = {"X-DataMind-User": "alice"}
+    bob = {"X-DataMind-User": "bob"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/assistant/memories",
+            json={
+                "memory_type": "workflow_preference",
+                "scope_type": "user",
+                "content": "默认使用中文生成简洁报告",
+                "pinned": True,
+            },
+            headers=alice,
+        )
+        assert created.status_code == 201, created.text
+        memory_id = created.json()["memory_id"]
+        assert created.json()["status"] == "active"
+        assert created.json()["pinned"] is True
+
+        listed = await client.get("/api/v1/assistant/memories", headers=alice)
+        assert [item["memory_id"] for item in listed.json()["memories"]] == [memory_id]
+        hidden = await client.get("/api/v1/assistant/memories", headers=bob)
+        assert hidden.json()["memories"] == []
+
+        updated = await client.patch(
+            f"/api/v1/assistant/memories/{memory_id}",
+            json={"content": "默认使用中文生成详细报告", "pinned": False},
+            headers=alice,
+        )
+        assert updated.status_code == 200
+        assert updated.json()["content"].endswith("详细报告")
+        updated_id = updated.json()["memory_id"]
+        assert updated_id != memory_id
+        assert updated.json()["version"] == 2
+
+        history = await client.get(
+            f"/api/v1/assistant/memories/{updated_id}/history",
+            headers=alice,
+        )
+        assert history.status_code == 200
+        assert [item["version"] for item in history.json()["memories"]] == [2, 1]
+
+        run_id = uuid4()
+        memory_repository = AssistantMemoryRepository(
+            assistant_settings.dataset_store_path,
+            user_id="alice",
+        )
+        recalled = memory_repository.get(UUID(updated_id))
+        recalled.update(
+            relevance_score=0.92,
+            score_breakdown={
+                "lexical": 0.8,
+                "embedding": 0.7,
+                "scope": 1.0,
+                "recency": 1.0,
+            },
+            recall_reason="当前问题与已确认报告偏好相关",
+        )
+        memory_repository.record_usage(run_id=run_id, memory=recalled)
+        usage = await client.get(
+            "/api/v1/assistant/memory-usage",
+            params={"run_id": str(run_id)},
+            headers=alice,
+        )
+        assert usage.status_code == 200
+        assert usage.json()["usages"][0]["memory_id"] == updated_id
+        assert usage.json()["usages"][0]["reason"] == "当前问题与已确认报告偏好相关"
+        hidden_usage = await client.get(
+            "/api/v1/assistant/memory-usage",
+            params={"run_id": str(run_id)},
+            headers=bob,
+        )
+        assert hidden_usage.json()["usages"] == []
+
+        settings = await client.patch(
+            "/api/v1/assistant/memory-settings",
+            json={"enabled": False},
+            headers=alice,
+        )
+        assert settings.status_code == 200
+        assert settings.json()["enabled"] is False
+        assert (await client.get("/api/v1/assistant/memory-settings", headers=bob)).json()[
+            "enabled"
+        ] is True
+
+        recycled = await client.delete(
+            f"/api/v1/assistant/memories/{updated_id}",
+            headers=alice,
+        )
+        assert recycled.json()["status"] == "recycled"
+        restored = await client.post(
+            f"/api/v1/assistant/memories/{updated_id}/restore",
+            json={},
+            headers=alice,
+        )
+        assert restored.json()["status"] == "active"
 
 
 @pytest.mark.asyncio

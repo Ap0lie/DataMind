@@ -71,6 +71,7 @@ from app.analysis.workflow_prompt_context import (
 from app.analysis.workflow_prompt_context import (
     prompt_system as _prompt_system,
 )
+from app.assistant.memory import AssistantMemoryService
 from app.core.settings import get_settings
 from app.harness.node import NodeExecutionHarness, NodeHarnessPolicy
 from app.schemas.analysis import (
@@ -98,6 +99,7 @@ from app.schemas.analysis import (
     ValidationIssueResponse,
     WorkflowTraceNodeResponse,
 )
+from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.dataset_store import DatasetStoreRepository
 
 PLANNER_NODE = "planner"
@@ -217,6 +219,7 @@ class AnalysisWorkflowState(TypedDict):
     profile: NotRequired[DatasetProfileResponse]
     analysis_framework: NotRequired[AnalysisFrameworkResponse]
     analysis_contract: NotRequired[AnalysisContractResponse]
+    analysis_experiences: NotRequired[tuple[dict[str, Any], ...]]
     statistical_verification: NotRequired[StatisticalVerificationResponse]
     statistical_validation_issues: NotRequired[tuple[ValidationIssueResponse, ...]]
     analysis_lineage: NotRequired[AnalysisLineageResponse]
@@ -648,6 +651,20 @@ def _planner_node(
         records = multi_dataset_preparation.records
         profile = multi_dataset_preparation.profile
         multi_dataset_context = multi_dataset_preparation.response
+        memory_service = AssistantMemoryService(
+            repository=AssistantMemoryRepository(
+                repository.root_path,
+                user_id=repository.user_id,
+            ),
+            store=repository,
+        )
+        analysis_experiences = memory_service.retrieve_analysis_experiences(
+            question=state["question"],
+            dataset_id=dataset_id,
+            dataset_group_id=state.get("dataset_group_id"),
+            additional_dataset_ids=state.get("additional_dataset_ids", ()),
+            run_id=state["run_id"],
+        )
         planned_analysis = _plan(state["question"], profile)
         planner_source = "rules"
         model_router_provider: str | None = None
@@ -663,6 +680,7 @@ def _planner_node(
                         question=state["question"],
                         profile=profile,
                         multi_dataset_context=multi_dataset_context,
+                        analysis_experiences=analysis_experiences,
                     ),
                     temperature=0.1,
                     max_tokens=700,
@@ -788,6 +806,7 @@ def _planner_node(
             "planner_metadata": planner_metadata,
             "planner_decision": semantic_decision,
             "analysis_contract": analysis_contract,
+            "analysis_experiences": analysis_experiences,
             "plan_validation_issues": plan_validation_issues,
             "planner_source": planner_source,
             "analysis_fast_path": _analysis_fast_path_eligible(
@@ -5464,6 +5483,7 @@ def _planner_messages(
     question: str,
     profile: DatasetProfileResponse,
     multi_dataset_context: MultiDatasetProfileResponse | None = None,
+    analysis_experiences: tuple[dict[str, Any], ...] = (),
 ) -> list[dict[str, str]]:
     schema = {
         "columns": [
@@ -5480,6 +5500,9 @@ def _planner_messages(
         "experience_context": _experience_context(
             "planner", tuple(column.name for column in profile.columns)
         ),
+        "validated_analysis_experiences": _compact_analysis_experiences(
+            analysis_experiences
+        ),
     }
     return [
         {
@@ -5489,7 +5512,9 @@ def _planner_messages(
                 "route, category_column, metric_column, time_column, steps. "
                 "route must be one of sql, python, hybrid. Use only provided column names. "
                 "Use experience_context as planning guidance, not as data evidence. For joined data, "
-                "use multi_dataset_context to respect field provenance, skipped joins, and row expansion."
+                "use multi_dataset_context to respect field provenance, skipped joins, and row expansion. "
+                "validated_analysis_experiences are read-only route evidence: reconsider their route, "
+                "columns, joins, and permissions against the current request before using them."
             ),
         },
         {
@@ -5500,6 +5525,28 @@ def _planner_messages(
             ),
         },
     ]
+
+
+def _compact_analysis_experiences(
+    experiences: tuple[dict[str, Any], ...],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for item in experiences[:3]:
+        value = item.get("structured_value")
+        value = value if isinstance(value, dict) else {}
+        output.append(
+            {
+                "experience_id": str(item["memory_id"]),
+                "summary": _truncate_text(str(item.get("content") or ""), 500),
+                "analysis_contract": value.get("analysis_contract") or {},
+                "semantic_model_id": value.get("semantic_model_id"),
+                "semantic_model_version": value.get("semantic_model_version"),
+                "join_plan": value.get("join_plan") or [],
+                "tool_sequence": value.get("tool_sequence") or [],
+                "result_summary": value.get("result_summary") or {},
+            }
+        )
+    return output
 
 
 def _report_messages(

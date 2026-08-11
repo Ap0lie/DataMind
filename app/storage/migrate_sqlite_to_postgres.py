@@ -35,6 +35,10 @@ TABLES = (
     "assistant_permission_grants",
     "assistant_action_log",
     "assistant_import_batches",
+    "assistant_memories",
+    "assistant_memory_settings",
+    "assistant_memory_usage",
+    "assistant_memory_maintenance_jobs",
     "user_sessions",
 )
 

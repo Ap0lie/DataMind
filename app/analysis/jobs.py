@@ -8,8 +8,10 @@ from threading import Event, Lock, Thread
 from uuid import UUID
 
 from app.analysis.runtime import build_analysis_runner
+from app.assistant.memory import AssistantMemoryService
 from app.core.settings import get_settings
 from app.schemas.analysis import AnalysisRunResponse, MultimodalInputResponse
+from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.dataset_store import DatasetStoreRepository
 
 logger = logging.getLogger(__name__)
@@ -309,3 +311,25 @@ def _complete_job(
         report_revision_count=result.report_revision_count,
         report_terminal_reason=result.report_terminal_reason,
     )
+    try:
+        experience = AssistantMemoryService(
+            repository=AssistantMemoryRepository(
+                repository.root_path,
+                user_id=repository.user_id,
+            ),
+            store=repository,
+        ).save_analysis_experience(job_id)
+        if experience is not None:
+            repository.append_analysis_job_event(
+                job_id,
+                node="memory",
+                status="completed",
+                message="Validated analysis experience saved for future planning.",
+                event_type="memory.experience_saved",
+                payload={"memory_id": str(experience["memory_id"])},
+            )
+    except Exception:
+        logger.exception(
+            "Unable to save validated analysis experience for job %s.",
+            job_id,
+        )

@@ -52,6 +52,17 @@ jobs:
           path: artifacts/benchmarks/release
           if-no-files-found: warn
 
+      - name: Trustworthy memory benchmark
+        run: python -m app.evaluation.cli run --suite memory --output artifacts/benchmarks/memory
+
+      - name: Upload memory benchmark
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datamind-memory-benchmark
+          path: artifacts/benchmarks/memory
+          if-no-files-found: warn
+
       - uses: actions/setup-node@v4
         with:
           node-version: "24"

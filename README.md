@@ -32,7 +32,7 @@ a permission-aware conversational workspace over the same DataMind assets.
 | Semantic understanding | Column roles, bilingual semantic ranking, versioned metric DSL, relationship graph, Join cardinality and grain checks |
 | Autonomous analysis | Planner, safe SQL, sandboxed Python, bounded repair loops, deterministic fallback, and resumable jobs |
 | Trustworthy output | Statistical verification, evidence IDs, lineage, adversarial review, report repair, and auditable commit |
-| Kimi workspace | User-scoped conversations, image/data attachments, asset retrieval, read/execute modes, grants, action logs, and recycle bin |
+| Kimi workspace | User-scoped conversations, structured summaries, trustworthy versioned memory, read-only analysis experience, image/data attachments, grants, audit, and recycle bin |
 | Production runtime | PostgreSQL, Redis, Celery, checkpoint recovery, SSE events, Cookie sessions, CSRF, rate limits, and Docker sandboxing |
 
 ## Architecture
@@ -153,6 +153,9 @@ Compose. The most important settings are:
 | `DATAMIND_PYTHON_RUNNER_URL` | Controlled container runner endpoint |
 | `DATAMIND_AGENT_LOOP_DEFAULT_MODE` | Default `loop`; `legacy` is compatibility mode |
 | `DATAMIND_SEMANTIC_EMBEDDING_ENABLED` | Enables local semantic embedding ranking |
+| `DATAMIND_ASSISTANT_MEMORY_ENABLED` | Enables Kimi conversation summaries and long-term memory |
+| `DATAMIND_ASSISTANT_MEMORY_RELEVANCE_THRESHOLD` | Minimum combined relevance for ordinary recalled memory |
+| `DATAMIND_ASSISTANT_MEMORY_EXPERIENCE_ENABLED` | Enables validated read-only route experience for Planner |
 
 Agent-level provider routing is configured independently. Kimi and DeepSeek are
 defaults, not hard requirements; tests use the mock provider.
@@ -169,6 +172,16 @@ requires confirmation and remains recoverable for 30 days.
 Attachments support JPEG, PNG, WebP, CSV, XLSX, JSON, and TXT. Large data files are
 streamed to protected staging storage and parsed one file at a time. Final answers
 stream real provider tokens and may cite only assets actually read during the run.
+
+Kimi memory has three explicit layers: sourced structured summaries compress older
+messages; versioned semantic memory carries approved preferences, terminology,
+metric definitions, and business context; task checkpoints only resume one run.
+Explicit conflicting instructions create a new active version and supersede the old
+one, while inferred conflicts require confirmation. A separate episodic store keeps
+only statistically validated analysis experience as read-only Planner evidence; it
+never executes tools or bypasses fresh planning. Recalled memory is relevance gated,
+MMR-ranked, user/asset isolated, auditable per run, and can be disabled without
+deleting stored memory or current-conversation summaries.
 
 ## MCP Status
 
@@ -196,6 +209,7 @@ python -m pytest -o addopts="" -m sandbox
 # Project benchmark tests and deterministic release gate.
 python -m pytest -o addopts="" -m benchmark
 python -m app.evaluation.cli run --suite release
+python -m app.evaluation.cli run --suite memory
 
 npm --prefix frontend/react run build
 npm --prefix frontend/react run test:e2e

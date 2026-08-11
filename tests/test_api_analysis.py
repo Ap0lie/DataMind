@@ -14,6 +14,7 @@ from app.core.settings import get_settings
 from app.main import create_app
 from app.mcp.tool_schemas import ModelRouterResponse
 from app.schemas.analysis import AnalysisRunRequest, DatasetJoinConfig
+from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.dataset_store import DatasetStoreRepository
 
 
@@ -531,6 +532,7 @@ async def test_multi_dataset_join_suggestions_run_and_job_retry(tmp_path, monkey
                 final_job = payload
                 break
             await asyncio.sleep(0.1)
+
         result_response = await client.get(f"/api/v1/analysis/jobs/{job_id}/result")
         retry_response = await client.post(f"/api/v1/analysis/jobs/{job_id}/retry")
         retry_job_id = retry_response.json()["job_id"]
@@ -1038,6 +1040,10 @@ async def test_analysis_job_lifecycle_and_user_scope(tmp_path, monkeypatch) -> N
                 break
             await asyncio.sleep(0.1)
 
+        experiences = AssistantMemoryRepository(
+            str(tmp_path), user_id="alice"
+        ).list(memory_kind="episodic", status="active")
+
     get_settings.cache_clear()
     assert create_job_response.status_code == 202
     assert create_job_response.json()["status"] == "queued"
@@ -1055,6 +1061,8 @@ async def test_analysis_job_lifecycle_and_user_scope(tmp_path, monkeypatch) -> N
     assert retry_response.json()["retry_of"] == job_id
     assert retry_final_job is not None
     assert retry_final_job["status"] == "completed"
+    assert len(experiences) == 1
+    assert experiences[0]["memory_type"] == "analysis_experience"
 
 
 def test_queued_analysis_job_can_be_canceled(tmp_path) -> None:

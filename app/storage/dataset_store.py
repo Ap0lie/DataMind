@@ -108,6 +108,10 @@ class DatasetStoreRepository(AuthRepositoryMixin):
     def root_path(self) -> str:
         return str(self._root)
 
+    @property
+    def user_id(self) -> str:
+        return self._user_id
+
     def create_dataset(
         self,
         *,

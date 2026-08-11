@@ -132,6 +132,10 @@ class AssistantRepository:
                 ("assistant_attachments", "import_status", "TEXT"),
                 ("assistant_attachments", "dataset_id", "TEXT"),
                 ("assistant_attachments", "import_batch_id", "TEXT"),
+                ("assistant_conversations", "summary_through_message_id", "TEXT"),
+                ("assistant_conversations", "summary_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("assistant_conversations", "summary_updated_at", "TEXT"),
+                ("assistant_conversations", "summary_payload", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 _ensure_column(connection, table, column, definition)
             connection.execute(
@@ -210,6 +214,41 @@ class AssistantRepository:
             )
         return self.get_conversation(conversation_id)
 
+    def update_conversation_summary(
+        self,
+        conversation_id: UUID,
+        *,
+        summary: str,
+        through_message_id: UUID,
+        summary_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        cursor = self.get_message(through_message_id)
+        if cursor["conversation_id"] != conversation_id:
+            raise RuntimeError("Assistant summary cursor does not belong to this conversation.")
+        now = _now()
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE assistant_conversations
+                SET summary=?, summary_payload=?, summary_through_message_id=?,
+                    summary_version=summary_version+1,
+                    summary_updated_at=?, updated_at=?
+                WHERE id=? AND user_id=? AND deleted_at IS NULL
+                """,
+                (
+                    summary,
+                    _json(summary_payload or {}),
+                    str(through_message_id),
+                    now,
+                    now,
+                    str(conversation_id),
+                    self.user_id,
+                ),
+            )
+        if result.rowcount != 1:
+            raise RuntimeError("Assistant conversation was not found.")
+        return self.get_conversation(conversation_id)
+
     def delete_conversation(self, conversation_id: UUID) -> None:
         self.get_conversation(conversation_id)
         now = _now()
@@ -261,6 +300,35 @@ class AssistantRepository:
             rows = connection.execute(
                 "SELECT * FROM assistant_messages WHERE conversation_id=? AND user_id=? ORDER BY created_at ASC LIMIT ?",
                 (str(conversation_id), self.user_id, max(1, min(limit, 500))),
+            ).fetchall()
+        return tuple(self._message(row) for row in rows)
+
+    def list_messages_after(
+        self,
+        conversation_id: UUID,
+        *,
+        after_message_id: UUID | None,
+        limit: int = 500,
+    ) -> tuple[dict[str, Any], ...]:
+        self.get_conversation(conversation_id)
+        parameters: list[Any] = [str(conversation_id), self.user_id]
+        cursor_filter = ""
+        if after_message_id is not None:
+            cursor = self.get_message(after_message_id)
+            if cursor["conversation_id"] != conversation_id:
+                raise RuntimeError("Assistant summary cursor does not belong to this conversation.")
+            cursor_filter = " AND created_at > ?"
+            parameters.append(cursor["created_at"])
+        parameters.append(max(1, min(limit, 1_000)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM assistant_messages
+                WHERE conversation_id=? AND user_id=?
+                """
+                + cursor_filter
+                + " ORDER BY created_at ASC LIMIT ?",
+                tuple(parameters),
             ).fetchall()
         return tuple(self._message(row) for row in rows)
 
@@ -929,7 +997,8 @@ class AssistantRepository:
 
     @staticmethod
     def _conversation(row: Any) -> dict[str, Any]:
-        return {"conversation_id": UUID(str(row["id"])), "title": str(row["title"]), "scope_type": str(row["scope_type"]), "scope_id": UUID(str(row["scope_id"])) if row["scope_id"] else None, "summary": str(row["summary"] or ""), "active_run_id": UUID(str(row["active_run_id"])) if row["active_run_id"] else None, "active_run_status": str(row["active_run_status"]) if row["active_run_status"] else None, "created_at": str(row["created_at"]), "updated_at": str(row["updated_at"]), "last_message_at": str(row["last_message_at"]) if row["last_message_at"] else None}
+        keys = set(row.keys())
+        return {"conversation_id": UUID(str(row["id"])), "title": str(row["title"]), "scope_type": str(row["scope_type"]), "scope_id": UUID(str(row["scope_id"])) if row["scope_id"] else None, "summary": str(row["summary"] or ""), "summary_payload": _loads(row["summary_payload"], {}) if "summary_payload" in keys else {}, "summary_through_message_id": UUID(str(row["summary_through_message_id"])) if "summary_through_message_id" in keys and row["summary_through_message_id"] else None, "summary_version": int(row["summary_version"] or 0) if "summary_version" in keys else 0, "summary_updated_at": str(row["summary_updated_at"]) if "summary_updated_at" in keys and row["summary_updated_at"] else None, "active_run_id": UUID(str(row["active_run_id"])) if row["active_run_id"] else None, "active_run_status": str(row["active_run_status"]) if row["active_run_status"] else None, "created_at": str(row["created_at"]), "updated_at": str(row["updated_at"]), "last_message_at": str(row["last_message_at"]) if row["last_message_at"] else None}
 
     @staticmethod
     def _message(row: Any) -> dict[str, Any]:
@@ -937,7 +1006,7 @@ class AssistantRepository:
 
 
 _ASSISTANT_SCHEMA = """
-CREATE TABLE IF NOT EXISTS assistant_conversations (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,title TEXT NOT NULL,scope_type TEXT NOT NULL,scope_id TEXT,summary TEXT NOT NULL DEFAULT '',deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,last_message_at TEXT);
+CREATE TABLE IF NOT EXISTS assistant_conversations (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,title TEXT NOT NULL,scope_type TEXT NOT NULL,scope_id TEXT,summary TEXT NOT NULL DEFAULT '',summary_payload TEXT NOT NULL DEFAULT '{}',summary_through_message_id TEXT,summary_version INTEGER NOT NULL DEFAULT 0,summary_updated_at TEXT,deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,last_message_at TEXT);
 CREATE TABLE IF NOT EXISTS assistant_messages (id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,status TEXT NOT NULL,provider TEXT,model TEXT,token_usage TEXT NOT NULL DEFAULT '{}',citations TEXT NOT NULL DEFAULT '[]',metadata TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS assistant_runs (id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,user_id TEXT NOT NULL,user_message_id TEXT NOT NULL,assistant_message_id TEXT NOT NULL,status TEXT NOT NULL,current_stage TEXT NOT NULL,analysis_job_id TEXT,pending_confirmation TEXT NOT NULL DEFAULT '{}',error TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0,broker_task_id TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,lease_owner TEXT,lease_expires_at TEXT,heartbeat_at TEXT,checkpoint_thread_id TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,execution_mode TEXT NOT NULL DEFAULT 'ask',execution_plan TEXT NOT NULL DEFAULT '{}',current_action_id TEXT,required_permission TEXT,next_event_sequence INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS assistant_run_events (run_id TEXT NOT NULL,sequence INTEGER NOT NULL,event_type TEXT NOT NULL,status TEXT NOT NULL,message TEXT NOT NULL,tool_name TEXT,payload TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL,PRIMARY KEY(run_id,sequence));

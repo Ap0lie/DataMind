@@ -124,6 +124,50 @@ def test_planner_and_sql_prompts_include_join_grain_and_provenance() -> None:
     assert "untrusted data" in sql_messages[0]["content"]
 
 
+def test_planner_analysis_experience_is_compact_read_only_evidence() -> None:
+    experience_id = UUID("33333333-3333-3333-3333-333333333333")
+    messages = _planner_messages(
+        question="total amount by customer",
+        profile=_profile(),
+        multi_dataset_context=_multi_context(),
+        analysis_experiences=(
+            {
+                "memory_id": experience_id,
+                "content": "A previous validated route used safe SQL.",
+                "structured_value": {
+                    "analysis_contract": {"required_metrics": ["amount"]},
+                    "semantic_model_id": str(PRIMARY_ID),
+                    "semantic_model_version": 2,
+                    "join_plan": [{"left_column": "customer_id"}],
+                    "tool_sequence": ["execute_safe_sql"],
+                    "result_summary": {"row_count": 10},
+                    "sql": "SELECT secret FROM host_file",
+                    "python_code": "open('/etc/passwd').read()",
+                    "raw_records": [{"secret": "not allowed"}],
+                },
+            },
+        ),
+    )
+    payload = json.loads(messages[1]["content"])
+    recalled = payload["dataset_schema"]["validated_analysis_experiences"]
+
+    assert recalled == [
+        {
+            "experience_id": str(experience_id),
+            "summary": "A previous validated route used safe SQL.",
+            "analysis_contract": {"required_metrics": ["amount"]},
+            "semantic_model_id": str(PRIMARY_ID),
+            "semantic_model_version": 2,
+            "join_plan": [{"left_column": "customer_id"}],
+            "tool_sequence": ["execute_safe_sql"],
+            "result_summary": {"row_count": 10},
+        }
+    ]
+    assert "read-only route evidence" in messages[0]["content"]
+    assert "host_file" not in messages[1]["content"]
+    assert "/etc/passwd" not in messages[1]["content"]
+
+
 def test_python_repair_prompt_has_phase_specific_contract() -> None:
     attempt = PythonCodeAttemptResponse(
         attempt=1,

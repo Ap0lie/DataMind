@@ -14,8 +14,9 @@ from typing import Any
 
 
 class SmokeClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, *, origin: str) -> None:
         self.base_url = base_url.rstrip("/")
+        self.origin = origin.rstrip("/")
         self.cookies = CookieJar()
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
         self.csrf_token = ""
@@ -27,7 +28,7 @@ class SmokeClient:
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
-        headers = {"Accept": "application/json", "Origin": "http://127.0.0.1:5173"}
+        headers = {"Accept": "application/json", "Origin": self.origin}
         cookie_header = "; ".join(f"{cookie.name}={cookie.value}" for cookie in self.cookies)
         if cookie_header:
             # The production profile correctly marks the session Secure. This CLI smoke
@@ -52,7 +53,7 @@ class SmokeClient:
             raise RuntimeError(f"{method} {path} failed with HTTP {exc.code}: {detail}") from exc
 
     def stream_events(self, path: str, *, timeout: float) -> list[dict[str, Any]]:
-        headers = {"Accept": "text/event-stream", "Origin": "http://127.0.0.1:5173"}
+        headers = {"Accept": "text/event-stream", "Origin": self.origin}
         cookie_header = "; ".join(f"{cookie.name}={cookie.value}" for cookie in self.cookies)
         if cookie_header:
             headers["Cookie"] = cookie_header
@@ -105,9 +106,9 @@ def wait_for_job(
     raise RuntimeError(f"Job did not finish in {timeout:.0f}s: {path}")
 
 
-def run(base_url: str, timeout: float) -> dict[str, Any]:
+def run(base_url: str, timeout: float, *, origin: str = "https://localhost") -> dict[str, Any]:
     smoke_started = time.perf_counter()
-    client = SmokeClient(base_url)
+    client = SmokeClient(base_url, origin=origin)
     ready = wait_for_ready(client, timeout)
     print("ready", json.dumps(ready, ensure_ascii=False, sort_keys=True))
 
@@ -117,7 +118,14 @@ def run(base_url: str, timeout: float) -> dict[str, Any]:
         {"username": "production-smoke", "password": "production-smoke-password"},
     )
     client.csrf_token = str(login["csrf_token"])
-    assert login["user_id"] == "production_smoke"
+    current_user = client.request("GET", "/auth/me")
+    assert login["user_id"]
+    assert current_user["user_id"] == login["user_id"]
+    assert current_user["display_name"] == "production-smoke"
+    memory_settings = client.request("GET", "/assistant/memory-settings")
+    memories = client.request("GET", "/assistant/memories")
+    assert isinstance(memory_settings.get("enabled"), bool)
+    assert isinstance(memories.get("memories"), list)
 
     dataset = client.request(
         "POST",
@@ -198,6 +206,7 @@ def run(base_url: str, timeout: float) -> dict[str, Any]:
         "cleaning_duration_seconds": round(cleaning_duration, 3),
         "analysis_duration_seconds": round(time.perf_counter() - analysis_started, 3),
         "total_duration_seconds": round(time.perf_counter() - smoke_started, 3),
+        "memory_enabled": memory_settings["enabled"],
         "sse_event_count": len(event_latencies),
         "sse_delivery_p95_ms": round(_percentile(event_latencies, 0.95), 3)
         if event_latencies
@@ -231,10 +240,11 @@ def _percentile(values: list[float], fraction: float) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the real DataMind production-stack smoke flow.")
     parser.add_argument("--base-url", default="http://127.0.0.1:8010/api/v1")
+    parser.add_argument("--origin", default="https://localhost")
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--benchmark-output", type=Path)
     args = parser.parse_args()
-    metrics = run(args.base_url, args.timeout)
+    metrics = run(args.base_url, args.timeout, origin=args.origin)
     if args.benchmark_output:
         args.benchmark_output.parent.mkdir(parents=True, exist_ok=True)
         args.benchmark_output.write_text(

@@ -18,6 +18,8 @@ from app.assistant.control import (
     AssistantRunPaused,
     ensure_run_continuable,
 )
+from app.assistant.memory import AssistantMemoryService
+from app.assistant.memory_jobs import schedule_memory_maintenance
 from app.assistant.routing import compact_message_text, should_skip_tool_router
 from app.assistant.tools import (
     AssistantConfirmationRequired,
@@ -26,6 +28,7 @@ from app.assistant.tools import (
 )
 from app.core.settings import Settings, get_settings
 from app.harness.node import NodeExecutionHarness, NodeHarnessPolicy
+from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.assistant_repository import AssistantRepository
 from app.storage.dataset_store import DatasetStoreRepository
 
@@ -42,6 +45,7 @@ class AssistantState(TypedDict, total=False):
     token_usage: dict[str, int]
     timings: dict[str, int | bool]
     skip_tool_router: bool
+    memory_usage: list[dict[str, Any]]
 
 
 class AssistantWorkflowRunner:
@@ -67,9 +71,20 @@ class AssistantWorkflowRunner:
         user_message = self.assistant_store.get_message(run.user_message_id)
         history = [
             item
-            for item in self.assistant_store.list_messages(run.conversation_id, limit=40)
+            for item in self.assistant_store.list_messages_after(
+                run.conversation_id,
+                after_message_id=conversation.get("summary_through_message_id"),
+            )
             if item["message_id"] != run.assistant_message_id
         ]
+        memory_service = AssistantMemoryService(
+            repository=AssistantMemoryRepository(
+                self.settings.dataset_store_path,
+                user_id=self.assistant_store.user_id,
+            ),
+            store=self.store,
+            settings=self.settings,
+        )
 
         def emit(**kwargs: Any) -> None:
             self.assistant_store.append_event(run_id, **kwargs)
@@ -99,12 +114,44 @@ class AssistantWorkflowRunner:
                 current_run.execution_mode,
             )
             message_history = []
-            summary = compact_message_text(str(conversation.get("summary") or ""), max_chars=3000)
+            summary = compact_message_text(
+                str(conversation.get("summary") or ""),
+                max_chars=self.settings.assistant_memory_summary_max_chars,
+            )
             if summary:
                 message_history.append(
                     {"role": "system", "content": f"Earlier conversation summary:\n{summary}"}
                 )
-            for item in history[-10:]:
+            memories = memory_service.retrieve(
+                question=state["question"],
+                conversation=conversation,
+                evidence=tools.evidence.values(),
+                run_id=run_id,
+            )
+            memory_usage = [
+                {
+                    "memory_id": str(item["memory_id"]),
+                    "memory_type": item["memory_type"],
+                    "memory_kind": item["memory_kind"],
+                    "content": item["content"],
+                    "scope_type": item["scope_type"],
+                    "scope_id": str(item["scope_id"]) if item.get("scope_id") else None,
+                    "reason": item["recall_reason"],
+                    "score": item["relevance_score"],
+                }
+                for item in memories
+            ]
+            if memory_usage:
+                emit(
+                    event_type="memory.recalled",
+                    status="completed",
+                    message=f"已采用 {len(memory_usage)} 条相关记忆。",
+                    payload={"memories": memory_usage},
+                )
+            memory_context = memory_service.render_prompt_context(memories)
+            if memory_context:
+                message_history.append({"role": "system", "content": memory_context})
+            for item in history:
                 role = str(item.get("role") or "")
                 if role not in {"user", "assistant"}:
                     continue
@@ -153,6 +200,7 @@ class AssistantWorkflowRunner:
                 "tool_count": 0,
                 "timings": timings,
                 "skip_tool_router": skip_tool_router,
+                "memory_usage": memory_usage,
             }
 
         def decide(state: AssistantState) -> dict[str, Any]:
@@ -711,6 +759,7 @@ class AssistantWorkflowRunner:
                 value_ms=int(timings["total_ms"]),
                 threshold_ms=self.settings.assistant_total_slow_ms,
             )
+            memory_usage = list(state.get("memory_usage") or [])
             committed = self.assistant_store.complete_run_answer(
                 run_id,
                 content=accumulated,
@@ -725,6 +774,8 @@ class AssistantWorkflowRunner:
                     "evidence_consistency_repaired": evidence_consistency_repaired,
                     "requested_details_repaired": requested_details_repaired,
                     "output_budget": output_budget,
+                    "memory_usage": memory_usage,
+                    "memory_updates": [],
                 },
                 event_payload={
                     "message_id": str(run.assistant_message_id),
@@ -739,6 +790,19 @@ class AssistantWorkflowRunner:
             if not committed:
                 ensure_run_continuable(self.assistant_store, run_id)
                 raise RuntimeError("Assistant run could not commit its final answer.")
+            try:
+                schedule_memory_maintenance(
+                    run_id=run_id,
+                    user_id=self.assistant_store.user_id,
+                    dataset_store_path=self.settings.dataset_store_path,
+                )
+            except Exception as exc:
+                emit(
+                    event_type="memory.maintenance_failed",
+                    status="warning",
+                    message="记忆维护暂时不可用，不影响本次回答。",
+                    payload={"error": f"{type(exc).__name__}: {exc}"[:500]},
+                )
             return {
                 "answer": accumulated,
                 "timings": timings,
@@ -792,7 +856,6 @@ class AssistantWorkflowRunner:
             },
             config=config,
         )
-
 
 def _system_prompt(
     conversation: dict[str, Any],

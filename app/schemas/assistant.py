@@ -18,6 +18,17 @@ AssistantCapability = Literal[
     "asset_recycle",
 ]
 AssistantAssetType = Literal["dataset", "dataset_group", "report", "semantic_model"]
+AssistantMemoryType = Literal[
+    "preference",
+    "terminology",
+    "metric_definition",
+    "business_context",
+    "workflow_preference",
+    "analysis_experience",
+]
+AssistantMemoryScopeType = Literal["user", "dataset", "dataset_group", "report"]
+AssistantMemoryStatus = Literal["active", "pending", "superseded", "stale", "recycled"]
+AssistantMemoryKind = Literal["semantic", "episodic"]
 
 
 class AssistantCitationReliabilityResponse(ApiModel):
@@ -55,6 +66,10 @@ class AssistantConversationResponse(ApiModel):
     scope_type: AssistantScopeType
     scope_id: UUID | None = None
     summary: str = ""
+    summary_payload: dict[str, Any] = Field(default_factory=dict)
+    summary_through_message_id: UUID | None = None
+    summary_version: int = 0
+    summary_updated_at: str | None = None
     active_run_id: UUID | None = None
     active_run_status: str | None = None
     created_at: str
@@ -179,6 +194,88 @@ class AssistantActionResponse(ApiModel):
 
 class AssistantActionListResponse(ApiModel):
     actions: tuple[AssistantActionResponse, ...]
+
+
+class AssistantMemoryCreateRequest(ApiModel):
+    memory_type: AssistantMemoryType
+    scope_type: AssistantMemoryScopeType = "user"
+    scope_id: UUID | None = None
+    content: str = Field(min_length=1, max_length=4_000)
+    pinned: bool = False
+
+
+class AssistantMemoryUpdateRequest(ApiModel):
+    memory_type: AssistantMemoryType | None = None
+    content: str | None = Field(default=None, min_length=1, max_length=4_000)
+    pinned: bool | None = None
+
+
+class AssistantMemoryResponse(ApiModel):
+    memory_id: UUID
+    memory_kind: AssistantMemoryKind = "semantic"
+    memory_type: AssistantMemoryType
+    scope_type: AssistantMemoryScopeType
+    scope_id: UUID | None = None
+    normalized_key: str
+    subject_key: str
+    content: str
+    structured_value: dict[str, Any] = Field(default_factory=dict)
+    version: int = 1
+    supersedes_id: UUID | None = None
+    superseded_by_id: UUID | None = None
+    application_policy: Literal["relevant", "always"] = "relevant"
+    source_kind: str = "user_message"
+    source_job_id: UUID | None = None
+    explicit: bool
+    confidence: float = Field(ge=0, le=1)
+    status: AssistantMemoryStatus
+    pinned: bool
+    source_conversation_id: UUID | None = None
+    source_message_id: UUID | None = None
+    source_conversation_deleted: bool = False
+    last_used_at: str | None = None
+    valid_from: str | None = None
+    valid_to: str | None = None
+    deleted_at: str | None = None
+    purge_after: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class AssistantMemoryListResponse(ApiModel):
+    memories: tuple[AssistantMemoryResponse, ...]
+
+
+class AssistantMemorySettingsResponse(ApiModel):
+    enabled: bool = True
+    updated_at: str | None = None
+
+
+class AssistantMemorySettingsUpdateRequest(ApiModel):
+    enabled: bool
+
+
+class AssistantMemoryUsageResponse(ApiModel):
+    usage_id: UUID
+    run_id: UUID
+    memory_id: UUID
+    score: float
+    lexical_score: float
+    embedding_score: float
+    scope_score: float
+    recency_score: float
+    reason: str
+    scope_type: AssistantMemoryScopeType
+    created_at: str
+
+
+class AssistantMemoryUsageListResponse(ApiModel):
+    usages: tuple[AssistantMemoryUsageResponse, ...]
+
+
+class AssistantMemoryHistoryResponse(ApiModel):
+    subject_key: str
+    memories: tuple[AssistantMemoryResponse, ...]
 
 
 class AssistantImportBatchPreviewRequest(ApiModel):

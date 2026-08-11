@@ -30,7 +30,7 @@ DataMind 数据资产提供受权限约束的对话式工作台。
 | 语义理解 | 字段角色、中英文语义排序、版本化指标 DSL、关系图、Join 基数与数据粒度检查 |
 | 自主分析 | Planner、安全 SQL、沙箱 Python、有边界修复 Loop、规则回退和任务恢复 |
 | 可信交付 | 统计验证、evidence ID、血缘、对抗审查、报告修复和幂等提交 |
-| Kimi 工作台 | 用户隔离对话、图片与数据附件、资产检索、问答/执行模式、授权、审计和回收站 |
+| Kimi 工作台 | 用户隔离对话、结构化摘要、可信版本记忆、只读分析经验、图片与数据附件、授权、审计和回收站 |
 | 生产运行 | PostgreSQL、Redis、Celery、Checkpoint、SSE、Cookie 会话、CSRF、限流和容器沙箱 |
 
 ## 系统架构
@@ -139,6 +139,9 @@ Celery Beat、受控 Python Runner 和无网络 Sandbox 镜像。DNS、HTTPS、�
 | `DATAMIND_PYTHON_RUNNER_URL` | 受控容器 Runner 地址 |
 | `DATAMIND_AGENT_LOOP_DEFAULT_MODE` | 默认 `loop`，`legacy` 仅用于兼容 |
 | `DATAMIND_SEMANTIC_EMBEDDING_ENABLED` | 启用本地语义向量排序 |
+| `DATAMIND_ASSISTANT_MEMORY_ENABLED` | 启用 Kimi 对话摘要与长期记忆 |
+| `DATAMIND_ASSISTANT_MEMORY_RELEVANCE_THRESHOLD` | 普通记忆进入上下文的最低综合相关性 |
+| `DATAMIND_ASSISTANT_MEMORY_EXPERIENCE_ENABLED` | 启用供 Planner 参考的已验证只读分析经验 |
 
 各 Agent 可以独立配置模型供应商。Kimi 和 DeepSeek 是默认选择，并非测试环境的
 硬依赖；自动化测试统一使用 Mock Provider。
@@ -152,6 +155,13 @@ Kimi 可以读取当前用户的数据集、已完成分析和报告。问答模
 
 附件支持 JPEG、PNG、WebP、CSV、XLSX、JSON 和 TXT。大文件采用受保护的落盘暂存，
 逐个文件解析。最终回答使用模型真实 Token 流，并且只能引用本轮实际读取过的资产。
+
+Kimi Memory 分为三层：带来源的结构化摘要压缩较早消息；版本化语义记忆跨对话保存
+偏好、术语、指标口径和业务背景；Checkpoint 只负责单次任务恢复。显式冲突会创建
+新版本并替代旧版本，推断冲突必须确认。独立的情景记忆只保存通过统计验证的成功分析
+经验，并且仅作为 Planner 的只读路线证据，不能直接执行工具或绕过重新规划。记忆经过
+相关性门槛、MMR、用户和资产范围过滤，每次实际采用均可审计；关闭总开关后停止长期
+记忆读写，但保留当前对话摘要和已有记忆。
 
 ## MCP 状态
 
@@ -178,6 +188,7 @@ python -m pytest -o addopts="" -m sandbox
 # 项目基准与确定性发布门禁。
 python -m pytest -o addopts="" -m benchmark
 python -m app.evaluation.cli run --suite release
+python -m app.evaluation.cli run --suite memory
 
 npm --prefix frontend/react run build
 npm --prefix frontend/react run test:e2e

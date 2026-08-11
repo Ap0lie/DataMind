@@ -60,6 +60,22 @@ The application image downloads the pinned `BAAI/bge-small-zh-v1.5` revision
 during the build. The API and Worker reuse this image layer; the Python sandbox
 does not contain the embedding model.
 
+Assistant structured summaries, versioned semantic memory, maintenance leases, usage
+audit, and validated analysis experience use the existing application database and
+BGE cache. API, Worker, and Beat must share the same PostgreSQL database; no extra
+vector database or memory service is required. Memory maintenance runs after answer
+commit, outside the first-token path, and is recovered from its database lease after
+Worker restarts. Daily Beat cleanup recycles stale or superseded unpinned memory and
+permanently removes only expired recycle items.
+
+`DATAMIND_ASSISTANT_MEMORY_ENABLED` is the default for new users; each user can turn
+long-term reads and writes off without deleting existing memory. Tune
+`DATAMIND_ASSISTANT_MEMORY_RELEVANCE_THRESHOLD`,
+`DATAMIND_ASSISTANT_MEMORY_PREFILTER_LIMIT`, and
+`DATAMIND_ASSISTANT_MEMORY_MMR_LAMBDA` only after running the deterministic `memory`
+benchmark. `DATAMIND_ASSISTANT_MEMORY_EXPERIENCE_ENABLED` controls read-only Planner
+experience reuse independently.
+
 If the server cannot reach the official Python package index, set
 `DATAMIND_PYPI_INDEX_URL` to an approved internal or regional mirror before
 building. This value is used only while building images.

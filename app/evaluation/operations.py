@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -20,7 +22,9 @@ from app.analysis.dataset_groups import suggest_dataset_group_relationships
 from app.analysis.model_router import MCPAnalysisModelRouter
 from app.analysis.services import DatasetProfiler
 from app.analysis.statistical_verifier import verify_statistical_analysis
+from app.assistant.memory import AssistantMemoryService
 from app.assistant.permissions import AssistantPermissionService
+from app.core.settings import get_settings
 from app.data_reliability.drift import compare_snapshots
 from app.evaluation.agent_loop import AgentLoopBenchmarkOutcome, evaluate_agent_loop_benchmark
 from app.evaluation.benchmarking import BenchmarkObservation
@@ -33,9 +37,10 @@ from app.schemas.analysis import (
     InsightFindingResponse,
     MultiDatasetProfileResponse,
 )
-from app.semantic.embedding import MockEmbeddingProvider
+from app.semantic.embedding import DisabledEmbeddingProvider, MockEmbeddingProvider
 from app.semantic.ranking import SemanticCandidateRanker
 from app.semantic.relationship_graph import plan_relationship_path
+from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.dataset_store import DatasetStoreRepository
 
 
@@ -51,6 +56,7 @@ def release_executors() -> dict[str, Any]:
         "data.drift": _data_drift,
         "relationship.grain": _relationship_grain,
         "assistant.permission": _assistant_permission,
+        "memory.trust": _memory_trust,
     }
 
 
@@ -416,6 +422,132 @@ def _assistant_permission(case: BenchmarkCase) -> BenchmarkObservation:
             else 0.0
         },
     )
+
+
+def _memory_trust(case: BenchmarkCase) -> BenchmarkObservation:
+    memory_count = max(10, int(case.input.get("memory_count") or 500))
+    query_count = max(1, min(20, int(case.input.get("query_count") or 10)))
+    with tempfile.TemporaryDirectory(
+        prefix="datamind-benchmark-memory-",
+        ignore_cleanup_errors=True,
+    ) as directory:
+        store = DatasetStoreRepository(directory, user_id="benchmark")
+        repository = AssistantMemoryRepository(directory, user_id="benchmark")
+        settings = get_settings().model_copy(
+            update={
+                "assistant_memory_enabled": True,
+                "assistant_memory_relevance_threshold": 0.32,
+                "assistant_memory_prefilter_limit": 100,
+                "assistant_memory_retrieval_limit": 8,
+                "assistant_memory_context_chars": 4_000,
+            }
+        )
+        service = AssistantMemoryService(
+            repository=repository,
+            store=store,
+            settings=settings,
+            embedding_provider=DisabledEmbeddingProvider(),
+        )
+        topics = (
+            "华东毛利率",
+            "华南复购率",
+            "西北客单价",
+            "东北退货率",
+            "沿海履约时长",
+            "门店库存周转",
+            "会员活跃程度",
+            "广告转化效率",
+            "供应缺货频率",
+            "客服响应时长",
+        )[:query_count]
+        expected: dict[str, set[UUID]] = {topic: set() for topic in topics}
+        relevant_count = len(topics) * 8
+        for index in range(memory_count):
+            topic_index, variant = divmod(index, 8)
+            content = (
+                f"{topics[topic_index]} 分析约定 {variant + 1}"
+                if index < relevant_count
+                else hashlib.sha256(f"memory-{index}".encode()).hexdigest()
+            )
+            memory = service.create_manual(
+                memory_type="business_context",
+                scope_type="user",
+                scope_id=None,
+                content=content,
+            )
+            if index < relevant_count:
+                expected[topics[topic_index]].add(memory["memory_id"])
+
+        latencies: list[float] = []
+        selected_count = 0
+        matched_count = 0
+        expected_count = 0
+        for topic, expected_ids in expected.items():
+            started = time.perf_counter()
+            recalled = service.retrieve(
+                question=f"请按{topic}分析",
+                conversation={"scope_type": "auto", "scope_id": None},
+                run_id=uuid4(),
+            )
+            latencies.append((time.perf_counter() - started) * 1_000)
+            selected = {item["memory_id"] for item in recalled}
+            selected_count += len(selected)
+            matched_count += len(selected & expected_ids)
+            expected_count += len(expected_ids)
+
+        old = service.create_manual(
+            memory_type="metric_definition",
+            scope_type="user",
+            scope_id=None,
+            content="复购率口径是旧定义",
+        )
+        current = service.create_manual(
+            memory_type="metric_definition",
+            scope_type="user",
+            scope_id=None,
+            content="复购率口径是新定义",
+        )
+        conflict_correct = float(
+            old["memory_id"] != current["memory_id"]
+            and repository.get(old["memory_id"])["status"] == "superseded"
+            and current["version"] == 2
+        )
+        old_usage = sum(
+            item["memory_id"] == old["memory_id"]
+            for item in service.retrieve(
+                question="旧定义",
+                conversation={"scope_type": "auto", "scope_id": None},
+            )
+        )
+        isolated = not AssistantMemoryRepository(
+            directory,
+            user_id="other-user",
+        ).list()
+        context_contract = "current user message overrides memory" in service.render_prompt_context(
+            (current,)
+        ).casefold()
+        precision = matched_count / selected_count if selected_count else 0.0
+        recall = matched_count / expected_count if expected_count else 0.0
+        p95 = sorted(latencies)[max(0, math.ceil(len(latencies) * 0.95) - 1)]
+        return BenchmarkObservation(
+            actual={
+                "precision_at_8": precision,
+                "recall_at_8": recall,
+                "conflict_accuracy": conflict_correct,
+                "superseded_usage": old_usage,
+                "user_isolation": isolated,
+                "current_instruction_override_contract": context_contract,
+                "retrieval_p95_ms": p95,
+            },
+            metrics={
+                "memory_precision_at_8": precision,
+                "memory_recall_at_8": recall,
+                "memory_conflict_accuracy": conflict_correct,
+                "memory_superseded_usage": float(old_usage),
+                "memory_user_isolation": 1.0 if isolated else 0.0,
+                "memory_retrieval_p95_ms": p95,
+            },
+        )
 
 
 def _provider_complete(case: BenchmarkCase) -> BenchmarkObservation:

@@ -2,6 +2,10 @@ export type AssistantScopeType = "auto" | "dataset" | "dataset_group" | "report"
 export type AssistantExecutionMode = "ask" | "execute";
 export type AssistantCapability = "data_prepare" | "relationship_manage" | "analysis_manage" | "report_manage" | "semantic_manage" | "asset_recycle";
 export type AssistantAssetType = "dataset" | "dataset_group" | "report" | "semantic_model";
+export type AssistantMemoryType = "preference" | "terminology" | "metric_definition" | "business_context" | "workflow_preference" | "analysis_experience";
+export type AssistantMemoryScopeType = "user" | "dataset" | "dataset_group" | "report";
+export type AssistantMemoryStatus = "active" | "pending" | "superseded" | "stale" | "recycled";
+export type AssistantMemoryKind = "semantic" | "episodic";
 
 export const ASSISTANT_FULL_CAPABILITIES: AssistantCapability[] = [
   "data_prepare",
@@ -29,6 +33,10 @@ export type AssistantConversation = {
   scope_type: AssistantScopeType;
   scope_id?: string | null;
   summary: string;
+  summary_payload?: Record<string, unknown>;
+  summary_through_message_id?: string | null;
+  summary_version: number;
+  summary_updated_at?: string | null;
   active_run_id?: string | null;
   active_run_status?: string | null;
   created_at: string;
@@ -144,6 +152,38 @@ export type RecycledAsset = {
   name: string;
   deleted_at: string;
   purge_after: string;
+};
+
+export type AssistantMemory = {
+  memory_id: string;
+  memory_kind: AssistantMemoryKind;
+  memory_type: AssistantMemoryType;
+  scope_type: AssistantMemoryScopeType;
+  scope_id?: string | null;
+  normalized_key: string;
+  subject_key: string;
+  content: string;
+  structured_value: Record<string, unknown>;
+  version: number;
+  supersedes_id?: string | null;
+  superseded_by_id?: string | null;
+  application_policy: "relevant" | "always";
+  source_kind: string;
+  source_job_id?: string | null;
+  explicit: boolean;
+  confidence: number;
+  status: AssistantMemoryStatus;
+  pinned: boolean;
+  source_conversation_id?: string | null;
+  source_message_id?: string | null;
+  source_conversation_deleted: boolean;
+  last_used_at?: string | null;
+  valid_from?: string | null;
+  valid_to?: string | null;
+  deleted_at?: string | null;
+  purge_after?: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 export type AssistantImportFilePreview = {

@@ -100,6 +100,26 @@ if celery_app is not None:
             worker_id=str(self.request.id or "celery-worker"),
         )
 
+    @celery_app.task(name="datamind.assistant.memory.maintain", bind=True)
+    def maintain_assistant_memory_task(
+        self: Any,
+        job_id: str,
+        user_id: str,
+        dataset_store_path: str,
+    ) -> None:
+        from uuid import UUID
+
+        from app.assistant.memory_jobs import run_memory_maintenance
+        from app.observability import configure_observability
+
+        configure_observability("datamind-worker")
+        run_memory_maintenance(
+            UUID(job_id),
+            user_id,
+            dataset_store_path,
+            worker_id=str(self.request.id or "celery-worker"),
+        )
+
     @celery_app.task(name="datamind.assets.purge_expired")
     def purge_expired_assets_task() -> int:
         from app.main import _purge_expired_assets

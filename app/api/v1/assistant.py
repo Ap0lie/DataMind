@@ -19,6 +19,12 @@ from app.analysis.dataset_groups import (
 from app.api.v1.deps import current_user_id
 from app.assistant.evidence import canonical_reliability, safe_excerpt
 from app.assistant.jobs import start_assistant_run
+from app.assistant.memory import (
+    MEMORY_SCOPES,
+    MEMORY_STATUSES,
+    MEMORY_TYPES,
+    AssistantMemoryService,
+)
 from app.assistant.permissions import (
     AssistantPermissionService,
     capabilities_for_asset,
@@ -35,6 +41,15 @@ from app.schemas.assistant import (
     AssistantImportBatchCommitRequest,
     AssistantImportBatchPreviewRequest,
     AssistantImportBatchResponse,
+    AssistantMemoryCreateRequest,
+    AssistantMemoryHistoryResponse,
+    AssistantMemoryListResponse,
+    AssistantMemoryResponse,
+    AssistantMemorySettingsResponse,
+    AssistantMemorySettingsUpdateRequest,
+    AssistantMemoryUpdateRequest,
+    AssistantMemoryUsageListResponse,
+    AssistantMemoryUsageResponse,
     AssistantMessageCreateRequest,
     AssistantMessageListResponse,
     AssistantMessageResponse,
@@ -52,6 +67,7 @@ from app.services.tabular_import import (
     record_batches_from_file_path,
     xlsx_sheet_previews_from_path,
 )
+from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.assistant_repository import AssistantRepository, StoredAssistantRun
 from app.storage.dataset_store import DatasetStoreRepository
 
@@ -62,10 +78,30 @@ def _repository(user_id: str) -> AssistantRepository:
     return AssistantRepository(get_settings().dataset_store_path, user_id=user_id)
 
 
+def _memory_repository(user_id: str) -> AssistantMemoryRepository:
+    return AssistantMemoryRepository(get_settings().dataset_store_path, user_id=user_id)
+
+
+def _memory_service(user_id: str) -> AssistantMemoryService:
+    settings = get_settings()
+    return AssistantMemoryService(
+        repository=_memory_repository(user_id),
+        store=DatasetStoreRepository(settings.dataset_store_path, user_id=user_id),
+        settings=settings,
+    )
+
+
 def _action_response(action: dict[str, Any]) -> AssistantActionResponse:
     public_fields = AssistantActionResponse.model_fields
     return AssistantActionResponse.model_validate(
         {field: action.get(field) for field in public_fields}
+    )
+
+
+def _memory_response(memory: dict[str, Any]) -> AssistantMemoryResponse:
+    public_fields = AssistantMemoryResponse.model_fields
+    return AssistantMemoryResponse.model_validate(
+        {field: memory.get(field) for field in public_fields}
     )
 
 
@@ -190,6 +226,186 @@ def revoke_permission_grant(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/memories", response_model=AssistantMemoryListResponse)
+def list_memories(
+    scope_type: str | None = Query(default=None),
+    scope_id: UUID | None = Query(default=None),
+    memory_type: str | None = Query(default=None),
+    memory_kind: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    query: str | None = Query(default=None, max_length=200),
+    limit: int = Query(default=200, ge=1, le=500),
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryListResponse:
+    if scope_type is not None and scope_type not in MEMORY_SCOPES:
+        raise HTTPException(status_code=422, detail="Unsupported assistant memory scope.")
+    if memory_type is not None and memory_type not in MEMORY_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported assistant memory type.")
+    if memory_kind is not None and memory_kind not in {"semantic", "episodic"}:
+        raise HTTPException(status_code=422, detail="Unsupported assistant memory kind.")
+    if status is not None and status not in MEMORY_STATUSES:
+        raise HTTPException(status_code=422, detail="Unsupported assistant memory status.")
+    items = _memory_repository(user_id).list(
+        scope_type=scope_type,
+        scope_id=scope_id,
+        memory_type=memory_type,
+        memory_kind=memory_kind,
+        status=status,
+        query=query,
+        limit=limit,
+    )
+    return AssistantMemoryListResponse(
+        memories=tuple(_memory_response(item) for item in items)
+    )
+
+
+@router.post("/memories", response_model=AssistantMemoryResponse, status_code=201)
+def create_memory(
+    request: AssistantMemoryCreateRequest,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryResponse:
+    try:
+        item = _memory_service(user_id).create_manual(
+            memory_type=request.memory_type,
+            scope_type=request.scope_type,
+            scope_id=request.scope_id,
+            content=request.content,
+            pinned=request.pinned,
+        )
+        return _memory_response(item)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.patch("/memories/{memory_id}", response_model=AssistantMemoryResponse)
+def update_memory(
+    memory_id: UUID,
+    request: AssistantMemoryUpdateRequest,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryResponse:
+    try:
+        item = _memory_service(user_id).update_memory(
+            memory_id,
+            memory_type=request.memory_type,
+            content=request.content,
+            pinned=request.pinned,
+        )
+        return _memory_response(item)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/memories/{memory_id}/confirm", response_model=AssistantMemoryResponse)
+def confirm_memory(
+    memory_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryResponse:
+    repository = _memory_repository(user_id)
+    try:
+        current = repository.get(memory_id)
+        if current["status"] != "pending":
+            raise ValueError("Only pending memories can be confirmed.")
+        return _memory_response(repository.confirm(memory_id))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/memories/{memory_id}", response_model=AssistantMemoryResponse)
+def recycle_memory(
+    memory_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryResponse:
+    settings = get_settings()
+    try:
+        return _memory_response(
+            _memory_repository(user_id).recycle(
+                memory_id,
+                retention_days=settings.assistant_memory_recycle_days,
+            )
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/memories/{memory_id}/restore", response_model=AssistantMemoryResponse)
+def restore_memory(
+    memory_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryResponse:
+    try:
+        return _memory_response(_memory_repository(user_id).restore(memory_id))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/memory-settings", response_model=AssistantMemorySettingsResponse)
+def get_memory_settings(
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemorySettingsResponse:
+    return AssistantMemorySettingsResponse.model_validate(
+        _memory_repository(user_id).get_settings()
+    )
+
+
+@router.patch("/memory-settings", response_model=AssistantMemorySettingsResponse)
+def update_memory_settings(
+    request: AssistantMemorySettingsUpdateRequest,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemorySettingsResponse:
+    return AssistantMemorySettingsResponse.model_validate(
+        _memory_repository(user_id).update_settings(enabled=request.enabled)
+    )
+
+
+@router.get(
+    "/memories/{memory_id}/history",
+    response_model=AssistantMemoryHistoryResponse,
+)
+def memory_history(
+    memory_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryHistoryResponse:
+    try:
+        items = _memory_repository(user_id).history(memory_id)
+        return AssistantMemoryHistoryResponse(
+            subject_key=items[0]["subject_key"],
+            memories=tuple(_memory_response(item) for item in items),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/memories/{memory_id}/reactivate",
+    response_model=AssistantMemoryResponse,
+)
+def reactivate_memory(
+    memory_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryResponse:
+    try:
+        return _memory_response(_memory_repository(user_id).reactivate(memory_id))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/memory-usage", response_model=AssistantMemoryUsageListResponse)
+def list_memory_usage(
+    run_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryUsageListResponse:
+    return AssistantMemoryUsageListResponse(
+        usages=tuple(
+            AssistantMemoryUsageResponse.model_validate(item)
+            for item in _memory_repository(user_id).list_usage(run_id=run_id)
+        )
+    )
 
 
 @router.get("/actions", response_model=AssistantActionListResponse)
@@ -611,6 +827,7 @@ async def stream_run_events(
     async def events():
         nonlocal cursor
         idle = 0
+        terminal_grace = 0
         while True:
             rows = repository.list_events(run_id, after_sequence=cursor)
             for item in rows:
@@ -624,6 +841,14 @@ async def stream_run_events(
                 "pause_requested",
                 "cancel_requested",
             } and not rows:
+                maintenance = _memory_repository(user_id).get_maintenance_job_for_run(run_id)
+                if maintenance and maintenance["status"] in {"queued", "running"}:
+                    await asyncio.sleep(0.2)
+                    continue
+                if maintenance is None and terminal_grace < 2:
+                    terminal_grace += 1
+                    await asyncio.sleep(0.2)
+                    continue
                 yield f"event: end\ndata: {json.dumps({'status': run.status})}\n\n"
                 return
             idle += 1

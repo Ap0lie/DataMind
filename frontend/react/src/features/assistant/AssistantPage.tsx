@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
+  Brain,
   FileImage,
   FileSpreadsheet,
   Loader2,
@@ -81,7 +82,8 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
   const [conversationDialogPending, setConversationDialogPending] = useState(false);
   const [conversationDialogError, setConversationDialogError] = useState<string | null>(null);
   const [historyCollapsed, setHistoryCollapsed] = useState(() => window.localStorage.getItem("datamind:assistant-history-collapsed") === "true");
-  const [workbenchSummary, setWorkbenchSummary] = useState({ grants: 0, actions: 0, recycled: 0 });
+  const [workbenchSummary, setWorkbenchSummary] = useState({ grants: 0, actions: 0, recycled: 0, memories: 0 });
+  const [workbenchTab, setWorkbenchTab] = useState<"permissions" | "actions" | "memory" | "recycle">("permissions");
   const endRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -122,7 +124,7 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
   const hasSendTarget = !!current || creatingConversation;
   const canSend = hasSendTarget && !!draft.trim() && !busy && !sending && !uploading && !importing && !hasPendingDataFile;
   const filteredConversations = conversations.filter((item) => item.title.toLocaleLowerCase().includes(historySearch.trim().toLocaleLowerCase()));
-  const workbenchCount = workbenchSummary.grants + workbenchSummary.actions + workbenchSummary.recycled;
+  const workbenchCount = workbenchSummary.grants + workbenchSummary.actions + workbenchSummary.recycled + workbenchSummary.memories;
 
   const toggleHistoryCollapsed = () => {
     setHistoryCollapsed((value) => {
@@ -739,6 +741,8 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
                   <div className="assistant-message-meta"><b>{message.role === "user" ? "你" : "Kimi"}</b><span>{formatTime(message.created_at)}</span>{message.model && <span>{message.model}</span>}</div>
                   {message.attachments.length > 0 && <div className="assistant-message-images">{message.attachments.map((item) => item.attachment_kind === "image" ? <AssistantAttachmentImage key={item.attachment_id} attachment={item} /> : <div className="assistant-message-file" key={item.attachment_id}><FileSpreadsheet size={18} /><span><b>{item.file_name}</b><small>{item.import_status ?? "数据文件"}</small></span></div>)}</div>}
                   <MarkdownText text={message.content || (message.status === "pending" ? "正在准备回答..." : "")} />
+                  {memoryUpdates(message.metadata).map((item, index) => <div key={`${message.message_id}-memory-${index}`} className={`assistant-memory-feedback ${item.event_type === "memory.candidate" ? "candidate" : ""}`}><Brain size={14} /><span>{item.message}</span>{item.event_type === "memory.candidate" && <button type="button" onClick={() => { setWorkbenchTab("memory"); setControlOpen(true); }}>去确认</button>}</div>)}
+                  <MemoryRecall usage={memoryUsage(message.metadata)} onOpenMemory={() => { setWorkbenchTab("memory"); setControlOpen(true); }} />
                   <AssistantEvidenceCards citations={message.citations} onOpenDataset={onOpenDataset} onOpenAnalysis={onOpenAnalysis} onOpenReport={onOpenReport} />
                 </div>
               </article>
@@ -766,6 +770,7 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
         </div>
         <AssistantControlPanel
           open={controlOpen}
+          initialTab={workbenchTab}
           onClose={() => setControlOpen(false)}
           onSummaryChange={setWorkbenchSummary}
           onAssetsChanged={onAssetsChanged}
@@ -798,7 +803,7 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
                 <h3 id="assistant-conversation-dialog-title">{conversationDialog.kind === "rename" ? "重命名对话" : "删除对话"}</h3>
                 <p id="assistant-conversation-dialog-description">{conversationDialog.kind === "rename"
                   ? "输入一个便于在消息记录中识别的名称。"
-                  : `确认删除“${conversationDialog.conversation.title}”？此操作无法撤销。`}</p>
+                  : `确认删除“${conversationDialog.conversation.title}”？对话将不再显示；已经保存的长期记忆会独立保留，可在 Kimi 工作台的“记忆”中管理。`}</p>
               </div>
               {conversationDialog.kind === "rename" && (
                 <label className="assistant-conversation-dialog-field">
@@ -843,9 +848,65 @@ function inlineText(value: string) {
   return value.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((part, index) => part.startsWith("**") ? <strong key={index}>{part.slice(2, -2)}</strong> : part.startsWith("`") ? <code key={index}>{part.slice(1, -1)}</code> : part);
 }
 
+function memoryUpdates(metadata: Record<string, unknown>) {
+  const value = metadata.memory_updates;
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is { event_type: string; message: string } => !!item && typeof item === "object" && typeof (item as Record<string, unknown>).event_type === "string" && typeof (item as Record<string, unknown>).message === "string");
+}
+
+type RecalledMemory = {
+  memory_id: string;
+  memory_type: string;
+  memory_kind: string;
+  content: string;
+  scope_type: string;
+  reason: string;
+  score: number;
+};
+
+function memoryUsage(metadata: Record<string, unknown>): RecalledMemory[] {
+  const value = metadata.memory_usage;
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is RecalledMemory => {
+    if (!item || typeof item !== "object") return false;
+    const entry = item as Record<string, unknown>;
+    return typeof entry.memory_id === "string"
+      && typeof entry.memory_type === "string"
+      && typeof entry.memory_kind === "string"
+      && typeof entry.content === "string"
+      && typeof entry.scope_type === "string"
+      && typeof entry.reason === "string"
+      && typeof entry.score === "number";
+  });
+}
+
+function MemoryRecall({ usage, onOpenMemory }: { usage: RecalledMemory[]; onOpenMemory: () => void }) {
+  if (!usage.length) return null;
+  return (
+    <details className="assistant-memory-recall">
+      <summary><Brain size={14} />使用了 {usage.length} 条记忆</summary>
+      <div>
+        {usage.map((item) => (
+          <article key={item.memory_id}>
+            <div><b>{recalledMemoryLabel(item)}</b><span>{item.reason}</span></div>
+            <p>{item.content}</p>
+          </article>
+        ))}
+        <button type="button" onClick={onOpenMemory}>管理记忆</button>
+      </div>
+    </details>
+  );
+}
+
+function recalledMemoryLabel(memory: RecalledMemory) {
+  const type = ({ preference: "偏好", terminology: "业务术语", metric_definition: "指标口径", business_context: "业务背景", workflow_preference: "工作流偏好", analysis_experience: "分析经验" } as Record<string, string>)[memory.memory_type] ?? "长期记忆";
+  const scope = ({ user: "全局", dataset: "数据集", dataset_group: "数据包", report: "报告" } as Record<string, string>)[memory.scope_type] ?? memory.scope_type;
+  return `${type} · ${scope}`;
+}
+
 function toolLabel(event: AssistantEvent) {
   const labels: Record<string, string> = { search_datamind_assets: "检索 DataMind 资产", get_dataset_context: "读取数据集结构", get_analysis_result: "读取分析结果", get_report: "读取报告", preview_analysis_plan: "规划分析", start_analysis: "运行 DataMind Workflow", get_analysis_status: "检查分析状态", start_cleaning: "运行自主清洗", get_cleaning_status: "检查清洗状态", activate_cleaning_version: "激活清洗版本", rollback_cleaning_version: "回滚清洗版本", update_column_metadata: "更新字段元数据", suggest_relationships: "生成关系建议", save_relationship_plan: "保存关系计划", cancel_analysis: "取消分析", retry_analysis: "重试分析", rename_report: "重命名报告", create_semantic_draft: "创建语义草稿", update_semantic_draft: "更新语义草稿", validate_semantic_model: "校验语义模型", publish_semantic_model: "发布语义模型", soft_delete_asset: "移入回收站", restore_asset: "恢复资产" };
-  const eventLabels: Record<string, string> = { "retrieval.completed": "自动检索", "message.completed": "生成回答", "permission.checked": "权限校验", "action.planned": "准备执行", "action.completed": "操作完成", "action.rolled_back": "操作已撤销", "import.progress": "数据包导入", "asset.recycled": "资产回收" };
+  const eventLabels: Record<string, string> = { "retrieval.completed": "自动检索", "message.completed": "生成回答", "permission.checked": "权限校验", "action.planned": "准备执行", "action.completed": "操作完成", "action.rolled_back": "操作已撤销", "import.progress": "数据包导入", "asset.recycled": "资产回收", "memory.recalled": "召回相关记忆", "memory.saved": "保存长期记忆", "memory.superseded": "更新长期记忆", "memory.candidate": "待确认记忆", "memory.conflict": "确认记忆冲突", "memory.summary_updated": "更新对话摘要", "memory.experience_saved": "保存分析经验", "memory.experience_stale": "分析经验已失效", "memory.maintenance_failed": "记忆维护异常", "memory.skipped": "跳过记忆维护" };
   return labels[event.tool_name ?? ""] ?? eventLabels[event.event_type] ?? "Kimi 工具";
 }
 

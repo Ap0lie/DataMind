@@ -129,6 +129,19 @@ class Settings(BaseSettings):
     assistant_data_batch_max_bytes: int = Field(default=1_073_741_824, ge=1024)
     assistant_recycle_retention_days: int = Field(default=30, ge=1, le=365)
     assistant_rate_limit: int = Field(default=30, ge=1)
+    assistant_memory_enabled: bool = True
+    assistant_memory_summary_messages: int = Field(default=12, ge=4, le=100)
+    assistant_memory_summary_chars: int = Field(default=24_000, ge=1_000, le=240_000)
+    assistant_memory_summary_max_chars: int = Field(default=3_000, ge=500, le=20_000)
+    assistant_memory_retrieval_limit: int = Field(default=8, ge=1, le=50)
+    assistant_memory_context_chars: int = Field(default=4_000, ge=500, le=40_000)
+    assistant_memory_ttl_days: int = Field(default=180, ge=1, le=3_650)
+    assistant_memory_recycle_days: int = Field(default=30, ge=1, le=365)
+    assistant_memory_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    assistant_memory_relevance_threshold: float = Field(default=0.32, ge=0.0, le=1.0)
+    assistant_memory_prefilter_limit: int = Field(default=100, ge=8, le=500)
+    assistant_memory_mmr_lambda: float = Field(default=0.75, ge=0.0, le=1.0)
+    assistant_memory_experience_enabled: bool = True
 
     @model_validator(mode="after")
     def validate_production_profile(self) -> Settings:
