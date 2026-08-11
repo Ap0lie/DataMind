@@ -142,6 +142,9 @@ Celery Beat、受控 Python Runner 和无网络 Sandbox 镜像。DNS、HTTPS、�
 | `DATAMIND_ASSISTANT_MEMORY_ENABLED` | 启用 Kimi 对话摘要与长期记忆 |
 | `DATAMIND_ASSISTANT_MEMORY_RELEVANCE_THRESHOLD` | 普通记忆进入上下文的最低综合相关性 |
 | `DATAMIND_ASSISTANT_MEMORY_EXPERIENCE_ENABLED` | 启用供 Planner 参考的已验证只读分析经验 |
+| `DATAMIND_ASSISTANT_MEMORY_MODEL_EXTRACTION_ENABLED` | 启用回答后的 Kimi 来源校验记忆提取 |
+| `DATAMIND_ASSISTANT_MEMORY_AUTO_DORMANCY_ENABLED` | 校准后启用低效用记忆自动休眠，默认 `false` |
+| `DATAMIND_ASSISTANT_MEMORY_DORMANCY_THRESHOLD` | 自动休眠策略使用的效用阈值 |
 
 各 Agent 可以独立配置模型供应商。Kimi 和 DeepSeek 是默认选择，并非测试环境的
 硬依赖；自动化测试统一使用 Mock Provider。
@@ -154,6 +157,13 @@ Kimi 可以读取当前用户的数据集、已完成分析和报告。问答模
 单独确认，并可在 30 天内恢复。
 
 附件支持 JPEG、PNG、WebP、CSV、XLSX、JSON 和 TXT。大文件采用受保护的落盘暂存，
+
+Kimi Memory 分为对话结构化摘要、版本化长期记忆和任务 Checkpoint。Memory v3 将
+持久内容规范化为带类型的“实体 + 谓词 + 值”，并在回答提交后通过后台 Kimi 提取器
+补充跨句定义，同时严格校验来源消息。用户可对本轮实际使用的单条记忆标记“有用、
+无关、错误”；系统分别计算相关性与效用，并记录采用或抑制原因。低质量记忆只会进入
+可恢复的休眠状态，不会静默删除。自动休眠默认处于影子模式，完成至少 5 个有效基准
+批次后再启用。
 逐个文件解析。最终回答使用模型真实 Token 流，并且只能引用本轮实际读取过的资产。
 
 Kimi Memory 分为三层：带来源的结构化摘要压缩较早消息；版本化语义记忆跨对话保存

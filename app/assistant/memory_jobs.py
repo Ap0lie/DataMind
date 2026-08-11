@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import json
 import logging
 import socket
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from uuid import UUID, uuid4
 
-from app.assistant.memory import AssistantMemoryService
+from app.analysis.model_router import MCPAnalysisModelRouter
+from app.assistant.memory import (
+    AssistantMemoryService,
+    MemoryCandidate,
+    extract_memory_candidates,
+    parse_model_memory_candidates,
+    should_use_model_memory_extractor,
+)
 from app.core.settings import get_settings
 from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.assistant_repository import AssistantRepository
@@ -93,10 +101,15 @@ def run_memory_maintenance(
         )
         conversation = assistant_store.get_conversation(claimed["conversation_id"])
         user_message = assistant_store.get_message(claimed["user_message_id"])
+        model_candidates = _model_memory_candidates(
+            text=str(user_message.get("content") or ""),
+            source_message_id=claimed["user_message_id"],
+        )
         events.extend(
             service.capture_user_memories(
                 conversation=conversation,
                 user_message=user_message,
+                model_candidates=model_candidates,
             )
         )
         summary = service.update_conversation_summary(
@@ -123,6 +136,7 @@ def run_memory_maintenance(
                         "payload": {"memory_id": str(experience["memory_id"])},
                     }
                 )
+                repository.record_validated_reuse(run_id=claimed["run_id"])
         for event in events:
             assistant_store.append_event(claimed["run_id"], **event)
         _merge_message_memory_metadata(
@@ -148,6 +162,68 @@ def run_memory_maintenance(
     finally:
         with _lock:
             _futures.pop(job_id, None)
+
+
+def _model_memory_candidates(
+    *, text: str, source_message_id: UUID
+) -> tuple[MemoryCandidate, ...]:
+    settings = get_settings()
+    deterministic = extract_memory_candidates(text)
+    if (
+        not settings.assistant_memory_model_extraction_enabled
+        or not should_use_model_memory_extractor(text, deterministic)
+    ):
+        return deterministic
+    schema = {
+        "memories": [
+            {
+                "memory_type": "preference|terminology|metric_definition|business_context|workflow_preference",
+                "entity_key": "stable business subject",
+                "predicate": "definition|meaning|preference|context",
+                "typed_value": {"type": "text|number|boolean", "value": "normalized value"},
+                "unit": None,
+                "content": "concise normalized memory",
+                "evidence": "exact quote from the user message",
+                "source_message_ids": [str(source_message_id)],
+                "confidence": 0.8,
+                "correction": False,
+            }
+        ]
+    }
+    try:
+        response = MCPAnalysisModelRouter(settings).complete(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract at most three durable user memories. Return JSON only. "
+                        "Do not extract one-time requests, credentials, personal identifiers, "
+                        "raw data rows, tool output, or assistant inferences. Evidence must be "
+                        "an exact quote from the user message. Use the supplied source message ID. "
+                        f"Output schema example: {json.dumps(schema, ensure_ascii=False)}"
+                    ),
+                },
+                {"role": "user", "content": text[:8_000]},
+            ],
+            provider=settings.assistant_llm_provider,
+            model=settings.assistant_llm_model,
+            temperature=0.0,
+            max_tokens=600,
+            metadata={
+                "agent": "assistant_memory_extract",
+                "optional_stage": True,
+                "timeout_seconds": settings.assistant_memory_timeout_seconds,
+            },
+        )
+        parsed = parse_model_memory_candidates(
+            str(response.content or ""),
+            source_text=text,
+            source_message_id=source_message_id,
+        )
+        return parsed or deterministic
+    except Exception:
+        logger.warning("Model memory extraction failed; using deterministic candidates.", exc_info=True)
+        return deterministic
 
 
 def recover_memory_maintenance_jobs(dataset_store_path: str) -> int:

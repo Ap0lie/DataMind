@@ -42,6 +42,9 @@ from app.schemas.assistant import (
     AssistantImportBatchPreviewRequest,
     AssistantImportBatchResponse,
     AssistantMemoryCreateRequest,
+    AssistantMemoryEffectivenessResponse,
+    AssistantMemoryFeedbackRequest,
+    AssistantMemoryFeedbackResponse,
     AssistantMemoryHistoryResponse,
     AssistantMemoryListResponse,
     AssistantMemoryResponse,
@@ -398,14 +401,71 @@ def reactivate_memory(
 @router.get("/memory-usage", response_model=AssistantMemoryUsageListResponse)
 def list_memory_usage(
     run_id: UUID,
+    include_suppressed: bool = Query(default=False),
     user_id: str = Depends(current_user_id),
 ) -> AssistantMemoryUsageListResponse:
     return AssistantMemoryUsageListResponse(
         usages=tuple(
             AssistantMemoryUsageResponse.model_validate(item)
-            for item in _memory_repository(user_id).list_usage(run_id=run_id)
+            for item in _memory_repository(user_id).list_usage(
+                run_id=run_id,
+                include_suppressed=include_suppressed,
+            )
         )
     )
+
+
+@router.post(
+    "/memory-usage/{usage_id}/feedback",
+    response_model=AssistantMemoryFeedbackResponse,
+)
+def submit_memory_feedback(
+    usage_id: UUID,
+    request: AssistantMemoryFeedbackRequest,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryFeedbackResponse:
+    settings = get_settings()
+    try:
+        feedback = _memory_repository(user_id).record_feedback(
+            usage_id=usage_id,
+            feedback=request.feedback,
+            reason=request.reason,
+            auto_dormancy=settings.assistant_memory_auto_dormancy_enabled,
+            dormancy_threshold=settings.assistant_memory_dormancy_threshold,
+            dormancy_min_feedback=settings.assistant_memory_dormancy_min_feedback,
+            wrong_feedback_limit=settings.assistant_memory_wrong_feedback_limit,
+        )
+        return AssistantMemoryFeedbackResponse.model_validate(feedback)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/memory-effectiveness",
+    response_model=AssistantMemoryEffectivenessResponse,
+)
+def memory_effectiveness(
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryEffectivenessResponse:
+    settings = get_settings()
+    return AssistantMemoryEffectivenessResponse.model_validate(
+        _memory_repository(user_id).effectiveness(
+            shadow_mode=not settings.assistant_memory_auto_dormancy_enabled,
+        )
+    )
+
+
+@router.post("/memories/{memory_id}/wake", response_model=AssistantMemoryResponse)
+def wake_memory(
+    memory_id: UUID,
+    user_id: str = Depends(current_user_id),
+) -> AssistantMemoryResponse:
+    try:
+        return _memory_response(_memory_repository(user_id).wake(memory_id))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/actions", response_model=AssistantActionListResponse)

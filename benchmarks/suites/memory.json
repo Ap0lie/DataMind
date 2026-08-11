@@ -1,7 +1,7 @@
 {
   "suite_id": "memory",
-  "version": "2.0.0",
-  "description": "Deterministic trust, isolation, temporal conflict and retrieval latency gates for Memory v2.",
+  "version": "3.0.0",
+  "description": "Deterministic trust, isolation, effectiveness feedback, strategic dormancy and retrieval latency gates for Memory v3.",
   "mode": "deterministic",
   "corpus_checksum": "auto",
   "max_duration_seconds": 120,
@@ -13,12 +13,13 @@
       "operation": "memory.trust",
       "input": {"memory_count": 500, "query_count": 10},
       "validators": [
-        {"type": "minimum", "path": "precision_at_8", "expected": 0.9},
+        {"type": "minimum", "path": "precision_at_8", "expected": 0.92},
         {"type": "minimum", "path": "recall_at_8", "expected": 0.85},
         {"type": "minimum", "path": "conflict_accuracy", "expected": 0.95},
         {"type": "exact", "path": "superseded_usage", "expected": 0},
         {"type": "exact", "path": "user_isolation", "expected": true},
         {"type": "exact", "path": "current_instruction_override_contract", "expected": true},
+        {"type": "maximum", "path": "harmful_memory_usage_rate", "expected": 0.01},
         {"type": "maximum", "path": "retrieval_p95_ms", "expected": 300}
       ],
       "timeout_seconds": 120,
@@ -26,11 +27,12 @@
     }
   ],
   "thresholds": [
-    {"metric": "memory_precision_at_8", "direction": "minimum", "value": 0.9},
+    {"metric": "memory_precision_at_8", "direction": "minimum", "value": 0.92},
     {"metric": "memory_recall_at_8", "direction": "minimum", "value": 0.85},
     {"metric": "memory_conflict_accuracy", "direction": "minimum", "value": 0.95},
     {"metric": "memory_superseded_usage", "direction": "exact", "value": 0},
     {"metric": "memory_user_isolation", "direction": "exact", "value": 1},
+    {"metric": "memory_harmful_usage_rate", "direction": "maximum", "value": 0.01},
     {"metric": "memory_retrieval_p95_ms", "direction": "maximum", "value": 300}
   ]
 }

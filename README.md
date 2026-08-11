@@ -156,6 +156,9 @@ Compose. The most important settings are:
 | `DATAMIND_ASSISTANT_MEMORY_ENABLED` | Enables Kimi conversation summaries and long-term memory |
 | `DATAMIND_ASSISTANT_MEMORY_RELEVANCE_THRESHOLD` | Minimum combined relevance for ordinary recalled memory |
 | `DATAMIND_ASSISTANT_MEMORY_EXPERIENCE_ENABLED` | Enables validated read-only route experience for Planner |
+| `DATAMIND_ASSISTANT_MEMORY_MODEL_EXTRACTION_ENABLED` | Enables post-answer, source-verified Kimi memory extraction |
+| `DATAMIND_ASSISTANT_MEMORY_AUTO_DORMANCY_ENABLED` | Enables automatic low-utility dormancy after calibration; defaults to `false` |
+| `DATAMIND_ASSISTANT_MEMORY_DORMANCY_THRESHOLD` | Utility threshold used by the calibrated dormancy policy |
 
 Agent-level provider routing is configured independently. Kimi and DeepSeek are
 defaults, not hard requirements; tests use the mock provider.
@@ -182,6 +185,14 @@ only statistically validated analysis experience as read-only Planner evidence; 
 never executes tools or bypasses fresh planning. Recalled memory is relevance gated,
 MMR-ranked, user/asset isolated, auditable per run, and can be disabled without
 deleting stored memory or current-conversation summaries.
+
+Memory v3 closes the quality loop. Durable statements are normalized as typed
+`entity + predicate + value` facts, and complex cross-sentence definitions are
+extracted after the answer is committed with source-message verification. Users can
+mark each recalled memory as helpful, irrelevant, or wrong. Relevance and utility
+are scored separately; suppressed candidates keep an auditable reason. Low-quality
+memory enters a reversible dormant state only after sufficient feedback. Automatic
+dormancy is disabled by default during the five-batch calibration period.
 
 ## MCP Status
 

@@ -1042,6 +1042,7 @@ migrations/
     0010_data_reliability_graph.py
     0011_assistant_memory.py
     0012_trustworthy_memory.py
+    0013_memory_effectiveness.py
 ```
 
 ---
@@ -1085,6 +1086,7 @@ Embedding configuration:
 - `assistant_permission_grants`, `assistant_action_log`, `assistant_import_batches`, execution-mode fields, attachment import metadata, and recycle columns are introduced by `0007_kimi_capabilities` and included in SQLite-to-PostgreSQL migration.
 - `assistant_memories` and conversation summary cursors are introduced by `0011_assistant_memory` and included in SQLite-to-PostgreSQL migration. The dedicated Memory Repository keeps long-term context separate from run/checkpoint persistence.
 - `0012_trustworthy_memory` adds immutable memory version chains, structured summaries, per-user settings, recall usage records, resumable background maintenance jobs, and validated episodic analysis experience. It reuses the application database and BGE cache rather than introducing a vector database.
+- `0013_memory_effectiveness` adds typed entity/predicate/value facts, per-candidate selection and suppression audit, idempotent user feedback, utility signals, reversible dormancy, and effectiveness aggregation. Background Kimi extraction remains outside the first-token path and every model candidate is revalidated against its source user message.
 - `analysis_jobs.prompt_overrides` and `cleaning_jobs.prompt_overrides` are introduced by `0008_agent_prompt_overrides`; retries preserve the original stage preferences and reports retain them as audit metadata.
 - API and Worker share protected attachment storage; image and data-file bytes are never exposed as a public static directory.
 - Local lifespan and production Celery Beat run daily expiry cleanup; permanent purge is not exposed to Kimi or public HTTP APIs.
@@ -1117,6 +1119,11 @@ Assistant configuration:
 - `DATAMIND_ASSISTANT_MEMORY_PREFILTER_LIMIT`
 - `DATAMIND_ASSISTANT_MEMORY_MMR_LAMBDA`
 - `DATAMIND_ASSISTANT_MEMORY_EXPERIENCE_ENABLED`
+- `DATAMIND_ASSISTANT_MEMORY_MODEL_EXTRACTION_ENABLED`
+- `DATAMIND_ASSISTANT_MEMORY_AUTO_DORMANCY_ENABLED`
+- `DATAMIND_ASSISTANT_MEMORY_DORMANCY_THRESHOLD`
+- `DATAMIND_ASSISTANT_MEMORY_DORMANCY_MIN_FEEDBACK`
+- `DATAMIND_ASSISTANT_MEMORY_WRONG_FEEDBACK_LIMIT`
 
 ### Bounded Loop Engineering (implemented, default)
 
@@ -1251,8 +1258,10 @@ Implemented:
 - Data reliability and grain-aware relationship graph v1 reverified 2026-07-30: Ruff passed; 126 Unit, 36 Workflow, and 72 Integration tests passed together with the deterministic release Benchmark, frontend production build, and all 26 desktop/mobile Playwright cases. Alembic `0001 -> 0010`, `0010 -> 0009`, and re-upgrade to `0010` passed on a fresh SQLite database; coverage includes drift invalidation, relationship freshness, unsafe grain blocking, shortest-path planning, and field-to-report lineage persistence.
 - Persistent Kimi data assistant with independent `kimi-k2.6` routing, user-scoped conversation/message history, protected image attachments, automatic report/result retrieval, and validated evidence citations.
 - Trustworthy Memory v2 with sourced structured summaries, immutable conflict/version chains, user-level enablement, relevance/MMR retrieval, per-run recall audit, background maintenance leases, and stale-aware read-only analysis experience for Planner. Checkpoints remain task-local and do not masquerade as long-term memory.
+- Memory v3 effectiveness loop with source-verified typed formation, relevance/utility separation, per-memory helpful/irrelevant/wrong feedback, selected and suppressed recall audit, reversible dormant versions, and a quality workbench. Automatic dormancy remains in shadow mode until five valid Memory benchmark batches establish the deployment baseline.
 - The deterministic Memory benchmark blocks releases on isolation, current-instruction precedence, superseded-use rate, Precision@8, Recall@8, conflict correctness, and 500-memory local retrieval latency.
 - Trustworthy Memory v2 reverified 2026-08-12: Ruff passed; 211 Unit, 82 Workflow, 89 Integration, and 9 Sandbox tests passed; deterministic release and Memory benchmarks passed; the frontend production build and all 60 desktop/mobile Playwright cases passed. Alembic `0001 -> 0012`, `0012 -> 0011`, and re-upgrade to `0012` passed on fresh SQLite and PostgreSQL 16 databases, including Repository conflict-chain and lease smoke tests.
+- Memory v3 reverified 2026-08-12: Ruff passed; 213 Unit, 82 Workflow, and 89 Integration tests passed; deterministic release and Memory v3 benchmarks passed with `Precision@8=97.5%`, `Recall@8=97.5%`, harmful-memory adoption `0%`, and 500-memory retrieval P95 `79.3ms`; the frontend production build and all 60 desktop/mobile Playwright cases passed. Alembic `0001 -> 0013`, `0013 -> 0012`, and re-upgrade to `0013` passed on fresh SQLite; the running PostgreSQL stack upgraded from `0012` to `0013`, and Docker Compose readiness passed.
 - Kimi ask-mode report fast path, database-level Top-N report retrieval, bounded summary-plus-cursor context, segmented first-answer latency telemetry, combined token accounting, and Benchmark P50/P95 aggregation.
 - Kimi report revision with frozen analytical evidence, deterministic evidence fingerprints, no analysis rerun, and one audited primary report deliverable per message.
 - Assistant LangGraph and local/Celery execution path with ordered SSE tool/analysis/message events, immediate terminal cancellation, checkpoint-safe pause/resume, low-confidence semantic-plan confirmation, and analysis-job reuse. Cancel and final-answer commits are atomic so a late model response cannot overwrite the user's stop action.
@@ -1321,6 +1330,7 @@ The current product is successful when users can:
 - Run with semantic embedding disabled/fallback in development and fail production readiness when required local embeddings are unavailable.
 - Ask Kimi about existing DataMind reports and completed analyses, upload an image for visual context, and receive answers backed by clickable report/job/dataset evidence.
 - Tell Kimi to remember an explicit durable preference across conversations, confirm inferred memory candidates, and edit, pin, recycle, or restore user- and asset-scoped memory without changing tool permissions or deleting it with the source conversation.
+- Inspect why a memory was used or suppressed, rate each recalled memory as helpful, irrelevant, or wrong, and wake a dormant version without losing its feedback and version history.
 - Let Kimi start a DataMind analysis when evidence is insufficient, follow the Workflow inside the conversation, confirm low-confidence semantic plans, and continue the answer from the completed result.
 - Grant or revoke Kimi access to a selected dataset, dataset group, or report; every tool call must satisfy both conversation scope and capability Grant checks.
 - In Execute mode, let Kimi run authorized cleaning, relationship, analysis, report, semantic-model, recycle, restore, and reversible action workflows without bypassing quality, SQL, semantic, or sandbox validation.
@@ -1333,6 +1343,7 @@ The current product is successful when users can:
 
 ## Next
 
+- Retain five valid Memory v3 benchmark batches, review harmful-memory adoption and feedback calibration, then decide whether production automatic dormancy can be enabled.
 - Continue behavior-preserving module extraction: move frontend domain types and page modules out of `main.tsx`; move Workflow Prompt builders into `workflow_prompts.py` and node factories into a `workflow_nodes` package; move relationship-graph validation into its own storage helper and split dataset/group/job/report repositories behind the existing facade.
 - Run and retain the real-stack production smoke artifact on a Docker-capable host before production acceptance.
 - Add per-cell manual cleaning approval workflow.

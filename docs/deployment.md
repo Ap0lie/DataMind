@@ -76,6 +76,16 @@ long-term reads and writes off without deleting existing memory. Tune
 benchmark. `DATAMIND_ASSISTANT_MEMORY_EXPERIENCE_ENABLED` controls read-only Planner
 experience reuse independently.
 
+Memory v3 model extraction runs only in the post-answer maintenance job. Keep
+`DATAMIND_ASSISTANT_MEMORY_MODEL_EXTRACTION_ENABLED=true` when the Kimi provider is
+configured; deterministic extraction remains the fallback. Relevance and utility are
+scored separately. Start with
+`DATAMIND_ASSISTANT_MEMORY_AUTO_DORMANCY_ENABLED=false`, retain at least five valid
+Memory benchmark batches, then enable it only if harmful-memory adoption remains
+below the release threshold. Dormancy is reversible and never applies to pinned
+memory. The default policy requires three feedback signals or two explicit `wrong`
+ratings and a utility below `0.25`.
+
 If the server cannot reach the official Python package index, set
 `DATAMIND_PYPI_INDEX_URL` to an approved internal or regional mirror before
 building. This value is used only while building images.

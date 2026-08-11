@@ -4,7 +4,7 @@ export type AssistantCapability = "data_prepare" | "relationship_manage" | "anal
 export type AssistantAssetType = "dataset" | "dataset_group" | "report" | "semantic_model";
 export type AssistantMemoryType = "preference" | "terminology" | "metric_definition" | "business_context" | "workflow_preference" | "analysis_experience";
 export type AssistantMemoryScopeType = "user" | "dataset" | "dataset_group" | "report";
-export type AssistantMemoryStatus = "active" | "pending" | "superseded" | "stale" | "recycled";
+export type AssistantMemoryStatus = "active" | "pending" | "superseded" | "stale" | "dormant" | "recycled";
 export type AssistantMemoryKind = "semantic" | "episodic";
 
 export const ASSISTANT_FULL_CAPABILITIES: AssistantCapability[] = [
@@ -162,8 +162,12 @@ export type AssistantMemory = {
   scope_id?: string | null;
   normalized_key: string;
   subject_key: string;
+  entity_key: string;
+  predicate: string;
   content: string;
   structured_value: Record<string, unknown>;
+  typed_value: Record<string, unknown>;
+  unit?: string | null;
   version: number;
   supersedes_id?: string | null;
   superseded_by_id?: string | null;
@@ -178,12 +182,35 @@ export type AssistantMemory = {
   source_message_id?: string | null;
   source_conversation_deleted: boolean;
   last_used_at?: string | null;
+  utility_score: number;
+  helpful_count: number;
+  irrelevant_count: number;
+  wrong_count: number;
+  correction_count: number;
+  validated_reuse_count: number;
+  feedback_count: number;
+  last_validated_at?: string | null;
+  dormant_reason?: string | null;
   valid_from?: string | null;
   valid_to?: string | null;
   deleted_at?: string | null;
   purge_after?: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type AssistantMemoryEffectiveness = {
+  total_memories: number;
+  active_memories: number;
+  dormant_memories: number;
+  low_quality_memories: number;
+  never_used_memories: number;
+  usage_count: number;
+  selected_usage_count: number;
+  average_utility: number;
+  feedback_counts: Record<string, number>;
+  suppression_counts: Record<string, number>;
+  shadow_mode: boolean;
 };
 
 export type AssistantImportFilePreview = {

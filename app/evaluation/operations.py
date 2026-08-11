@@ -526,6 +526,40 @@ def _memory_trust(case: BenchmarkCase) -> BenchmarkObservation:
         context_contract = "current user message overrides memory" in service.render_prompt_context(
             (current,)
         ).casefold()
+        harmful = service.create_manual(
+            memory_type="business_context",
+            scope_type="user",
+            scope_id=None,
+            content="高风险测试口径应使用已经失效的旧金额字段",
+        )
+        for _ in range(2):
+            harmful_run = uuid4()
+            recalled = service.retrieve(
+                question="高风险测试口径使用哪个金额字段？",
+                conversation={"scope_type": "auto", "scope_id": None},
+                run_id=harmful_run,
+            )
+            harmful_usage = next(
+                item for item in recalled if item["memory_id"] == harmful["memory_id"]
+            )
+            repository.record_feedback(
+                usage_id=harmful_usage["usage_id"],
+                feedback="wrong",
+                reason="benchmark harmful memory",
+                auto_dormancy=True,
+                dormancy_threshold=0.25,
+                dormancy_min_feedback=3,
+                wrong_feedback_limit=2,
+            )
+        harmful_usage_rate = float(
+            any(
+                item["memory_id"] == harmful["memory_id"]
+                for item in service.retrieve(
+                    question="高风险测试口径使用哪个金额字段？",
+                    conversation={"scope_type": "auto", "scope_id": None},
+                )
+            )
+        )
         precision = matched_count / selected_count if selected_count else 0.0
         recall = matched_count / expected_count if expected_count else 0.0
         p95 = sorted(latencies)[max(0, math.ceil(len(latencies) * 0.95) - 1)]
@@ -537,6 +571,7 @@ def _memory_trust(case: BenchmarkCase) -> BenchmarkObservation:
                 "superseded_usage": old_usage,
                 "user_isolation": isolated,
                 "current_instruction_override_contract": context_contract,
+                "harmful_memory_usage_rate": harmful_usage_rate,
                 "retrieval_p95_ms": p95,
             },
             metrics={
@@ -545,6 +580,7 @@ def _memory_trust(case: BenchmarkCase) -> BenchmarkObservation:
                 "memory_conflict_accuracy": conflict_correct,
                 "memory_superseded_usage": float(old_usage),
                 "memory_user_isolation": 1.0 if isolated else 0.0,
+                "memory_harmful_usage_rate": harmful_usage_rate,
                 "memory_retrieval_p95_ms": p95,
             },
         )

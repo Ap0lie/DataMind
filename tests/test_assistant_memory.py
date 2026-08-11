@@ -9,6 +9,7 @@ import pytest
 from app.assistant.memory import (
     AssistantMemoryService,
     extract_memory_candidates,
+    parse_model_memory_candidates,
 )
 from app.core.settings import get_settings
 from app.semantic.embedding import DisabledEmbeddingProvider
@@ -50,6 +51,41 @@ def test_explicit_and_inferred_memory_are_separated_and_sensitive_values_are_rej
 
     assert extract_memory_candidates("这次请把报告改短一点。") == ()
     assert extract_memory_candidates("请记住 API_KEY=not-a-real-secret-value") == ()
+
+
+def test_model_memory_candidate_requires_exact_source_and_builds_canonical_value() -> None:
+    message_id = uuid4()
+    source = "请记住，我们把净收入定义为销售额减去退款，单位是元。以后报告使用这个口径。"
+    payload = f"""{{
+      "memories": [{{
+        "memory_type": "metric_definition",
+        "entity_key": "net_revenue",
+        "predicate": "definition",
+        "typed_value": {{"type": "text", "value": "销售额减去退款"}},
+        "unit": "元",
+        "content": "净收入定义为销售额减去退款",
+        "evidence": "我们把净收入定义为销售额减去退款，单位是元。",
+        "source_message_ids": ["{message_id}"],
+        "confidence": 0.91
+      }}]
+    }}"""
+    parsed = parse_model_memory_candidates(
+        payload,
+        source_text=source,
+        source_message_id=message_id,
+    )
+    assert len(parsed) == 1
+    assert parsed[0].explicit is True
+    assert parsed[0].subject_key == "metric_definition:net_revenue:definition"
+    assert parsed[0].typed_value == {"type": "text", "value": "销售额减去退款"}
+    assert parsed[0].unit == "元"
+
+    invalid = payload.replace(str(message_id), str(uuid4()))
+    assert parse_model_memory_candidates(
+        invalid,
+        source_text=source,
+        source_message_id=message_id,
+    ) == ()
 
 
 def test_explicit_conflict_creates_auditable_version_chain(memory_context) -> None:
@@ -355,6 +391,81 @@ def test_retrieval_applies_relevance_gate_and_records_actual_usage(memory_contex
     usages = repository.list_usage(run_id=run_id)
     assert [item["memory_id"] for item in usages] == [relevant["memory_id"]]
     assert usages[0]["reason"]
+    all_usage = repository.list_usage(run_id=run_id, include_suppressed=True)
+    assert len(all_usage) == 2
+    assert any(
+        not item["final_selected"]
+        and item["suppression_reason"] == "below_relevance_threshold"
+        for item in all_usage
+    )
+
+
+def test_feedback_is_idempotent_and_repeated_wrong_memory_can_sleep(memory_context) -> None:
+    settings, _store, repository, service = memory_context
+    memory = service.create_manual(
+        memory_type="business_context",
+        scope_type="user",
+        scope_id=None,
+        content="华东区域是重点销售市场",
+    )
+    usage_ids = []
+    for _ in range(2):
+        recalled = service.retrieve(
+            question="华东销售市场表现如何？",
+            conversation={"scope_type": "auto", "scope_id": None},
+            run_id=uuid4(),
+        )
+        usage_ids.append(recalled[0]["usage_id"])
+
+    first = repository.record_feedback(
+        usage_id=usage_ids[0],
+        feedback="wrong",
+        reason="业务背景已经变化",
+        auto_dormancy=True,
+        dormancy_threshold=settings.assistant_memory_dormancy_threshold,
+        dormancy_min_feedback=settings.assistant_memory_dormancy_min_feedback,
+        wrong_feedback_limit=settings.assistant_memory_wrong_feedback_limit,
+    )
+    assert first["memory_status"] == "active"
+    repeated = repository.record_feedback(
+        usage_id=usage_ids[0],
+        feedback="helpful",
+        reason=None,
+        auto_dormancy=True,
+        dormancy_threshold=settings.assistant_memory_dormancy_threshold,
+        dormancy_min_feedback=settings.assistant_memory_dormancy_min_feedback,
+        wrong_feedback_limit=settings.assistant_memory_wrong_feedback_limit,
+    )
+    assert repeated["feedback_id"] == first["feedback_id"]
+    assert repository.get(memory["memory_id"])["wrong_count"] == 0
+
+    repository.record_feedback(
+        usage_id=usage_ids[0],
+        feedback="wrong",
+        reason=None,
+        auto_dormancy=True,
+        dormancy_threshold=settings.assistant_memory_dormancy_threshold,
+        dormancy_min_feedback=settings.assistant_memory_dormancy_min_feedback,
+        wrong_feedback_limit=settings.assistant_memory_wrong_feedback_limit,
+    )
+    final = repository.record_feedback(
+        usage_id=usage_ids[1],
+        feedback="wrong",
+        reason=None,
+        auto_dormancy=True,
+        dormancy_threshold=settings.assistant_memory_dormancy_threshold,
+        dormancy_min_feedback=settings.assistant_memory_dormancy_min_feedback,
+        wrong_feedback_limit=settings.assistant_memory_wrong_feedback_limit,
+    )
+    assert final["memory_status"] == "dormant"
+    assert service.retrieve(
+        question="华东销售市场表现如何？",
+        conversation={"scope_type": "auto", "scope_id": None},
+    ) == ()
+    woken = repository.wake(memory["memory_id"])
+    assert woken["status"] == "active"
+    assert woken["version"] == 2
+    assert woken["utility_score"] == 0.5
 
 
 def test_only_validated_analysis_becomes_experience_and_drift_marks_it_stale(

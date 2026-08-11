@@ -26,3 +26,8 @@ The deterministic `memory` suite is a blocking trust gate. It validates user
 isolation, temporal supersession, current-instruction precedence, Precision@8,
 Recall@8, and local retrieval P95 with 500 active memories. It uses generated
 business topics and does not call an LLM provider.
+
+Memory v3 additionally injects a misleading memory, records idempotent negative
+feedback, verifies reversible dormancy, and requires harmful-memory adoption below
+1%. Keep production automatic dormancy in shadow mode until five valid benchmark
+batches have been retained for the current corpus and model configuration.

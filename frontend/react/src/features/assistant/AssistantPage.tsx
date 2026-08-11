@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   Brain,
+  CircleMinus,
   FileImage,
   FileSpreadsheet,
   Loader2,
@@ -15,6 +16,8 @@ import {
   Search,
   Send,
   Sparkles,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
   X,
 } from "lucide-react";
@@ -856,12 +859,16 @@ function memoryUpdates(metadata: Record<string, unknown>) {
 
 type RecalledMemory = {
   memory_id: string;
+  usage_id?: string;
   memory_type: string;
   memory_kind: string;
   content: string;
   scope_type: string;
+  source_message_id?: string | null;
   reason: string;
   score: number;
+  relevance_score?: number;
+  utility_score?: number;
 };
 
 function memoryUsage(metadata: Record<string, unknown>): RecalledMemory[] {
@@ -881,17 +888,40 @@ function memoryUsage(metadata: Record<string, unknown>): RecalledMemory[] {
 }
 
 function MemoryRecall({ usage, onOpenMemory }: { usage: RecalledMemory[]; onOpenMemory: () => void }) {
+  const [feedback, setFeedback] = useState<Record<string, "helpful" | "irrelevant" | "wrong">>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   if (!usage.length) return null;
+  const submitFeedback = async (item: RecalledMemory, value: "helpful" | "irrelevant" | "wrong") => {
+    if (!item.usage_id) return;
+    setBusy(item.usage_id);
+    setError(null);
+    try {
+      await apiPost(`/assistant/memory-usage/${item.usage_id}/feedback`, { feedback: value });
+      setFeedback((current) => ({ ...current, [item.usage_id!]: value }));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
   return (
     <details className="assistant-memory-recall">
       <summary><Brain size={14} />使用了 {usage.length} 条记忆</summary>
       <div>
         {usage.map((item) => (
           <article key={item.memory_id}>
-            <div><b>{recalledMemoryLabel(item)}</b><span>{item.reason}</span></div>
+            <div><b>{recalledMemoryLabel(item)}</b><span>{item.reason}</span>{item.source_message_id && <span>来源消息 {item.source_message_id.slice(0, 8)}</span>}</div>
             <p>{item.content}</p>
+            {item.usage_id && <div className="assistant-memory-vote" aria-label="评价这条记忆">
+              <span>这条记忆有帮助吗？</span>
+              <button type="button" className={feedback[item.usage_id] === "helpful" ? "active" : ""} disabled={busy === item.usage_id} title="有用" onClick={() => void submitFeedback(item, "helpful")}><ThumbsUp size={13} /> 有用</button>
+              <button type="button" className={feedback[item.usage_id] === "irrelevant" ? "active" : ""} disabled={busy === item.usage_id} title="无关" onClick={() => void submitFeedback(item, "irrelevant")}><CircleMinus size={13} /> 无关</button>
+              <button type="button" className={feedback[item.usage_id] === "wrong" ? "active wrong" : ""} disabled={busy === item.usage_id} title="错误" onClick={() => void submitFeedback(item, "wrong")}><ThumbsDown size={13} /> 错误</button>
+            </div>}
           </article>
         ))}
+        {error && <small className="assistant-memory-vote-error">反馈未保存：{error}</small>}
         <button type="button" onClick={onOpenMemory}>管理记忆</button>
       </div>
     </details>

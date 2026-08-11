@@ -30,7 +30,7 @@ MEMORY_TYPES = {
     "analysis_experience",
 }
 MEMORY_SCOPES = {"user", "dataset", "dataset_group", "report"}
-MEMORY_STATUSES = {"active", "pending", "superseded", "stale", "recycled"}
+MEMORY_STATUSES = {"active", "pending", "superseded", "stale", "dormant", "recycled"}
 
 _EXPLICIT_MARKERS = (
     "请记住",
@@ -76,6 +76,11 @@ class MemoryCandidate:
     explicit: bool
     confidence: float
     structured_value: dict[str, Any] = field(default_factory=dict)
+    entity_key: str = ""
+    predicate: str = "value"
+    typed_value: dict[str, Any] = field(default_factory=dict)
+    unit: str | None = None
+    correction: bool = False
     application_policy: str = "relevant"
 
 
@@ -113,12 +118,17 @@ class AssistantMemoryService:
         if _sensitive_reason(cleaned):
             raise ValueError("敏感凭证、个人信息或原始数据不能写入长期记忆。")
         subject = _normalized_key(memory_type, cleaned)
+        canonical = _canonical_memory_value(memory_type, cleaned, subject)
         return self.repository.save(
             memory_type=memory_type,
             scope_type=scope_type,
             scope_id=scope_id,
             normalized_key=subject,
             subject_key=subject,
+            entity_key=canonical["entity_key"],
+            predicate=canonical["predicate"],
+            typed_value=canonical["typed_value"],
+            unit=canonical["unit"],
             content=cleaned,
             explicit=True,
             confidence=1.0,
@@ -149,12 +159,17 @@ class AssistantMemoryService:
             if next_type == current["memory_type"]
             else _normalized_key(next_type, next_content)
         )
+        canonical = _canonical_memory_value(next_type, next_content, subject)
         return self.repository.save(
             memory_type=next_type,
             scope_type=current["scope_type"],
             scope_id=current["scope_id"],
             normalized_key=subject,
             subject_key=subject,
+            entity_key=canonical["entity_key"],
+            predicate=canonical["predicate"],
+            typed_value=canonical["typed_value"],
+            unit=canonical["unit"],
             content=next_content,
             structured_value=current.get("structured_value") or {},
             memory_kind=current.get("memory_kind") or "semantic",
@@ -173,6 +188,7 @@ class AssistantMemoryService:
         conversation: dict[str, Any],
         evidence: Iterable[dict[str, Any]] = (),
         run_id: UUID | None = None,
+        assistant_message_id: UUID | None = None,
         semantic_model: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], ...]:
         if not self._enabled():
@@ -202,6 +218,7 @@ class AssistantMemoryService:
             candidates=candidates,
             scope_scores=scope_scores,
             run_id=run_id,
+            assistant_message_id=assistant_message_id,
             limit=self.settings.assistant_memory_retrieval_limit,
             context_chars=self.settings.assistant_memory_context_chars,
         )
@@ -214,6 +231,7 @@ class AssistantMemoryService:
         dataset_group_id: UUID | None = None,
         additional_dataset_ids: tuple[UUID, ...] = (),
         run_id: UUID | None = None,
+        assistant_message_id: UUID | None = None,
     ) -> tuple[dict[str, Any], ...]:
         """Return validated route evidence for Planner only, never an executable plan."""
         if not self._enabled() or not self.settings.assistant_memory_experience_enabled:
@@ -249,6 +267,7 @@ class AssistantMemoryService:
             candidates=candidates,
             scope_scores=scope_scores,
             run_id=run_id,
+            assistant_message_id=assistant_message_id,
             limit=min(3, self.settings.assistant_memory_retrieval_limit),
             context_chars=min(2_500, self.settings.assistant_memory_context_chars),
         )
@@ -260,6 +279,7 @@ class AssistantMemoryService:
         candidates: list[dict[str, Any]],
         scope_scores: dict[tuple[str, str], float],
         run_id: UUID | None,
+        assistant_message_id: UUID | None,
         limit: int,
         context_chars: int,
     ) -> tuple[dict[str, Any], ...]:
@@ -300,37 +320,40 @@ class AssistantMemoryService:
         except Exception:
             vectors_by_id = {}
 
-        scored: list[dict[str, Any]] = []
+        evaluated: list[dict[str, Any]] = []
         for item in candidates:
             scope_score = scope_scores[(item["scope_type"], str(item["scope_id"] or "user"))]
             recency = _recency_score(item.get("last_used_at") or item["updated_at"], now)
             lexical = lexical_by_id[item["memory_id"]]
             embedding = embedding_scores[item["memory_id"]]
-            score = (
+            relevance = (
                 lexical * 0.40
                 + embedding * 0.35
                 + scope_score * 0.15
                 + recency * 0.10
             )
+            utility = max(0.0, min(1.0, float(item.get("utility_score") or 0.5)))
+            final_score = relevance * 0.75 + utility * 0.25
             always = bool(
                 item["application_policy"] == "always" and item["explicit"]
             )
             relevant = (
                 (lexical >= 0.15 or embedding >= 0.35)
-                and score >= self.settings.assistant_memory_relevance_threshold
+                and relevance >= self.settings.assistant_memory_relevance_threshold
             )
-            if not (always or relevant):
-                continue
             reason = (
                 "用户确认的持续偏好"
                 if always
                 else _recall_reason(lexical, embedding, scope_score)
             )
-            scored.append(
+            evaluated.append(
                 item
                 | {
-                    "relevance_score": round(score, 4),
+                    "relevance_score": round(relevance, 4),
+                    "utility_score": round(utility, 4),
+                    "final_score": round(final_score, 4),
                     "recall_reason": reason,
+                    "eligible": bool(always or relevant),
                     "score_breakdown": {
                         "lexical": round(lexical, 4),
                         "embedding": round(embedding, 4),
@@ -340,8 +363,9 @@ class AssistantMemoryService:
                     "_vector": vectors_by_id.get(item["memory_id"]),
                 }
             )
+        eligible = [item for item in evaluated if item["eligible"]]
         selected = _mmr_select(
-            scored,
+            eligible,
             limit=limit,
             lambda_value=self.settings.assistant_memory_mmr_lambda,
         )
@@ -356,8 +380,44 @@ class AssistantMemoryService:
             used_chars += rendered_size
         self.repository.mark_used(tuple(item["memory_id"] for item in output))
         if run_id is not None:
-            for item in output:
-                self.repository.record_usage(run_id=run_id, memory=item)
+            output_ids = {item["memory_id"] for item in output}
+            selected_ids = {item["memory_id"] for item in selected}
+            ranked = sorted(
+                evaluated,
+                key=lambda item: (item["final_score"], item["updated_at"]),
+                reverse=True,
+            )
+            usage_entries = []
+            for rank, item in enumerate(ranked, start=1):
+                memory_id = item["memory_id"]
+                suppression_reason = None
+                if not item["eligible"]:
+                    suppression_reason = "below_relevance_threshold"
+                elif memory_id not in selected_ids:
+                    suppression_reason = "mmr_or_limit"
+                elif memory_id not in output_ids:
+                    suppression_reason = "context_budget"
+                usage_entries.append(
+                    {
+                        "memory": item,
+                        "retrieval_rank": rank,
+                        "final_selected": memory_id in output_ids,
+                        "suppression_reason": suppression_reason,
+                    }
+                )
+            recorded = self.repository.record_usage_batch(
+                run_id=run_id,
+                entries=tuple(usage_entries),
+                assistant_message_id=assistant_message_id,
+            )
+            usage_by_memory = {
+                item["memory_id"]: usage
+                for item, usage in zip(ranked, recorded, strict=True)
+            }
+            output = [
+                item | {"usage_id": usage_by_memory[item["memory_id"]]["usage_id"]}
+                for item in output
+            ]
         return tuple(output)
 
     def _published_semantic_models(
@@ -433,6 +493,7 @@ class AssistantMemoryService:
         *,
         conversation: dict[str, Any],
         user_message: dict[str, Any],
+        model_candidates: Iterable[MemoryCandidate] = (),
     ) -> tuple[dict[str, Any], ...]:
         if not self._enabled():
             return ()
@@ -442,7 +503,10 @@ class AssistantMemoryService:
             if any(marker in str(user_message.get("content") or "").casefold() for marker in _EXPLICIT_MARKERS):
                 events.append({"event_type": "memory.skipped", "status": "completed", "message": reason})
         else:
-            for candidate in extract_memory_candidates(str(user_message.get("content") or "")):
+            candidates = tuple(model_candidates) or extract_memory_candidates(
+                str(user_message.get("content") or "")
+            )
+            for candidate in candidates:
                 scope_type, scope_id = _conversation_memory_scope(conversation)
                 previous = next(
                     (
@@ -464,8 +528,12 @@ class AssistantMemoryService:
                     scope_id=scope_id,
                     normalized_key=candidate.normalized_key,
                     subject_key=candidate.subject_key,
+                    entity_key=candidate.entity_key,
+                    predicate=candidate.predicate,
                     content=candidate.content,
                     structured_value=candidate.structured_value,
+                    typed_value=candidate.typed_value,
+                    unit=candidate.unit,
                     memory_kind="semantic",
                     explicit=candidate.explicit,
                     confidence=candidate.confidence,
@@ -473,6 +541,7 @@ class AssistantMemoryService:
                     source_conversation_id=conversation["conversation_id"],
                     source_message_id=user_message["message_id"],
                     application_policy=candidate.application_policy,
+                    correction=candidate.correction,
                 )
                 event_type = "memory.saved" if candidate.explicit else "memory.candidate"
                 if previous and previous["memory_id"] != memory["memory_id"]:
@@ -566,8 +635,10 @@ class AssistantMemoryService:
         ):
             return None
         report = self.store.get_report(job.report_id)
-        metadata = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
-        contract = result.get("analysis_contract") or metadata.get("analysis_contract") or {}
+        raw_metadata = report.get("metadata")
+        metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+        raw_contract = result.get("analysis_contract") or metadata.get("analysis_contract")
+        contract: dict[str, Any] = raw_contract if isinstance(raw_contract, dict) else {}
         subject = "experience:" + hashlib.sha256(
             json.dumps(contract, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()[:24]
@@ -591,8 +662,11 @@ class AssistantMemoryService:
             scope_id=scope_id,
             normalized_key=subject,
             subject_key=subject,
+            entity_key=subject,
+            predicate="validated_route",
             content=_experience_content(job.question, structured),
             structured_value=structured,
+            typed_value={"type": "analysis_experience", "value": structured},
             explicit=True,
             confidence=1.0,
             status="active",
@@ -770,6 +844,7 @@ def extract_memory_candidates(text: str) -> tuple[MemoryCandidate, ...]:
         memory_type = _memory_type(sentence)
         cleaned = _clean_content(sentence)
         subject = _normalized_key(memory_type, cleaned)
+        canonical = _canonical_memory_value(memory_type, cleaned, subject)
         candidates.append(
             MemoryCandidate(
                 memory_type=memory_type,
@@ -779,6 +854,14 @@ def extract_memory_candidates(text: str) -> tuple[MemoryCandidate, ...]:
                 explicit=explicit,
                 confidence=0.98 if explicit else 0.68,
                 structured_value={"value": cleaned},
+                entity_key=canonical["entity_key"],
+                predicate=canonical["predicate"],
+                typed_value=canonical["typed_value"],
+                unit=canonical["unit"],
+                correction=any(
+                    marker in normalized
+                    for marker in ("纠正", "更正", "之前不对", "之前错误", "改为", "correction")
+                ),
                 application_policy=_application_policy(
                     memory_type,
                     subject,
@@ -789,6 +872,87 @@ def extract_memory_candidates(text: str) -> tuple[MemoryCandidate, ...]:
         if len(candidates) >= 3:
             break
     return tuple(candidates)
+
+
+def should_use_model_memory_extractor(
+    text: str,
+    deterministic: Iterable[MemoryCandidate],
+) -> bool:
+    if _sensitive_reason(text):
+        return False
+    normalized = text.casefold()
+    has_intent = any(marker in normalized for marker in (*_EXPLICIT_MARKERS, *_INFERRED_MARKERS))
+    candidates = tuple(deterministic)
+    return has_intent and (
+        not candidates
+        or len(_sentences(text)) > 1
+        or any(re.fullmatch(r"[0-9a-f]{24}", item.subject_key) for item in candidates)
+    )
+
+
+def parse_model_memory_candidates(
+    payload: str,
+    *,
+    source_text: str,
+    source_message_id: UUID,
+) -> tuple[MemoryCandidate, ...]:
+    try:
+        parsed = json.loads(_extract_json_payload(payload))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    items = parsed.get("memories") if isinstance(parsed, dict) else None
+    if not isinstance(items, list):
+        return ()
+    output: list[MemoryCandidate] = []
+    source_ids = {str(source_message_id)}
+    for item in items[:3]:
+        if not isinstance(item, dict):
+            continue
+        if set(str(value) for value in item.get("source_message_ids") or []) != source_ids:
+            continue
+        try:
+            evidence = _clean_content(str(item.get("evidence") or ""))
+        except ValueError:
+            continue
+        if evidence not in source_text or _sensitive_reason(evidence):
+            continue
+        memory_type = str(item.get("memory_type") or "")
+        if memory_type not in MEMORY_TYPES or memory_type == "analysis_experience":
+            continue
+        entity = _canonical_identifier(str(item.get("entity_key") or ""))
+        predicate = _canonical_identifier(str(item.get("predicate") or "value")) or "value"
+        if not entity:
+            continue
+        typed_value = item.get("typed_value")
+        if not isinstance(typed_value, dict) or "value" not in typed_value:
+            continue
+        explicit = any(marker in source_text.casefold() for marker in _EXPLICIT_MARKERS)
+        subject = f"{memory_type}:{entity}:{predicate}"[:160]
+        try:
+            content = _clean_content(str(item.get("content") or evidence))
+        except ValueError:
+            continue
+        output.append(
+            MemoryCandidate(
+                memory_type=memory_type,
+                normalized_key=subject,
+                subject_key=subject,
+                entity_key=entity,
+                predicate=predicate,
+                content=content,
+                explicit=explicit,
+                confidence=min(0.95, max(0.5, float(item.get("confidence") or 0.65))),
+                structured_value={"value": typed_value.get("value"), "evidence": evidence},
+                typed_value={
+                    "type": str(typed_value.get("type") or "text"),
+                    "value": typed_value.get("value"),
+                },
+                unit=str(item.get("unit") or "").strip() or None,
+                correction=bool(item.get("correction")) and explicit,
+                application_policy=_application_policy(memory_type, subject, explicit=explicit),
+            )
+        )
+    return tuple(output)
 
 
 def deterministic_conversation_summary(source: str) -> str:
@@ -838,7 +1002,7 @@ def structured_conversation_summary(
             if _sensitive_reason(sentence):
                 continue
             category = _summary_category(sentence, role)
-            entry = {
+            entry: dict[str, Any] = {
                 "value": _truncate_middle(sentence, 500),
                 "source_message_ids": [message_id],
                 "valid_from": timestamp,
@@ -935,9 +1099,9 @@ def _mmr_select(
     while remaining and len(selected) < limit:
         def mmr(item: dict[str, Any]) -> float:
             if not selected:
-                return float(item["relevance_score"])
+                return float(item["final_score"])
             redundancy = max(_memory_similarity(item, prior) for prior in selected)
-            return lambda_value * float(item["relevance_score"]) - (1 - lambda_value) * redundancy
+            return lambda_value * float(item["final_score"]) - (1 - lambda_value) * redundancy
 
         chosen = max(
             remaining,
@@ -1110,6 +1274,64 @@ def _normalized_key(memory_type: str, content: str) -> str:
         if any(marker in content.casefold() for marker in markers):
             return key
     return hashlib.sha256(f"{memory_type}:{normalized}".encode()).hexdigest()[:24]
+
+
+def _canonical_memory_value(
+    memory_type: str,
+    content: str,
+    subject_key: str,
+) -> dict[str, Any]:
+    predicate = {
+        "metric_definition": "definition",
+        "terminology": "meaning",
+        "workflow_preference": "preference",
+        "preference": "preference",
+        "business_context": "context",
+        "analysis_experience": "validated_route",
+    }.get(memory_type, "value")
+    value_text = content
+    parts = re.split(
+        r"定义为|定义是|口径是|口径为|叫做|默认(?:使用|用)?|means|=|：|:",
+        content,
+        maxsplit=1,
+        flags=re.I,
+    )
+    if len(parts) == 2 and parts[1].strip():
+        value_text = parts[1].strip(" ，。;；")
+    number_match = re.fullmatch(r"[-+]?\d+(?:\.\d+)?", value_text)
+    if number_match:
+        value: Any = float(value_text) if "." in value_text else int(value_text)
+        value_type = "number"
+    elif value_text.casefold() in {"true", "false", "是", "否"}:
+        value = value_text.casefold() in {"true", "是"}
+        value_type = "boolean"
+    else:
+        value = value_text
+        value_type = "text"
+    unit_match = re.search(r"(%|百分比|元|万元|亿元|天|小时|分钟|秒|个|件|次)", value_text)
+    return {
+        "entity_key": subject_key,
+        "predicate": predicate,
+        "typed_value": {"type": value_type, "value": value},
+        "unit": unit_match.group(1) if unit_match else None,
+    }
+
+
+def _canonical_identifier(value: str) -> str:
+    normalized = "_".join(
+        part for part in re.split(r"[^\w\u4e00-\u9fff]+", value.casefold()) if part
+    )
+    return normalized[:80]
+
+
+def _extract_json_payload(value: str) -> str:
+    cleaned = str(value or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    return cleaned[start : end + 1] if start >= 0 and end >= start else cleaned
 
 
 def _clean_content(value: str | None) -> str:

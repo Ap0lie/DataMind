@@ -38,6 +38,7 @@ TABLES = (
     "assistant_memories",
     "assistant_memory_settings",
     "assistant_memory_usage",
+    "assistant_memory_feedback",
     "assistant_memory_maintenance_jobs",
     "user_sessions",
 )

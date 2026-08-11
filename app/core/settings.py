@@ -142,6 +142,11 @@ class Settings(BaseSettings):
     assistant_memory_prefilter_limit: int = Field(default=100, ge=8, le=500)
     assistant_memory_mmr_lambda: float = Field(default=0.75, ge=0.0, le=1.0)
     assistant_memory_experience_enabled: bool = True
+    assistant_memory_model_extraction_enabled: bool = True
+    assistant_memory_auto_dormancy_enabled: bool = False
+    assistant_memory_dormancy_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
+    assistant_memory_dormancy_min_feedback: int = Field(default=3, ge=1, le=100)
+    assistant_memory_wrong_feedback_limit: int = Field(default=2, ge=1, le=20)
 
     @model_validator(mode="after")
     def validate_production_profile(self) -> Settings:

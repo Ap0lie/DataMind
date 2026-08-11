@@ -112,6 +112,21 @@ async def test_assistant_memory_crud_confirmation_and_user_isolation(assistant_s
         assert usage.status_code == 200
         assert usage.json()["usages"][0]["memory_id"] == updated_id
         assert usage.json()["usages"][0]["reason"] == "当前问题与已确认报告偏好相关"
+        usage_id = usage.json()["usages"][0]["usage_id"]
+        feedback = await client.post(
+            f"/api/v1/assistant/memory-usage/{usage_id}/feedback",
+            json={"feedback": "helpful"},
+            headers=alice,
+        )
+        assert feedback.status_code == 200, feedback.text
+        assert feedback.json()["utility_score"] > 0.5
+        effectiveness = await client.get(
+            "/api/v1/assistant/memory-effectiveness",
+            headers=alice,
+        )
+        assert effectiveness.status_code == 200
+        assert effectiveness.json()["feedback_counts"]["helpful"] == 1
+        assert effectiveness.json()["shadow_mode"] is True
         hidden_usage = await client.get(
             "/api/v1/assistant/memory-usage",
             params={"run_id": str(run_id)},

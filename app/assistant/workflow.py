@@ -127,17 +127,24 @@ class AssistantWorkflowRunner:
                 conversation=conversation,
                 evidence=tools.evidence.values(),
                 run_id=run_id,
+                assistant_message_id=run.assistant_message_id,
             )
             memory_usage = [
                 {
                     "memory_id": str(item["memory_id"]),
+                    "usage_id": str(item["usage_id"]),
                     "memory_type": item["memory_type"],
                     "memory_kind": item["memory_kind"],
                     "content": item["content"],
                     "scope_type": item["scope_type"],
                     "scope_id": str(item["scope_id"]) if item.get("scope_id") else None,
+                    "source_message_id": str(item["source_message_id"])
+                    if item.get("source_message_id")
+                    else None,
                     "reason": item["recall_reason"],
-                    "score": item["relevance_score"],
+                    "relevance_score": item["relevance_score"],
+                    "utility_score": item["utility_score"],
+                    "score": item["final_score"],
                 }
                 for item in memories
             ]

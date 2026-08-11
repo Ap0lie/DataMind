@@ -27,8 +27,16 @@ AssistantMemoryType = Literal[
     "analysis_experience",
 ]
 AssistantMemoryScopeType = Literal["user", "dataset", "dataset_group", "report"]
-AssistantMemoryStatus = Literal["active", "pending", "superseded", "stale", "recycled"]
+AssistantMemoryStatus = Literal[
+    "active",
+    "pending",
+    "superseded",
+    "stale",
+    "dormant",
+    "recycled",
+]
 AssistantMemoryKind = Literal["semantic", "episodic"]
+AssistantMemoryFeedbackType = Literal["helpful", "irrelevant", "wrong"]
 
 
 class AssistantCitationReliabilityResponse(ApiModel):
@@ -218,8 +226,12 @@ class AssistantMemoryResponse(ApiModel):
     scope_id: UUID | None = None
     normalized_key: str
     subject_key: str
+    entity_key: str
+    predicate: str = "value"
     content: str
     structured_value: dict[str, Any] = Field(default_factory=dict)
+    typed_value: dict[str, Any] = Field(default_factory=dict)
+    unit: str | None = None
     version: int = 1
     supersedes_id: UUID | None = None
     superseded_by_id: UUID | None = None
@@ -234,6 +246,15 @@ class AssistantMemoryResponse(ApiModel):
     source_message_id: UUID | None = None
     source_conversation_deleted: bool = False
     last_used_at: str | None = None
+    utility_score: float = Field(default=0.5, ge=0, le=1)
+    helpful_count: int = Field(default=0, ge=0)
+    irrelevant_count: int = Field(default=0, ge=0)
+    wrong_count: int = Field(default=0, ge=0)
+    correction_count: int = Field(default=0, ge=0)
+    validated_reuse_count: int = Field(default=0, ge=0)
+    feedback_count: int = Field(default=0, ge=0)
+    last_validated_at: str | None = None
+    dormant_reason: str | None = None
     valid_from: str | None = None
     valid_to: str | None = None
     deleted_at: str | None = None
@@ -259,18 +280,57 @@ class AssistantMemoryUsageResponse(ApiModel):
     usage_id: UUID
     run_id: UUID
     memory_id: UUID
+    assistant_message_id: UUID | None = None
+    retrieval_rank: int | None = None
+    final_selected: bool = True
     score: float
+    relevance_score: float = 0
+    utility_score: float = 0.5
+    final_score: float = 0
     lexical_score: float
     embedding_score: float
     scope_score: float
     recency_score: float
     reason: str
+    suppression_reason: str | None = None
     scope_type: AssistantMemoryScopeType
     created_at: str
 
 
 class AssistantMemoryUsageListResponse(ApiModel):
     usages: tuple[AssistantMemoryUsageResponse, ...]
+
+
+class AssistantMemoryFeedbackRequest(ApiModel):
+    feedback: AssistantMemoryFeedbackType
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class AssistantMemoryFeedbackResponse(ApiModel):
+    feedback_id: UUID
+    usage_id: UUID
+    memory_id: UUID
+    run_id: UUID
+    feedback: AssistantMemoryFeedbackType
+    reason: str | None = None
+    utility_score: float = Field(ge=0, le=1)
+    memory_status: AssistantMemoryStatus
+    created_at: str
+    updated_at: str
+
+
+class AssistantMemoryEffectivenessResponse(ApiModel):
+    total_memories: int = 0
+    active_memories: int = 0
+    dormant_memories: int = 0
+    low_quality_memories: int = 0
+    never_used_memories: int = 0
+    usage_count: int = 0
+    selected_usage_count: int = 0
+    average_utility: float = Field(default=0.5, ge=0, le=1)
+    feedback_counts: dict[str, int] = Field(default_factory=dict)
+    suppression_counts: dict[str, int] = Field(default_factory=dict)
+    shadow_mode: bool = True
 
 
 class AssistantMemoryHistoryResponse(ApiModel):
