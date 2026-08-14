@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from uuid import UUID
 
+from app.analysis.column_references import resolve_column_reference
 from app.analysis.query_intent import (
     infer_query_intent,
     infer_source_aggregations,
@@ -13,10 +14,12 @@ from app.core.settings import get_settings
 from app.schemas.analysis import (
     AnalysisAggregationResponse,
     AnalysisContractResponse,
+    AnalysisFilterResponse,
     DatasetProfileResponse,
     MultiDatasetProfileResponse,
     PlannerMetadataResponse,
 )
+from app.schemas.analysis_intent import AnalysisIntentSpec
 
 
 def build_analysis_contract(
@@ -29,12 +32,32 @@ def build_analysis_contract(
     planner_metadata: PlannerMetadataResponse,
     multi_dataset_context: MultiDatasetProfileResponse | None,
     analysis_row_count: int | None = None,
+    intent_spec: AnalysisIntentSpec | None = None,
 ) -> AnalysisContractResponse:
     settings = get_settings()
     analysis_type = _analysis_type(question, plan)
-    intent = infer_query_intent(question, profile)
+    intent = infer_query_intent(question, profile) if intent_spec is None else None
+    available_columns = tuple(column.name for column in profile.columns)
+    required_metric = (
+        resolve_column_reference(intent_spec.required_metric.column, available_columns)
+        if intent_spec is not None and intent_spec.required_metric is not None
+        else intent.required_metric
+        if intent is not None
+        else None
+    )
+    explicit_dimensions = (
+        tuple(
+            resolved
+            for binding in intent_spec.required_dimensions
+            if (resolved := resolve_column_reference(binding.column, available_columns))
+        )
+        if intent_spec is not None
+        else intent.required_dimensions
+        if intent is not None
+        else ()
+    )
     dimensions = (
-        intent.required_dimensions
+        explicit_dimensions
         or plan.requested_dimensions
     )
     source_aggregations = (
@@ -48,16 +71,81 @@ def build_analysis_contract(
                 )
             ),
         )
-        if multi_dataset_context is not None
+        if multi_dataset_context is not None and intent_spec is None
+        else ()
+    )
+    intent_aggregations = (
+        tuple(
+            AnalysisAggregationResponse(
+                operation=item.operation,
+                column=(
+                    resolve_column_reference(item.field.column, available_columns)
+                    if item.field is not None
+                    else None
+                ),
+                alias=item.alias,
+            )
+            for item in intent_spec.aggregations
+        )
+        if intent_spec is not None
+        else intent.aggregations
+        if intent is not None
         else ()
     )
     aggregations = _merge_aggregations(
-        (*source_aggregations, *intent.aggregations, *plan.aggregations)
+        (*source_aggregations, *intent_aggregations, *plan.aggregations)
     )
-    filters = intent.filters or plan.filters
+    derived_metrics = (
+        intent_spec.derived_metrics
+        if intent_spec is not None
+        else intent.derived_metrics
+        if intent is not None
+        else ()
+    )
+    if "average_order_value" in derived_metrics:
+        average_metric = required_metric or plan.metric_column or next(
+            (
+                item.column
+                for item in aggregations
+                if item.operation == "sum" and item.column
+            ),
+            None,
+        )
+        if average_metric:
+            aggregations = _merge_aggregations(
+                (
+                    *aggregations,
+                    AnalysisAggregationResponse(
+                        operation="avg",
+                        column=average_metric,
+                        alias="average_order_value",
+                    ),
+                )
+            )
+    intent_filters = (
+        tuple(
+            AnalysisFilterResponse(
+                column=resolved,
+                operator=item.operator,
+                value=item.value,
+            )
+            for item in intent_spec.filters
+            if (resolved := resolve_column_reference(item.field.column, available_columns))
+        )
+        if intent_spec is not None
+        else intent.filters
+        if intent is not None
+        else ()
+    )
+    filters = intent_filters or plan.filters
+    time_field = (
+        resolve_column_reference(intent_spec.time_field.column, available_columns)
+        if intent_spec is not None and intent_spec.time_field is not None
+        else plan.time_column
+    )
     grain = tuple(
         dict.fromkeys(
-            value for value in (*dimensions, plan.time_column) if value
+            value for value in (*dimensions, time_field) if value
         )
     ) or ("dataset",)
     assumptions = [
@@ -76,8 +164,12 @@ def build_analysis_contract(
         if analysis_row_count is None
         else max(0, int(analysis_row_count))
     )
-    aggregation_metrics = tuple(
-        dict.fromkeys(item.column for item in aggregations if item.column)
+    measure_metrics = tuple(
+        dict.fromkeys(
+            item.column.rsplit("__", 1)[-1]
+            for item in aggregations
+            if item.column and item.operation in {"sum", "avg", "min", "max"}
+        )
     )
     return AnalysisContractResponse(
         objective=question.strip(),
@@ -90,14 +182,12 @@ def build_analysis_contract(
         ),
         analysis_type=analysis_type,
         metric=(
-            aggregation_metrics[0]
-            if len(aggregation_metrics) == 1
-            else plan.metric_column
-            if not aggregation_metrics
-            else None
+            required_metric
+            or plan.metric_column
+            or (measure_metrics[0] if len(measure_metrics) == 1 else None)
         ),
         dimensions=dimensions,
-        time_field=plan.time_column,
+        time_field=time_field,
         aggregations=aggregations,
         filters=filters,
         grain=grain,

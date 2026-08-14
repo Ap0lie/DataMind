@@ -5,6 +5,12 @@ from uuid import UUID
 
 from pydantic import Field
 
+from app.schemas.analysis_intent import (
+    AnalysisIntentSpec,
+    ContractGuardResult,
+    IntentCompilationAttempt,
+    IntentGuardResult,
+)
 from app.schemas.common import ApiModel
 from app.schemas.prompt_overrides import AgentPromptOverrides
 
@@ -386,6 +392,10 @@ class AnalysisRunResponse(ApiModel):
     profile: DatasetProfileResponse
     analysis_framework: AnalysisFrameworkResponse | None = None
     analysis_contract: AnalysisContractResponse | None = None
+    intent_spec: AnalysisIntentSpec | None = None
+    intent_validation: IntentGuardResult | None = None
+    intent_attempts: tuple[IntentCompilationAttempt, ...] = ()
+    contract_validation: ContractGuardResult | None = None
     statistical_verification: StatisticalVerificationResponse | None = None
     analysis_lineage: AnalysisLineageResponse | None = None
     sql_result: SQLAnalysisResponse | None = None

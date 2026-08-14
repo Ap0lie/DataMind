@@ -40,6 +40,19 @@ def test_safe_loop_sql_allows_scoped_select_and_rejects_external_or_write_sql() 
             _validate_safe_dataset_sql(sql)
 
 
+def test_safe_loop_sql_rejects_prepared_dataset_self_join() -> None:
+    sql = (
+        "SELECT c.customer_state, SUM(p.total_payment) FROM "
+        "(SELECT order_id, SUM(payment_value) AS total_payment FROM dataset GROUP BY order_id) p "
+        "JOIN dataset o ON o.order_id = p.order_id "
+        "JOIN dataset c ON c.customer_id = o.customer_id "
+        "GROUP BY c.customer_state"
+    )
+
+    with pytest.raises(ValueError, match="scan the prepared dataset exactly once"):
+        _validate_safe_dataset_sql(sql)
+
+
 def test_loop_action_hash_is_canonical_and_error_classification_is_specific() -> None:
     assert canonical_action_hash("aggregate_dataset", {"metric": "销售额", "group_by": "区域"}) == canonical_action_hash(
         "aggregate_dataset", {"group_by": "区域", "metric": "销售额"}

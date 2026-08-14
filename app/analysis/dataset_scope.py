@@ -10,6 +10,7 @@ from uuid import UUID
 from app.analysis.query_intent import infer_query_intent
 from app.analysis.services import DatasetProfiler
 from app.schemas.analysis import DatasetJoinConfig
+from app.schemas.analysis_intent import AnalysisIntentSpec
 from app.storage.dataset_store import DatasetStoreRepository
 from app.storage.models import StoredDataset
 
@@ -28,10 +29,16 @@ _STRICT_SCOPE_RE = re.compile(
     re.IGNORECASE,
 )
 _NEGATED_DATASET_SCOPE_RE = re.compile(
-    r"(?:不要|不得|请勿|禁止)\s*(?:使用|用|采用|读取|包括)\s*"
-    r"[^,，;；。.!?！？\n]*"
+    r"(?:不要|不得|请勿|禁止|严禁)\s*(?:使用|用|采用|读取|包括)\s*"
+    r"[^,，;；。!?！？\n]*"
     r"|(?:(?:do\s+not|don't|never)\s+(?:use|include|read)|without|excluding?)\s+"
-    r"[^,，;；。.!?！？\n]*",
+    r"[^,，;；。!?！？\n]*",
+    re.IGNORECASE,
+)
+_RELATIONSHIP_CONSTRAINT_RE = re.compile(
+    r"(?:不要|不得|请勿|禁止|严禁)\s*(?:将|把)?\s*"
+    r"[^,，;；。!?！？\n]*?(?:连接|关联|join)"
+    r"[^,，;；。!?！？\n]*",
     re.IGNORECASE,
 )
 _GENERIC_DATASET_ALIAS_TOKENS = {
@@ -61,6 +68,7 @@ def resolve_analysis_dataset_scope(
     dataset_id: UUID,
     additional_dataset_ids: tuple[UUID, ...],
     join_plan: tuple[DatasetJoinConfig, ...],
+    intent_spec: AnalysisIntentSpec | None = None,
 ) -> AnalysisDatasetScope:
     """Reduce a relationship tree to the datasets needed by the question.
 
@@ -80,8 +88,13 @@ def resolve_analysis_dataset_scope(
     )
     datasets = {item: repository.get_dataset(item) for item in all_dataset_ids}
     negated_scope_spans = _negated_dataset_scope_spans(question)
-    strict_allowlist = bool(_STRICT_SCOPE_RE.search(question))
-    if strict_allowlist:
+    relationship_constraint_spans = _relationship_constraint_spans(question)
+    strict_allowlist = (
+        intent_spec.strict_dataset_scope
+        if intent_spec is not None
+        else bool(_STRICT_SCOPE_RE.search(question))
+    )
+    if strict_allowlist and intent_spec is None:
         submitted_ids = set(all_dataset_ids)
         missing_declared_datasets = tuple(
             dataset
@@ -91,6 +104,7 @@ def resolve_analysis_dataset_scope(
                 question,
                 dataset.name,
                 negated_scope_spans=negated_scope_spans,
+                relationship_constraint_spans=relationship_constraint_spans,
             )[0]
         )
         if missing_declared_datasets:
@@ -103,16 +117,36 @@ def resolve_analysis_dataset_scope(
             )
     allowlist_ids: list[UUID] = []
     denylist_ids: list[UUID] = []
-    for item in all_dataset_ids:
-        positive, negative = _dataset_reference_polarity(
-            question,
-            datasets[item].name,
-            negated_scope_spans=negated_scope_spans,
+    if intent_spec is not None:
+        missing_allowlist_ids = tuple(
+            item for item in intent_spec.dataset_allowlist if item not in datasets
         )
-        if positive:
-            allowlist_ids.append(item)
-        if negative:
-            denylist_ids.append(item)
+        if strict_allowlist and missing_allowlist_ids:
+            missing_names = ", ".join(
+                sorted(repository.get_dataset(item).name for item in missing_allowlist_ids)
+            )
+            raise ValueError(
+                "Strict dataset allowlist references datasets that were not submitted: "
+                f"{missing_names}. Select the dataset package or submit its relationship plan."
+            )
+        allowlist_ids.extend(
+            item for item in intent_spec.dataset_allowlist if item in datasets
+        )
+        denylist_ids.extend(
+            item for item in intent_spec.dataset_denylist if item in datasets
+        )
+    else:
+        for item in all_dataset_ids:
+            positive, negative = _dataset_reference_polarity(
+                question,
+                datasets[item].name,
+                negated_scope_spans=negated_scope_spans,
+                relationship_constraint_spans=relationship_constraint_spans,
+            )
+            if positive:
+                allowlist_ids.append(item)
+            if negative:
+                denylist_ids.append(item)
     conflicting_ids = set(allowlist_ids) & set(denylist_ids)
     if conflicting_ids:
         conflicting_names = ", ".join(
@@ -146,34 +180,121 @@ def resolve_analysis_dataset_scope(
         raise ValueError("Question excludes every submitted dataset.")
 
     inference_ids = explicit_ids or available_dataset_ids
-    intent, column_sources = _infer_field_sources(
-        repository,
-        question=question,
-        datasets=tuple(datasets[item] for item in inference_ids),
-    )
-    required_columns = tuple(
-        dict.fromkeys(
-            (
-                *intent.required_dimensions,
-                *((intent.required_metric,) if intent.required_metric else ()),
-                *(item.column for item in intent.aggregations if item.column),
-                *(item.column for item in intent.filters),
+    if intent_spec is None:
+        intent, column_sources = _infer_field_sources(
+            repository,
+            question=question,
+            datasets=tuple(datasets[item] for item in inference_ids),
+        )
+        required_columns = tuple(
+            dict.fromkeys(
+                (
+                    *intent.required_dimensions,
+                    *((intent.required_metric,) if intent.required_metric else ()),
+                    *(item.column for item in intent.aggregations if item.column),
+                    *(item.column for item in intent.filters),
+                )
             )
         )
+        field_source_ids = tuple(
+            dict.fromkeys(
+                column_sources[column]
+                for column in required_columns
+                if column in column_sources
+            )
+        )
+        metric_source_id = (
+            column_sources.get(intent.required_metric) if intent.required_metric else None
+        )
+    else:
+        required_bindings = tuple(
+            item
+            for item in (
+                intent_spec.required_metric,
+                *intent_spec.required_dimensions,
+                *(item.field for item in intent_spec.aggregations),
+                *(item.field for item in intent_spec.filters),
+            )
+            if item is not None and item.dataset_id in inference_ids
+        )
+        field_source_ids = tuple(
+            dict.fromkeys(
+                item.dataset_id for item in required_bindings if item.dataset_id is not None
+            )
+        )
+        metric_source_id = (
+            intent_spec.required_metric.dataset_id
+            if intent_spec.required_metric is not None
+            else None
+        )
+    missing_required_relationship_ids = (
+        tuple(
+            dict.fromkeys(
+                related_id
+                for constraint in intent_spec.relationship_constraints
+                if constraint.polarity == "required"
+                for related_id in (
+                    constraint.left_dataset_id,
+                    constraint.right_dataset_id,
+                )
+                if related_id not in datasets
+            )
+        )
+        if intent_spec is not None
+        else ()
     )
-    field_source_ids = tuple(
+    if missing_required_relationship_ids:
+        missing_names = ", ".join(
+            sorted(
+                repository.get_dataset(item).name
+                for item in missing_required_relationship_ids
+            )
+        )
+        raise ValueError(
+            "Required relationship references datasets that were not submitted: "
+            f"{missing_names}. Select the dataset package or submit its relationship plan."
+        )
+    required_relationship_ids = (
+        tuple(
+            dict.fromkeys(
+                dataset_id
+                for constraint in intent_spec.relationship_constraints
+                if constraint.polarity == "required"
+                for dataset_id in (
+                    constraint.left_dataset_id,
+                    constraint.right_dataset_id,
+                )
+                if dataset_id in inference_ids
+            )
+        )
+        if intent_spec is not None
+        else ()
+    )
+    referenced_ids = tuple(
         dict.fromkeys(
-            column_sources[column]
-            for column in required_columns
-            if column in column_sources
+            (*explicit_ids, *field_source_ids, *required_relationship_ids)
         )
     )
-    referenced_ids = tuple(dict.fromkeys((*explicit_ids, *field_source_ids)))
+    forbidden_pairs = (
+        {
+            frozenset((item.left_dataset_id, item.right_dataset_id))
+            for item in intent_spec.relationship_constraints
+            if item.polarity == "forbidden"
+        }
+        if intent_spec is not None
+        else set()
+    )
 
     # A casual mention of one table is not enough evidence to discard the
     # submitted relationship context. Prune only for an explicit multi-table
     # scope, strict "only use" wording, or requirements spanning 2+ sources.
-    scope_is_explicit = bool(denied_ids) or len(explicit_ids) >= 2 or strict_allowlist
+    scope_is_explicit = bool(
+        denied_ids
+        or forbidden_pairs
+        or required_relationship_ids
+        or len(explicit_ids) >= 2
+        or strict_allowlist
+    )
     if not scope_is_explicit and len(field_source_ids) < 2:
         return AnalysisDatasetScope(
             dataset_id=dataset_id,
@@ -186,9 +307,6 @@ def resolve_analysis_dataset_scope(
     if not referenced_ids:
         referenced_ids = explicit_ids or available_dataset_ids
 
-    metric_source_id = (
-        column_sources.get(intent.required_metric) if intent.required_metric else None
-    )
     root_id = metric_source_id or (
         dataset_id if dataset_id in referenced_ids else referenced_ids[0]
     )
@@ -209,13 +327,14 @@ def resolve_analysis_dataset_scope(
         for item in join_plan
         if item.left_dataset_id not in denied_id_set
         and item.right_dataset_id not in denied_id_set
+        and frozenset((item.left_dataset_id, item.right_dataset_id)) not in forbidden_pairs
     )
     scoped_plan, ordered_ids = _minimal_oriented_subtree(
         allowed_join_plan,
         root_id=root_id,
         terminal_ids=referenced_ids,
     )
-    if not denied_ids and set(ordered_ids) == set(all_dataset_ids):
+    if not denied_ids and not forbidden_pairs and set(ordered_ids) == set(all_dataset_ids):
         return AnalysisDatasetScope(
             dataset_id=dataset_id,
             additional_dataset_ids=_dedupe_ids(additional_dataset_ids, exclude=dataset_id),
@@ -376,12 +495,18 @@ def _dataset_reference_polarity(
     dataset_name: str,
     *,
     negated_scope_spans: tuple[tuple[int, int], ...],
+    relationship_constraint_spans: tuple[tuple[int, int], ...] = (),
 ) -> tuple[bool, bool]:
     folded = question.casefold()
     positive = False
     negative = False
     for alias in _dataset_aliases(dataset_name):
         for matched in _alias_pattern(alias).finditer(folded):
+            if any(
+                start <= matched.start() and matched.end() <= end
+                for start, end in relationship_constraint_spans
+            ):
+                continue
             is_negative = any(
                 start <= matched.start() and matched.end() <= end
                 for start, end in negated_scope_spans
@@ -393,6 +518,10 @@ def _dataset_reference_polarity(
 
 def _negated_dataset_scope_spans(question: str) -> tuple[tuple[int, int], ...]:
     return tuple(match.span() for match in _NEGATED_DATASET_SCOPE_RE.finditer(question))
+
+
+def _relationship_constraint_spans(question: str) -> tuple[tuple[int, int], ...]:
+    return tuple(match.span() for match in _RELATIONSHIP_CONSTRAINT_RE.finditer(question))
 
 
 def _dataset_aliases(dataset_name: str) -> tuple[str, ...]:

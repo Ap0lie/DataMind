@@ -3,6 +3,11 @@ from __future__ import annotations
 import pytest
 
 from app.analysis.dataset_scope import resolve_analysis_dataset_scope
+from app.analysis.intent_compiler import (
+    IntentCompilationHarness,
+    build_intent_compilation_context,
+)
+from app.core.settings import Settings
 from app.schemas.analysis import DatasetJoinConfig
 from app.storage.dataset_store import DatasetStoreRepository
 
@@ -169,6 +174,118 @@ def test_explicit_three_table_question_selects_minimal_metric_rooted_subtree(
         (datasets["order_payments"].id, datasets["orders"].id),
         (datasets["orders"].id, datasets["customers"].id),
     )
+
+
+def test_prohibited_direct_join_does_not_add_an_unneeded_fact_table(tmp_path) -> None:
+    repository = DatasetStoreRepository(str(tmp_path), user_id="default")
+    datasets, plan = _commerce_package(repository)
+
+    scope = resolve_analysis_dataset_scope(
+        repository,
+        question=(
+            "仅按 customers.customer_state 分析 order_status=delivered 的订单，"
+            "以 order_payments.payment_value 为总支付金额。先将 order_payments "
+            "按 order_id 预聚合，再经 orders.customer_id 连接 customers.customer_id；"
+            "严禁将 order_items 与 order_payments 逐行连接。"
+        ),
+        dataset_id=datasets["order_payments"].id,
+        additional_dataset_ids=tuple(
+            dataset.id
+            for name, dataset in datasets.items()
+            if name != "order_payments"
+        ),
+        join_plan=plan,
+    )
+
+    assert set(scope.referenced_dataset_ids) == {
+        datasets["order_payments"].id,
+        datasets["orders"].id,
+        datasets["customers"].id,
+    }
+    assert datasets["order_items"].id not in scope.additional_dataset_ids
+    assert scope.dataset_id == datasets["order_payments"].id
+    assert tuple(
+        (item.left_dataset_id, item.right_dataset_id) for item in scope.join_plan
+    ) == (
+        (datasets["order_payments"].id, datasets["orders"].id),
+        (datasets["orders"].id, datasets["customers"].id),
+    )
+
+
+def test_approved_forbidden_relationship_prunes_join_without_field_requirements(
+    tmp_path,
+) -> None:
+    repository = DatasetStoreRepository(str(tmp_path), user_id="default")
+    datasets, plan = _commerce_package(repository)
+    prohibited = DatasetJoinConfig(
+        left_dataset_id=datasets["order_items"].id,
+        right_dataset_id=datasets["order_payments"].id,
+        left_column="order_id",
+        right_column="order_id",
+    )
+    submitted_plan = (*plan, prohibited)
+    question = "严禁将 order_items 与 order_payments 逐行连接。"
+    intent = IntentCompilationHarness(
+        model_router=None,
+        settings=Settings(environment="test", intent_compiler_mode="shadow"),
+    ).compile(
+        question=question,
+        context=build_intent_compilation_context(
+            repository,
+            dataset_ids=tuple(dataset.id for dataset in datasets.values()),
+        ),
+    ).intent
+
+    scope = resolve_analysis_dataset_scope(
+        repository,
+        question=question,
+        dataset_id=datasets["order_items"].id,
+        additional_dataset_ids=tuple(
+            dataset.id
+            for name, dataset in datasets.items()
+            if name != "order_items"
+        ),
+        join_plan=submitted_plan,
+        intent_spec=intent,
+    )
+
+    assert prohibited not in scope.join_plan
+    assert set(scope.additional_dataset_ids) == {
+        dataset.id
+        for name, dataset in datasets.items()
+        if name != "order_items"
+    }
+
+
+def test_required_relationship_rejects_an_unsubmitted_authorized_dataset(
+    tmp_path,
+) -> None:
+    repository = DatasetStoreRepository(str(tmp_path), user_id="default")
+    datasets, _ = _commerce_package(repository)
+    question = "将 orders 与 customers 关联后分析。"
+    intent = IntentCompilationHarness(
+        model_router=None,
+        settings=Settings(environment="test", intent_compiler_mode="shadow"),
+    ).compile(
+        question=question,
+        context=build_intent_compilation_context(
+            repository,
+            dataset_ids=(datasets["orders"].id,),
+            authorized_dataset_ids=tuple(
+                dataset.id for dataset in datasets.values()
+            ),
+        ),
+    ).intent
+
+    with pytest.raises(ValueError, match=r"Required relationship.*not submitted"):
+        resolve_analysis_dataset_scope(
+            repository,
+            question=question,
+            dataset_id=datasets["orders"].id,
+            additional_dataset_ids=(),
+            join_plan=(),
+            intent_spec=intent,
+        )
 
 
 def test_single_casual_table_mention_preserves_relationship_context(tmp_path) -> None:

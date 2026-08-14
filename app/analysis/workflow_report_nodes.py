@@ -1036,6 +1036,21 @@ def _report_commit_node(
                     if state.get("analysis_contract")
                     else None
                 ),
+                "intent_spec": (
+                    state["intent_spec"].model_dump(mode="json")
+                    if state.get("intent_spec")
+                    else None
+                ),
+                "intent_validation": (
+                    state["intent_validation"].model_dump(mode="json")
+                    if state.get("intent_validation")
+                    else None
+                ),
+                "contract_validation": (
+                    state["contract_validation"].model_dump(mode="json")
+                    if state.get("contract_validation")
+                    else None
+                ),
                 "statistical_verification": (
                     state["statistical_verification"].model_dump(mode="json")
                     if state.get("statistical_verification")
@@ -1112,6 +1127,10 @@ def _report_commit_node(
             profile=profile,
             analysis_framework=state.get("analysis_framework"),
             analysis_contract=state.get("analysis_contract"),
+            intent_spec=state.get("intent_spec"),
+            intent_validation=state.get("intent_validation"),
+            intent_attempts=state.get("intent_attempts", ()),
+            contract_validation=state.get("contract_validation"),
             statistical_verification=state.get("statistical_verification"),
             analysis_lineage=state.get("analysis_lineage"),
             sql_result=state.get("sql_result"),
@@ -1578,6 +1597,21 @@ def _report_node(
                     if state.get("analysis_contract")
                     else None
                 ),
+                "intent_spec": (
+                    state["intent_spec"].model_dump(mode="json")
+                    if state.get("intent_spec")
+                    else None
+                ),
+                "intent_validation": (
+                    state["intent_validation"].model_dump(mode="json")
+                    if state.get("intent_validation")
+                    else None
+                ),
+                "contract_validation": (
+                    state["contract_validation"].model_dump(mode="json")
+                    if state.get("contract_validation")
+                    else None
+                ),
                 "statistical_verification": (
                     state["statistical_verification"].model_dump(mode="json")
                     if state.get("statistical_verification")
@@ -1651,6 +1685,10 @@ def _report_node(
             profile=profile,
             analysis_framework=analysis_framework,
             analysis_contract=state.get("analysis_contract"),
+            intent_spec=state.get("intent_spec"),
+            intent_validation=state.get("intent_validation"),
+            intent_attempts=state.get("intent_attempts", ()),
+            contract_validation=state.get("contract_validation"),
             statistical_verification=state.get("statistical_verification"),
             analysis_lineage=state.get("analysis_lineage"),
             sql_result=sql_result,

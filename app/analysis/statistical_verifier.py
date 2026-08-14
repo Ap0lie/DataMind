@@ -7,6 +7,8 @@ from typing import Any
 import pandas as pd
 from sqlglot import exp, parse
 
+from app.analysis.query_intent import wants_average_order_value
+from app.analysis.sql_policy import has_unsafe_dataset_self_join
 from app.schemas.analysis import (
     AnalysisAggregationResponse,
     AnalysisContractResponse,
@@ -149,6 +151,7 @@ def verify_statistical_analysis(
             python_result=python_result,
             evidence=evidence,
         ),
+        _sql_grain_safety_check(sql_result),
         _join_grain_check(
             contract=contract,
             context=multi_dataset_context,
@@ -975,6 +978,30 @@ def _population_check(dataframe: pd.DataFrame) -> StatisticalCheckResponse:
     )
 
 
+def _sql_grain_safety_check(
+    sql_result: SQLAnalysisResponse | None,
+) -> StatisticalCheckResponse:
+    if sql_result is None:
+        return StatisticalCheckResponse(
+            code="sql_grain_safety",
+            status="not_applicable",
+            severity="info",
+            message="本次分析没有 SQL 结果。",
+        )
+    unsafe = has_unsafe_dataset_self_join(sql_result.sql)
+    return StatisticalCheckResponse(
+        code="sql_grain_safety",
+        status="failed" if unsafe else "passed",
+        severity="error" if unsafe else "info",
+        message=(
+            "SQL 重复扫描并自连接已准备的数据集，可能放大事实行和聚合金额。"
+            if unsafe
+            else "SQL 未重复扫描已准备的数据集。"
+        ),
+        details={"unsafe_dataset_self_join": unsafe},
+    )
+
+
 def _metric_check(
     contract: AnalysisContractResponse,
     profile: DatasetProfileResponse,
@@ -1264,8 +1291,18 @@ def _statement_contract_gaps(
     group_columns = _statement_group_columns(statement)
     required_dimensions = _contract_grain_columns(contract)
     actual_filters, unexpected_filters = _statement_filters(statement)
+    nested_filters, nested_unexpected = _nested_contract_filters(
+        statement,
+        contract=contract,
+    )
+    actual_filters.extend(nested_filters)
+    unexpected_filters.extend(nested_unexpected)
     unexpected_filters.extend(
-        _unexpected_population_operations(statement, result_rows=result_rows)
+        _unexpected_population_operations(
+            statement,
+            result_rows=result_rows,
+            allowed_limit=_requested_result_limit(contract.objective),
+        )
     )
     unmatched_actual = list(actual_filters)
     missing_filters: list[str] = []
@@ -1304,6 +1341,7 @@ def _statement_contract_gaps(
                 statement=statement,
                 operation=item.operation,
                 column=item.column,
+                contract=contract,
             )
         ],
     }
@@ -1535,6 +1573,7 @@ def _unexpected_population_operations(
     statement: exp.Expression,
     *,
     result_rows: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    allowed_limit: int | None = None,
 ) -> list[str]:
     unexpected: list[str] = []
     for key in ("having", "qualify", "offset"):
@@ -1548,7 +1587,7 @@ def _unexpected_population_operations(
         if select is not statement
     ]
     for select in nested_selects:
-        for key in ("where", "having", "qualify", "limit", "offset"):
+        for key in ("having", "qualify", "limit", "offset"):
             node = select.args.get(key)
             if node is not None:
                 unexpected.append(
@@ -1562,9 +1601,85 @@ def _unexpected_population_operations(
             limit_value = int(str(raw_limit)) if raw_limit is not None else None
         except ValueError:
             limit_value = None
-        if limit_value is None or not result_rows or len(result_rows) >= limit_value:
+        if limit_value != allowed_limit and (
+            limit_value is None or not result_rows or len(result_rows) >= limit_value
+        ):
             unexpected.append(f"LIMIT {limit.sql(dialect='duckdb')}")
     return unexpected
+
+
+def _nested_contract_filters(
+    statement: exp.Expression,
+    *,
+    contract: AnalysisContractResponse,
+) -> tuple[list[tuple[str, str, object]], list[str]]:
+    accepted: list[tuple[str, str, object]] = []
+    unexpected: list[str] = []
+    for select in statement.find_all(exp.Select):
+        if select is statement or select.args.get("where") is None:
+            continue
+        actual, invalid = _statement_filters(select)
+        if not _is_direct_relation_select(select, statement):
+            unexpected.append(
+                f"INNER WHERE {select.args['where'].sql(dialect='duckdb')}"
+            )
+            continue
+        unexpected.extend(f"INNER WHERE {item}" for item in invalid)
+        for candidate in actual:
+            if any(
+                _column_equivalent(candidate[0], expected.column)
+                and candidate[1] == expected.operator
+                and _value_equivalent(candidate[2], expected.value)
+                for expected in contract.filters
+            ):
+                accepted.append(candidate)
+            else:
+                unexpected.append(
+                    f"INNER WHERE {candidate[0]}{candidate[1]}{candidate[2]}"
+                )
+    return accepted, unexpected
+
+
+def _is_direct_relation_select(
+    select: exp.Select,
+    statement: exp.Expression,
+) -> bool:
+    subquery = select.parent
+    relation = subquery.parent if isinstance(subquery, exp.Subquery) else None
+    return isinstance(relation, (exp.From, exp.Join)) and relation.parent is statement
+
+
+def _requested_result_limit(objective: str) -> int | None:
+    patterns = (
+        r"(?:前\s*(?P<value>\d{1,3}|[一二两三四五六七八九十]{1,3}))",
+        r"(?:top\s*(?P<value>\d{1,3}))",
+        r"(?:最高|最大|最多|最低|最小)(?:的)?\s*"
+        r"(?P<value>\d{1,3}|[一二两三四五六七八九十]{1,3})\s*(?:个|名|项|条)?",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, objective, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        value = _parse_positive_integer(match.group("value"))
+        if value is not None:
+            return value
+    return None
+
+
+def _parse_positive_integer(value: str) -> int | None:
+    if value.isdigit():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    digits = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9}
+    if value == "十":
+        return 10
+    if "十" in value:
+        left, right = value.split("十", 1)
+        tens = digits.get(left, 1) if left else 1
+        units = digits.get(right, 0) if right else 0
+        return tens * 10 + units
+    return digits.get(value)
 
 
 def _aggregation_present(
@@ -1572,7 +1687,25 @@ def _aggregation_present(
     statement: exp.Expression,
     operation: str,
     column: str | None,
+    contract: AnalysisContractResponse,
 ) -> bool:
+    if (
+        operation == "avg"
+        and column
+        and wants_average_order_value(contract.objective)
+        and any(item.operation == "count_distinct" for item in contract.aggregations)
+        and any(
+            item.operation == "sum"
+            and item.column
+            and _column_equivalent(item.column, column)
+            for item in contract.aggregations
+        )
+    ):
+        return _declared_ratio_average_present(
+            statement,
+            column=column,
+            contract=contract,
+        )
     node_type = {
         "sum": exp.Sum,
         "avg": exp.Avg,
@@ -1588,7 +1721,7 @@ def _aggregation_present(
         nodes = [projection] if isinstance(projection, node_type) else []
         nodes.extend(projection.find_all(node_type))
         for node in nodes:
-            node_columns = [item.name for item in node.find_all(exp.Column)]
+            node_columns = _aggregate_source_columns(statement, node)
             if column and not any(
                 _column_equivalent(candidate, column) for candidate in node_columns
             ):
@@ -1599,7 +1732,115 @@ def _aggregation_present(
             if operation == "count" and is_distinct:
                 continue
             return True
+    if operation == "avg" and column:
+        return _declared_ratio_average_present(
+            statement,
+            column=column,
+            contract=contract,
+        )
     return False
+
+
+def _declared_ratio_average_present(
+    statement: exp.Expression,
+    *,
+    column: str,
+    contract: AnalysisContractResponse,
+) -> bool:
+    denominator_columns = tuple(
+        item.column
+        for item in contract.aggregations
+        if item.operation == "count_distinct" and item.column
+    )
+    if not denominator_columns:
+        return False
+    for projection in statement.selects:
+        divisions = [projection] if isinstance(projection, exp.Div) else []
+        divisions.extend(projection.find_all(exp.Div))
+        for division in divisions:
+            sums = (
+                [division.this]
+                if isinstance(division.this, exp.Sum)
+                else list(division.this.find_all(exp.Sum))
+            )
+            counts = (
+                [division.expression]
+                if isinstance(division.expression, exp.Count)
+                else list(division.expression.find_all(exp.Count))
+            )
+            numerator_matches = any(
+                _contains_equivalent_column(
+                    _aggregate_source_columns(statement, item),
+                    column,
+                )
+                for item in sums
+            )
+            denominator_matches = any(
+                any(True for _ in item.find_all(exp.Distinct))
+                and any(
+                    _contains_equivalent_column(
+                        _aggregate_source_columns(statement, item),
+                        expected,
+                    )
+                    for expected in denominator_columns
+                )
+                for item in counts
+            )
+            if numerator_matches and denominator_matches:
+                return True
+    return False
+
+
+def _aggregate_source_columns(
+    statement: exp.Expression,
+    aggregate: exp.Expression,
+) -> tuple[str, ...]:
+    columns: list[str] = []
+    for item in aggregate.find_all(exp.Column):
+        columns.append(item.name)
+        if item.table:
+            columns.extend(
+                _relation_projection_source_columns(
+                    statement,
+                    relation_alias=item.table,
+                    output_name=item.name,
+                )
+            )
+    return tuple(dict.fromkeys(columns))
+
+
+def _relation_projection_source_columns(
+    statement: exp.Expression,
+    *,
+    relation_alias: str,
+    output_name: str,
+    visited: tuple[tuple[str, str], ...] = (),
+) -> tuple[str, ...]:
+    key = (relation_alias.casefold(), output_name.casefold())
+    if key in visited:
+        return ()
+    for relation_type in (exp.Subquery, exp.CTE):
+        for relation in statement.find_all(relation_type):
+            if relation.alias_or_name.casefold() != key[0]:
+                continue
+            for projection in getattr(relation.this, "selects", ()):
+                if projection.alias_or_name.casefold() != key[1]:
+                    continue
+                expression = projection.this if isinstance(projection, exp.Alias) else projection
+                sources: list[str] = []
+                for source in expression.find_all(exp.Column):
+                    sources.append(source.name)
+                    if source.table:
+                        sources.extend(
+                            _relation_projection_source_columns(
+                                statement,
+                                relation_alias=source.table,
+                                output_name=source.name,
+                                visited=(*visited, key),
+                            )
+                        )
+                return tuple(dict.fromkeys(sources))
+    return ()
 
 
 def _sql_value(node: exp.Expression) -> object | None:
@@ -2080,6 +2321,7 @@ def _suggestion(code: str) -> str:
         "time_coverage": "提供真实日期字段，或将问题改为非时间序列分析。",
         "request_coverage": "按分析契约重新生成查询，补齐缺失的维度、过滤和聚合。",
         "join_grain": "在来源事实表粒度先聚合，再按安全关系连接。",
+        "sql_grain_safety": "仅扫描一次已准备的数据集，禁止对临时宽表做直接自连接。",
         "numeric_evidence": "重新执行 SQL/Python 工具并让结论引用 evidence_id。",
         "comparison_support": "补充样本量、效应量或 95% 置信区间。",
         "causal_language": "改用相关性措辞，或提供受控实验设计和因果识别假设。",

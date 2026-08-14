@@ -72,6 +72,12 @@ class Settings(BaseSettings):
     llm_context_window_tokens: int = Field(default=65_536, ge=8_192, le=2_000_000)
     context_safety_ratio: float = Field(default=0.15, ge=0.05, le=0.40)
     llm_allow_provider_fallback: bool = True
+    intent_compiler_enabled: bool = True
+    intent_compiler_mode: str = Field(default="shadow", pattern="^(shadow|enforce)$")
+    intent_compiler_provider: str = "deepseek"
+    intent_compiler_max_repairs: int = Field(default=2, ge=0, le=4)
+    intent_compiler_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    contract_guard_enabled: bool = True
     semantic_embedding_enabled: bool = False
     semantic_embedding_model: str = "BAAI/bge-small-zh-v1.5"
     semantic_embedding_model_path: str = "data/models/bge-small-zh-v1.5"

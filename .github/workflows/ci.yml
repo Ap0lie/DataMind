@@ -91,3 +91,13 @@ jobs:
 
       - name: Playwright end-to-end tests
         run: npm --prefix frontend/react run test:e2e
+
+      - name: Upload Playwright diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: datamind-playwright-diagnostics
+          path: |
+            frontend/react/playwright-report
+            frontend/react/test-results
+          if-no-files-found: warn

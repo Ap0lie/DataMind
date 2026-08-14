@@ -44,6 +44,10 @@ async def test_semantic_model_api_publish_plan_and_low_confidence_gate(tmp_path,
         assert plan_response.status_code == 200
         plan = plan_response.json()
         assert plan["confidence_level"] == "low"
+        assert plan["intent_spec"]["question"] == "分析 completely_unknown_concept"
+        assert plan["intent_validation"]["status"] == "passed"
+        assert isinstance(plan["intent_attempts"], list)
+        assert "contract_validation" in plan
         blocked = await client.post(
             "/api/v1/analysis/jobs",
             json={"dataset_id": str(dataset.id), "question": "分析 completely_unknown_concept", "planner_decision_id": plan["decision_id"]},

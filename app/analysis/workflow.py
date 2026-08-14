@@ -31,7 +31,13 @@ from app.analysis.agent_loop import (
 )
 from app.analysis.analysis_contract import build_analysis_contract
 from app.analysis.checkpoints import get_analysis_checkpointer
+from app.analysis.column_references import resolve_column_reference
 from app.analysis.dataset_scope import resolve_analysis_dataset_scope
+from app.analysis.intent_compiler import (
+    IntentCompilationHarness,
+    build_intent_compilation_context,
+)
+from app.analysis.intent_guard import validate_analysis_contract
 from app.analysis.model_router import AnalysisModelRouter, MCPAnalysisModelRouter
 from app.analysis.multidataset import prepare_multi_dataset_context
 from app.analysis.python_execution import PythonAnalysisExecutor
@@ -50,6 +56,7 @@ from app.analysis.services import (
     _run_python,
     _run_sql,
 )
+from app.analysis.sql_policy import validate_scoped_dataset_select
 from app.analysis.statistical_verifier import (
     analysis_contract_gaps,
     verify_statistical_analysis,
@@ -57,9 +64,11 @@ from app.analysis.statistical_verifier import (
 from app.analysis.validators import validate_analysis_plan
 from app.analysis.workflow_nodes import (
     ADVERSARIAL_VALIDATE_NODE,
+    CONTRACT_VALIDATE_NODE,
     DESIGN_FRAMEWORK_NODE,
     FORMAT_CHARTS_NODE,
     INTEGRATE_INSIGHTS_NODE,
+    INTENT_COMPILE_NODE,
     JOIN_PREPARE_NODE,
     LOOP_ADVERSARIAL_REPAIR_NODE,
     LOOP_BOOTSTRAP_NODE,
@@ -83,6 +92,7 @@ from app.analysis.workflow_nodes import (
     ROUND_FOUNDATION_NODE,
     ROUND_PREPARE_NODE,
     ROUND_REFLECT_NODE,
+    SCOPE_RESOLVE_NODE,
     SQL_NODE,
     STATISTICAL_VERIFY_NODE,
 )
@@ -143,7 +153,9 @@ from app.assistant.memory import AssistantMemoryService
 from app.core.settings import get_settings
 from app.harness.node import NodeExecutionHarness, NodeHarnessPolicy
 from app.schemas.analysis import (
+    AnalysisAggregationResponse,
     AnalysisContractResponse,
+    AnalysisFilterResponse,
     AnalysisFrameworkResponse,
     AnalysisHypothesisResponse,
     AnalysisLineageResponse,
@@ -165,6 +177,12 @@ from app.schemas.analysis import (
     StructuredReportResponse,
     ValidationIssueResponse,
     WorkflowTraceNodeResponse,
+)
+from app.schemas.analysis_intent import (
+    AnalysisIntentSpec,
+    ContractGuardResult,
+    IntentCompilationAttempt,
+    IntentGuardResult,
 )
 from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.dataset_store import DatasetStoreRepository
@@ -285,6 +303,14 @@ class AnalysisWorkflowState(TypedDict):
     relationship_plan: NotRequired[tuple[DatasetJoinConfig, ...]]
     planner_decision: NotRequired[dict[str, Any] | None]
     question: str
+    intent_spec: NotRequired[AnalysisIntentSpec]
+    intent_validation: NotRequired[IntentGuardResult]
+    intent_attempts: NotRequired[tuple[IntentCompilationAttempt, ...]]
+    contract_validation: NotRequired[ContractGuardResult]
+    contract_repair_count: NotRequired[int]
+    contract_repair_context: NotRequired[dict[str, Any] | None]
+    contract_retry_requested: NotRequired[bool]
+    intent_confirmation_granted: NotRequired[bool]
     prompt_overrides: NotRequired[dict[str, str]]
     multimodal_inputs: NotRequired[tuple[MultimodalInputResponse, ...]]
     dataframe_artifact_id: NotRequired[UUID]
@@ -401,6 +427,7 @@ class AnalysisWorkflowRunner:
         resume: bool = False,
         node_event_callback: NodeEventCallback | None = None,
         agent_mode: str = "legacy",
+        confirmed_intent: bool = False,
     ) -> AnalysisRunResponse:
         run_id = workflow_id or uuid4()
         prepared_multimodal_inputs = _prepare_multimodal_inputs(multimodal_inputs)
@@ -418,19 +445,6 @@ class AnalysisWorkflowRunner:
             effective_join_plan,
             primary_dataset_id=dataset_id,
         )
-        dataset_scope = resolve_analysis_dataset_scope(
-            self._repository,
-            question=question,
-            dataset_id=dataset_id,
-            additional_dataset_ids=effective_additional_dataset_ids,
-            join_plan=effective_join_plan,
-        )
-        dataset_id = dataset_scope.dataset_id
-        effective_join_plan = dataset_scope.join_plan
-        effective_additional_dataset_ids = dataset_scope.additional_dataset_ids
-        prepared_relationship_plan = (
-            effective_join_plan if prepared_relationship_plan else ()
-        )
         if progress_callback is not None:
             progress_callback("queued", 0, "Analysis request accepted.")
         input_state: dict[str, Any] | None = {
@@ -442,6 +456,9 @@ class AnalysisWorkflowRunner:
             "relationship_plan": prepared_relationship_plan,
             "planner_decision": planner_decision,
             "question": question,
+            "intent_confirmation_granted": bool(
+                confirmed_intent or (planner_decision or {}).get("confirmed")
+            ),
             "prompt_overrides": dict(prompt_overrides or {}),
             "multimodal_inputs": prepared_multimodal_inputs,
             "executed_nodes": (),
@@ -525,7 +542,10 @@ def build_analysis_workflow(
         workflow_dataframe=_workflow_dataframe,
     )
     nodes = {
+        INTENT_COMPILE_NODE: _intent_compile_node(repository, model_router),
+        SCOPE_RESOLVE_NODE: _scope_resolve_node(repository),
         PLANNER_NODE: _planner_node(repository, model_router),
+        CONTRACT_VALIDATE_NODE: _contract_validate_node(),
         DESIGN_FRAMEWORK_NODE: _design_framework_node(model_router),
         SQL_NODE: _sql_node(repository, model_router),
         PYTHON_NODE: _python_node(repository, model_router, resolved_python_executor),
@@ -569,8 +589,18 @@ def build_analysis_workflow(
         node_harness = report_harness if node_name in report_nodes else harness
         graph.add_node(node_name, node_harness.wrap(node_name, handler))
 
-    graph.add_edge(START, PLANNER_NODE)
-    graph.add_edge(PLANNER_NODE, DESIGN_FRAMEWORK_NODE)
+    graph.add_edge(START, INTENT_COMPILE_NODE)
+    graph.add_edge(INTENT_COMPILE_NODE, SCOPE_RESOLVE_NODE)
+    graph.add_edge(SCOPE_RESOLVE_NODE, PLANNER_NODE)
+    graph.add_edge(PLANNER_NODE, CONTRACT_VALIDATE_NODE)
+    graph.add_conditional_edges(
+        CONTRACT_VALIDATE_NODE,
+        _route_after_contract_validate,
+        {
+            PLANNER_NODE: PLANNER_NODE,
+            DESIGN_FRAMEWORK_NODE: DESIGN_FRAMEWORK_NODE,
+        },
+    )
     graph.add_conditional_edges(
         DESIGN_FRAMEWORK_NODE,
         _route_after_framework,
@@ -707,6 +737,255 @@ def _workflow_dataframe(
     return _dataframe([record for record in records if isinstance(record, dict)])
 
 
+def _intent_compile_node(
+    repository: DatasetStoreRepository,
+    model_router: AnalysisModelRouter | None,
+) -> Any:
+    def run(state: AnalysisWorkflowState) -> dict[str, Any]:
+        _notify_progress(
+            state,
+            stage=INTENT_COMPILE_NODE,
+            progress=2,
+            message="Compiling the user request into a guarded analysis intent.",
+        )
+        context = build_intent_compilation_context(
+            repository,
+            dataset_ids=_requested_dataset_ids(state),
+        )
+        planner_decision = state.get("planner_decision") or {}
+        semantic_plan = (
+            planner_decision.get("semantic_plan")
+            if isinstance(planner_decision.get("semantic_plan"), dict)
+            else None
+        )
+        result = IntentCompilationHarness(
+            model_router=model_router,
+        ).compile(
+            question=state["question"],
+            context=context,
+            semantic_plan=semantic_plan,
+        )
+        _notify_node_event(
+            state,
+            {
+                "node": INTENT_COMPILE_NODE,
+                "status": "completed"
+                if result.validation.status == "passed"
+                else "warning",
+                "message": "Analysis intent compiled and checked against the user request.",
+                "attempt": len(result.attempts),
+                "event_type": "intent.compiled",
+                "payload": {
+                    "mode": result.mode,
+                    "source": result.intent.source,
+                    "validation_status": result.validation.status,
+                    "required_metric": (
+                        result.intent.required_metric.column
+                        if result.intent.required_metric
+                        else None
+                    ),
+                    "required_dimensions": tuple(
+                        item.column for item in result.intent.required_dimensions
+                    ),
+                    "clause_count": len(result.intent.clauses),
+                    "attempt_count": len(result.attempts),
+                },
+            },
+        )
+        for attempt in result.attempts:
+            if attempt.status == "failed":
+                _notify_node_event(
+                    state,
+                    {
+                        "node": INTENT_COMPILE_NODE,
+                        "status": "warning",
+                        "message": "Intent compiler output was rejected and returned for repair.",
+                        "attempt": attempt.attempt,
+                        "provider": attempt.provider,
+                        "model": attempt.model,
+                        "error_code": "intent_validation_failed",
+                        "event_type": "intent.validation_failed",
+                        "payload": {
+                            "issues": tuple(
+                                item.code for item in (attempt.guard.issues if attempt.guard else ())
+                            )
+                        },
+                    },
+                )
+            elif attempt.attempt > 1:
+                _notify_node_event(
+                    state,
+                    {
+                        "node": INTENT_COMPILE_NODE,
+                        "status": "completed",
+                        "message": "Intent compiler produced a guarded repair.",
+                        "attempt": attempt.attempt,
+                        "provider": attempt.provider,
+                        "model": attempt.model,
+                        "event_type": "intent.repaired",
+                    },
+                )
+        return {
+            "intent_spec": result.intent,
+            "intent_validation": result.validation,
+            "intent_attempts": result.attempts,
+            "executed_nodes": (*state.get("executed_nodes", ()), INTENT_COMPILE_NODE),
+        }
+
+    return run
+
+
+def _scope_resolve_node(repository: DatasetStoreRepository) -> Any:
+    def run(state: AnalysisWorkflowState) -> dict[str, Any]:
+        _notify_progress(
+            state,
+            stage=SCOPE_RESOLVE_NODE,
+            progress=5,
+            message="Resolving the approved dataset and relationship scope.",
+        )
+        intent = _require(state.get("intent_spec"), "Intent compiler did not produce a result.")
+        validation = _require(
+            state.get("intent_validation"),
+            "Intent compiler did not validate its result.",
+        )
+        settings = get_settings()
+        if settings.intent_compiler_mode == "enforce" and validation.status != "passed":
+            if not state.get("intent_confirmation_granted"):
+                reasons = "; ".join(
+                    item.message for item in validation.issues[:4]
+                ) or "The analysis intent requires confirmation."
+                _notify_node_event(
+                    state,
+                    {
+                        "node": SCOPE_RESOLVE_NODE,
+                        "status": "warning",
+                        "message": "Intent confirmation is required before analysis can run.",
+                        "attempt": 0,
+                        "event_type": "intent.confirmation_required",
+                        "payload": {
+                            "reasons": tuple(item.code for item in validation.issues)
+                        },
+                    },
+                )
+                raise RuntimeError(reasons)
+        requested_join_plan = tuple(state.get("join_plan", ()))
+        scope = resolve_analysis_dataset_scope(
+            repository,
+            question=state["question"],
+            dataset_id=state["dataset_id"],
+            additional_dataset_ids=tuple(state.get("additional_dataset_ids", ())),
+            join_plan=requested_join_plan,
+            intent_spec=intent,
+        )
+        return {
+            "dataset_id": scope.dataset_id,
+            "additional_dataset_ids": scope.additional_dataset_ids,
+            "join_plan": scope.join_plan,
+            "relationship_plan": (
+                scope.join_plan if state.get("relationship_plan") else ()
+            ),
+            "executed_nodes": (*state.get("executed_nodes", ()), SCOPE_RESOLVE_NODE),
+        }
+
+    return run
+
+
+def _contract_validate_node() -> Any:
+    def run(state: AnalysisWorkflowState) -> dict[str, Any]:
+        contract = _require(
+            state.get("analysis_contract"),
+            "Planner did not produce an analysis contract.",
+        )
+        intent = _require(state.get("intent_spec"), "Approved analysis intent is missing.")
+        result = validate_analysis_contract(
+            contract,
+            intent=intent,
+            join_plan=tuple(state.get("join_plan", ())),
+        )
+        settings = get_settings()
+        repair_count = int(state.get("contract_repair_count", 0))
+        enforce = settings.contract_guard_enabled and settings.intent_compiler_mode == "enforce"
+        retry_requested = bool(
+            enforce
+            and result.status == "repairable"
+            and repair_count < settings.intent_compiler_max_repairs
+        )
+        event_type = (
+            "contract.validated"
+            if result.status == "passed"
+            else "contract.repair_requested"
+            if retry_requested
+            else "contract.rejected"
+        )
+        _notify_node_event(
+            state,
+            {
+                "node": CONTRACT_VALIDATE_NODE,
+                "status": "completed" if result.status == "passed" else "warning",
+                "message": "Planner contract was checked against the approved user intent.",
+                "attempt": repair_count,
+                "error_code": None
+                if result.status == "passed"
+                else "contract_validation_failed",
+                "event_type": event_type,
+                "payload": {
+                    "status": result.status,
+                    "preserved_requirements": result.preserved_requirements,
+                    "missing_requirements": result.missing_requirements,
+                    "issues": tuple(item.code for item in result.issues),
+                },
+            },
+        )
+        if enforce and result.status != "passed" and not retry_requested:
+            detail = "; ".join(item.message for item in result.issues[:4])
+            raise RuntimeError(
+                "Analysis contract did not preserve the approved user intent: " + detail
+            )
+        return {
+            "contract_validation": result,
+            "contract_repair_count": repair_count + 1 if retry_requested else repair_count,
+            "contract_repair_context": (
+                {
+                    "missing_requirements": result.missing_requirements,
+                    "issues": tuple(
+                        {
+                            "code": item.code,
+                            "message": item.message,
+                            "suggestion": item.suggestion,
+                        }
+                        for item in result.issues
+                    ),
+                }
+                if retry_requested
+                else None
+            ),
+            "contract_retry_requested": retry_requested,
+            "executed_nodes": (*state.get("executed_nodes", ()), CONTRACT_VALIDATE_NODE),
+        }
+
+    return run
+
+
+def _route_after_contract_validate(state: AnalysisWorkflowState) -> str:
+    return PLANNER_NODE if state.get("contract_retry_requested") else DESIGN_FRAMEWORK_NODE
+
+
+def _requested_dataset_ids(state: AnalysisWorkflowState) -> tuple[UUID, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                state["dataset_id"],
+                *state.get("additional_dataset_ids", ()),
+                *(
+                    dataset_id
+                    for item in state.get("join_plan", ())
+                    for dataset_id in (item.left_dataset_id, item.right_dataset_id)
+                ),
+            )
+        )
+    )
+
+
 def _planner_node(
     repository: DatasetStoreRepository,
     model_router: AnalysisModelRouter | None,
@@ -742,7 +1021,7 @@ def _planner_node(
             additional_dataset_ids=state.get("additional_dataset_ids", ()),
             run_id=state["run_id"],
         )
-        planned_analysis = _plan(state["question"], profile)
+        planned_analysis = _resolve_plan_columns(_plan(state["question"], profile), profile)
         planner_source = "rules"
         model_router_provider: str | None = None
         model_router_model: str | None = None
@@ -758,6 +1037,12 @@ def _planner_node(
                         profile=profile,
                         multi_dataset_context=multi_dataset_context,
                         analysis_experiences=analysis_experiences,
+                        approved_intent=(
+                            state["intent_spec"].model_dump(mode="json")
+                            if state.get("intent_spec")
+                            else None
+                        ),
+                        contract_repair=state.get("contract_repair_context"),
                     ),
                     temperature=0.1,
                     max_tokens=700,
@@ -792,6 +1077,7 @@ def _planner_node(
                     model_plan = _parse_model_plan(
                         response.content, fallback=planned_analysis
                     )
+                model_plan = _resolve_plan_columns(model_plan, profile)
                 plan_validation_issues = _validate_plan_harness(
                     planned_analysis=model_plan,
                     profile=profile,
@@ -809,6 +1095,11 @@ def _planner_node(
                 model_router_model = response.model
             except Exception as exc:
                 model_router_error = str(exc)
+        planned_analysis = _apply_approved_intent_to_plan(
+            planned_analysis,
+            intent=state.get("intent_spec"),
+            profile=profile,
+        )
         planner_metadata = _planner_metadata(
             question=state["question"],
             profile=profile,
@@ -864,6 +1155,7 @@ def _planner_node(
             planner_metadata=planner_metadata,
             multi_dataset_context=multi_dataset_context,
             analysis_row_count=len(analysis_dataframe),
+            intent_spec=state.get("intent_spec"),
         )
         executed_nodes = (*state.get("executed_nodes", ()),)
         if multi_dataset_context is not None:
@@ -2009,6 +2301,11 @@ def _loop_decide_node(
                         "analysis_contract": _require(
                             state.get("analysis_contract"), "Missing analysis contract."
                         ).model_dump(mode="json"),
+                        "approved_intent": (
+                            state["intent_spec"].model_dump(mode="json")
+                            if state.get("intent_spec")
+                            else {}
+                        ),
                         "multi_dataset_context": _compact_loop_multi_dataset_context(state),
                         "evidence": evidence,
                         "attempted_action_hashes": list(state.get("loop_action_counts", {}))[-12:],
@@ -2818,7 +3115,15 @@ def _contract_gap_guidance(
             "Generate one read-only SELECT against dataset that returns the requested "
             "metric at the requested dimension/time grain and applies every contract filter. "
             + (
-                "The joined result will be checked against source-grain evidence before reporting."
+                "For average_order_value, compute SUM(the requested amount) divided by "
+                "COUNT(DISTINCT the order key); never AVG fact rows. "
+                if "average_order_value" in plan.derived_metrics
+                else ""
+            )
+            + (
+                "dataset is already the prepared joined dataframe: scan it exactly once, never "
+                "JOIN dataset to itself, and use GROUP BY plus COUNT(DISTINCT ...) to preserve "
+                "the requested grain. The result will be checked against source-grain evidence."
                 if multi_dataset
                 else ""
             )
@@ -3656,24 +3961,6 @@ class SQLValidationResult(TypedDict):
     message: str | None
 
 
-_FORBIDDEN_SQL_KEYWORDS = (
-    "drop",
-    "delete",
-    "update",
-    "insert",
-    "attach",
-    "copy",
-    "create",
-    "alter",
-    "truncate",
-    "merge",
-    "replace",
-    "vacuum",
-    "pragma",
-    "call",
-)
-
-
 def _extract_sql(content: str) -> str:
     text = content.strip()
     fenced = re.search(r"```(?:sql)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
@@ -3746,59 +4033,11 @@ def _localize_python_insight(insight: str) -> str:
 
 
 def _validate_dataset_select_sql(sql: str) -> SQLValidationResult:
-    normalized = _strip_sql_comments(sql).strip()
-    if not normalized:
-        return {"ok": False, "sql": "", "message": "Model did not return SQL."}
-    if normalized.count(";") > 1 or (";" in normalized and not normalized.endswith(";")):
-        return {"ok": False, "sql": normalized, "message": "Only one SQL statement is allowed."}
-    normalized = normalized.removesuffix(";").strip()
-    lowered = normalized.lower()
-    if not lowered.startswith("select "):
-        return {"ok": False, "sql": normalized, "message": "Only SELECT statements are allowed."}
-    for keyword in _FORBIDDEN_SQL_KEYWORDS:
-        if re.search(rf"\b{keyword}\b", lowered):
-            return {
-                "ok": False,
-                "sql": normalized,
-                "message": f"Forbidden SQL keyword was used: {keyword}.",
-            }
-
-    from_segments = re.findall(
-        r"\bfrom\b\s+(.*?)(?=\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\blimit\b|\bhaving\b|\bqualify\b|\bunion\b|$)",
-        normalized,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if any("," in segment for segment in from_segments):
-        return {
-            "ok": False,
-            "sql": normalized,
-            "message": "Comma joins are not allowed; SQL can only query dataset.",
-        }
-
-    table_refs = re.findall(
-        r"\b(?:from|join)\s+([\"`]?[\w.]+[\"`]?)",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-    if not table_refs:
-        return {
-            "ok": False,
-            "sql": normalized,
-            "message": "SQL must read from the dataset table.",
-        }
-    invalid_tables = [ref for ref in table_refs if ref.strip('"`').lower() != "dataset"]
-    if invalid_tables:
-        return {
-            "ok": False,
-            "sql": normalized,
-            "message": f"SQL can only query the dataset table: {', '.join(invalid_tables)}.",
-        }
+    try:
+        normalized = validate_scoped_dataset_select(sql)
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "sql": sql.strip(), "message": str(exc)}
     return {"ok": True, "sql": normalized, "message": None}
-
-
-def _strip_sql_comments(sql: str) -> str:
-    without_line_comments = re.sub(r"--.*?(?=\r?\n|$)", " ", sql)
-    return re.sub(r"/\*.*?\*/", " ", without_line_comments, flags=re.DOTALL)
 
 
 def _execute_dataset_sql(
@@ -3924,7 +4163,10 @@ def _execute_analysis_round(
     str | None,
     tuple[ValidationIssueResponse, ...],
 ]:
-    round_plan = _plan(f"{question}\n本轮假设：{hypothesis}", profile)
+    round_plan = _resolve_plan_columns(
+        _plan(f"{question}\n本轮假设：{hypothesis}", profile),
+        profile,
+    )
     plan_validation_issues: tuple[ValidationIssueResponse, ...] = ()
     model_router_provider: str | None = None
     model_router_model: str | None = None
@@ -3949,6 +4191,7 @@ def _execute_analysis_round(
                 },
             )
             model_plan = _parse_model_plan(response.content, fallback=round_plan)
+            model_plan = _resolve_plan_columns(model_plan, profile)
             plan_validation_issues = _validate_plan_harness(
                 planned_analysis=model_plan,
                 profile=profile,
@@ -4428,6 +4671,7 @@ def _sanitize_model_plan(
     *,
     allow_time: bool = True,
 ) -> PlannedAnalysis:
+    planned_analysis = _resolve_plan_columns(planned_analysis, profile)
     available_columns = {column.name for column in profile.columns}
     metric_columns = set(profile.numeric_columns)
     requested_dimensions = tuple(
@@ -4488,6 +4732,137 @@ def _sanitize_model_plan(
         requested_dimensions=requested_dimensions,
         derived_metrics=planned_analysis.derived_metrics,
         time_grain=planned_analysis.time_grain if time_column else None,
+    )
+
+
+def _apply_approved_intent_to_plan(
+    planned_analysis: PlannedAnalysis,
+    *,
+    intent: AnalysisIntentSpec | None,
+    profile: DatasetProfileResponse,
+) -> PlannedAnalysis:
+    if intent is None:
+        return planned_analysis
+    available_columns = {column.name for column in profile.columns}
+
+    def resolve(value: str | None) -> str | None:
+        return resolve_column_reference(value, available_columns)
+
+    forbidden = {
+        kind: {
+            resolved
+            for clause in intent.clauses
+            if clause.kind == kind
+            and clause.polarity == "forbidden"
+            and clause.field is not None
+            and (resolved := resolve(clause.field.column))
+        }
+        for kind in ("metric", "dimension", "filter", "time")
+    }
+
+    required_metric = resolve(intent.required_metric.column) if intent.required_metric else None
+    required_dimensions = tuple(
+        resolved
+        for binding in intent.required_dimensions
+        if (resolved := resolve(binding.column))
+    )
+    intent_aggregations = tuple(
+        AnalysisAggregationResponse(
+            operation=item.operation,
+            column=resolve(item.field.column) if item.field else None,
+            alias=item.alias,
+        )
+        for item in intent.aggregations
+        if item.field is None or resolve(item.field.column) is not None
+    )
+    intent_filters = tuple(
+        AnalysisFilterResponse(
+            column=resolved,
+            operator=item.operator,
+            value=item.value,
+        )
+        for item in intent.filters
+        if (resolved := resolve(item.field.column))
+    )
+    time_column = resolve(intent.time_field.column) if intent.time_field else None
+    fallback_metric = (
+        planned_analysis.metric_column
+        if planned_analysis.metric_column not in forbidden["metric"]
+        else None
+    )
+    fallback_dimensions = tuple(
+        item
+        for item in planned_analysis.requested_dimensions
+        if item not in forbidden["dimension"]
+    )
+    fallback_category = (
+        planned_analysis.category_column
+        if planned_analysis.category_column not in forbidden["dimension"]
+        else None
+    )
+    fallback_aggregations = tuple(
+        item
+        for item in planned_analysis.aggregations
+        if item.column is None or item.column not in forbidden["metric"]
+    )
+    fallback_filters = tuple(
+        item
+        for item in planned_analysis.filters
+        if item.column not in forbidden["filter"]
+    )
+    fallback_time = (
+        planned_analysis.time_column
+        if planned_analysis.time_column not in forbidden["time"]
+        else None
+    )
+    return PlannedAnalysis(
+        route=planned_analysis.route,
+        category_column=(
+            required_dimensions[0]
+            if required_dimensions
+            else fallback_category
+        ),
+        metric_column=required_metric or fallback_metric,
+        time_column=time_column or fallback_time,
+        steps=planned_analysis.steps,
+        aggregations=intent_aggregations or fallback_aggregations,
+        filters=intent_filters or fallback_filters,
+        requested_dimensions=required_dimensions or fallback_dimensions,
+        derived_metrics=intent.derived_metrics or planned_analysis.derived_metrics,
+        time_grain=planned_analysis.time_grain,
+    )
+
+
+def _resolve_plan_columns(
+    planned_analysis: PlannedAnalysis,
+    profile: DatasetProfileResponse,
+) -> PlannedAnalysis:
+    available_columns = {column.name for column in profile.columns}
+
+    def resolve(value: str | None) -> str | None:
+        return resolve_column_reference(value, available_columns) or value
+
+    return PlannedAnalysis(
+        route=planned_analysis.route,
+        category_column=resolve(planned_analysis.category_column),
+        metric_column=resolve(planned_analysis.metric_column),
+        time_column=resolve(planned_analysis.time_column),
+        steps=planned_analysis.steps,
+        aggregations=tuple(
+            item.model_copy(update={"column": resolve(item.column)})
+            if item.column
+            else item
+            for item in planned_analysis.aggregations
+        ),
+        filters=tuple(
+            item.model_copy(update={"column": resolve(item.column)})
+            for item in planned_analysis.filters
+        ),
+        requested_dimensions=tuple(
+            resolve(column) or column for column in planned_analysis.requested_dimensions
+        ),
+        derived_metrics=planned_analysis.derived_metrics,
+        time_grain=planned_analysis.time_grain,
     )
 
 

@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from app.analysis.analysis_contract import _analysis_type
 from app.analysis.services import PlannedAnalysis
 from app.analysis.workflow import (
@@ -13,7 +15,7 @@ from app.analysis.workflow import (
     _unsupported_summary_numbers,
     _validate_dataset_select_sql,
 )
-from app.core.settings import get_settings
+from app.core.settings import Settings, get_settings
 from app.mcp.tool_schemas import ModelRouterResponse
 from app.schemas.analysis import (
     InsightFindingResponse,
@@ -206,6 +208,104 @@ class FakeAnalysisModelRouter:
         return value
 
 
+class ContractRepairRouter:
+    def __init__(self, *, question: str, left_id, right_id) -> None:
+        self.question = question
+        self.left_id = left_id
+        self.right_id = right_id
+        self.agents: list[str] = []
+
+    def complete(self, **kwargs) -> ModelRouterResponse:
+        agent = str((kwargs.get("metadata") or {}).get("agent") or "")
+        self.agents.append(agent)
+        if agent == "intent_compiler":
+            content = json.dumps(
+                {
+                    "question": self.question,
+                    "source": "llm",
+                    "clauses": [
+                        {
+                            "clause_id": "relationship-1",
+                            "kind": "relationship",
+                            "polarity": "required",
+                            "concept": "row_level_join",
+                            "source_span": {
+                                "text": self.question,
+                                "start": 0,
+                                "end": len(self.question),
+                            },
+                        }
+                    ],
+                    "relationship_constraints": [
+                        {
+                            "left_dataset_id": str(self.left_id),
+                            "right_dataset_id": str(self.right_id),
+                            "operation": "row_level_join",
+                            "polarity": "required",
+                            "source_span": {
+                                "text": self.question,
+                                "start": 0,
+                                "end": len(self.question),
+                            },
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        elif agent == "planner":
+            content = (
+                '{"route":"sql","category_column":null,"metric_column":null,'
+                '"time_column":null,"steps":["Inspect joined coverage."]}'
+            )
+        else:
+            raise AssertionError(f"Unexpected model call after contract rejection: {agent}")
+        return ModelRouterResponse(provider="mock", model="guard-test", content=content)
+
+
+def test_contract_guard_replans_twice_then_stops_before_tools(
+    tmp_path, monkeypatch
+) -> None:
+    settings = Settings(
+        environment="test",
+        intent_compiler_mode="enforce",
+        intent_compiler_max_repairs=2,
+    )
+    monkeypatch.setattr("app.analysis.workflow.get_settings", lambda: settings)
+    monkeypatch.setattr("app.analysis.intent_compiler.get_settings", lambda: settings)
+    repository = DatasetStoreRepository(str(tmp_path))
+    orders = repository.create_dataset(
+        name="orders.csv", source_type="csv", source_metadata={}
+    )
+    payments = repository.create_dataset(
+        name="payments.csv", source_type="csv", source_metadata={}
+    )
+    repository.append_raw_records(
+        dataset_id=orders.id,
+        records=[{"order_id": "O1", "status": "complete"}],
+    )
+    repository.append_raw_records(
+        dataset_id=payments.id,
+        records=[{"order_id": "O1", "payment_value": 10.0}],
+    )
+    question = "将 orders.csv 与 payments.csv 关联后检查订单覆盖率。"
+    router = ContractRepairRouter(
+        question=question,
+        left_id=orders.id,
+        right_id=payments.id,
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        AnalysisWorkflowRunner(repository, model_router=router).run(
+            dataset_id=orders.id,
+            additional_dataset_ids=(payments.id,),
+            question=question,
+        )
+
+    assert router.agents == ["intent_compiler", "planner", "planner", "planner"]
+    assert "did not preserve the approved user intent" in str(captured.value)
+    assert repository.list_reports(orders.id) == ()
+
+
 def test_analysis_workflow_runner_executes_planner_sql_python_report(tmp_path) -> None:
     repository = DatasetStoreRepository(str(tmp_path))
     model_router = FakeAnalysisModelRouter()
@@ -288,20 +388,26 @@ def test_analysis_workflow_runner_executes_planner_sql_python_report(tmp_path) -
     assert reports[0]["metadata"]["model_router_provider"] == "mock"
     assert reports[0]["metadata"]["model_router_model"] == "fake-router"
     assert reports[0]["metadata"]["nodes"] == [
+        "intent_compile",
+        "scope_resolve",
         "planner",
+        "contract_validate",
         "design_framework",
         "sql_agent",
         "python_agent",
-            "iterative_prepare_rounds",
-            "iterative_round_1",
-            "iterative_fanout_round",
-            "iterative_reflect_and_merge",
-                "integrate_insights",
-                "format_charts",
-                "statistical_verify",
-                "adversarial_validate",
-            "report_agent",
+        "iterative_prepare_rounds",
+        "iterative_round_1",
+        "iterative_fanout_round",
+        "iterative_reflect_and_merge",
+        "integrate_insights",
+        "format_charts",
+        "statistical_verify",
+        "adversarial_validate",
+        "report_agent",
     ]
+    assert result.intent_validation is not None
+    assert result.contract_validation is not None
+    assert result.contract_validation.status == "passed"
     agents = [call["metadata"]["agent"] for call in model_router.calls]
     assert agents[:4] == [
         "planner",
@@ -668,6 +774,36 @@ def test_analysis_workflow_records_plan_validation_issues_and_falls_back(tmp_pat
     )
 
 
+def test_analysis_workflow_resolves_source_qualified_plan_columns(tmp_path) -> None:
+    repository = DatasetStoreRepository(str(tmp_path))
+    model_router = FakeAnalysisModelRouter(
+        planner_content=(
+            '{"route":"sql","category_column":"sales_dataset.csv__region",'
+            '"metric_column":"sales_dataset.csv__sales","time_column":null,'
+            '"steps":["Aggregate sales by region."]}'
+        )
+    )
+    dataset = repository.create_dataset(name="sales.csv", source_type="csv", source_metadata={})
+    repository.append_raw_records(
+        dataset_id=dataset.id,
+        records=[
+            {"region": "North", "sales": 100},
+            {"region": "South", "sales": 180},
+        ],
+    )
+
+    result = AnalysisWorkflowRunner(repository, model_router=model_router).run(
+        dataset_id=dataset.id,
+        question="Which region has the highest sales?",
+    )
+
+    assert result.planner_metadata.candidate_metrics[0] == "sales"
+    assert not any(
+        issue.finding_ref == "planner" and "unknown" in issue.issue
+        for issue in result.validation_issues
+    )
+
+
 def test_analysis_workflow_records_round_plan_validation_issues(tmp_path) -> None:
     repository = DatasetStoreRepository(str(tmp_path))
     model_router = FakeAnalysisModelRouter(
@@ -1004,6 +1140,10 @@ def test_sql_validator_allows_only_selects_against_dataset() -> None:
     external_table = _validate_dataset_select_sql("SELECT * FROM customers")
     comma_join = _validate_dataset_select_sql("SELECT * FROM dataset, customers")
     schema_table = _validate_dataset_select_sql("SELECT * FROM main.dataset")
+    self_join = _validate_dataset_select_sql(
+        "SELECT d.customer_state, SUM(d.payment_value) FROM dataset d "
+        "JOIN dataset o ON o.order_id = d.order_id GROUP BY d.customer_state"
+    )
 
     assert safe["ok"]
     assert not non_select["ok"]
@@ -1011,6 +1151,8 @@ def test_sql_validator_allows_only_selects_against_dataset() -> None:
     assert not external_table["ok"]
     assert not comma_join["ok"]
     assert not schema_table["ok"]
+    assert not self_join["ok"]
+    assert "scan the prepared dataset exactly once" in str(self_join["message"])
 def test_claim_result_keeps_derived_total_for_artifact_backed_rows() -> None:
     result = _claim_result(
         {

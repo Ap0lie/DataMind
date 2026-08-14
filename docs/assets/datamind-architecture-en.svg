@@ -64,33 +64,37 @@
     <text x="1183" y="257" text-anchor="middle" class="card-title" font-size="20" fill="#1e3a8a">Task control</text>
     <text text-anchor="middle" class="card-detail" fill="#1e3a8a"><tspan x="1183" y="291">SSE · Cancel · Retry · Resume</tspan></text>
 
-    <rect x="22" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
-    <text x="112" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Cleaning Loop</text>
-    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="112" y="452">Decide · Execute</tspan><tspan x="112" y="473">Gate · Commit</tspan></text>
+    <rect x="18" y="386" width="157" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="96.5" y="422" text-anchor="middle" class="card-title" font-size="16" fill="#14532d">Cleaning Loop</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="96.5" y="452">Decide · Execute</tspan><tspan x="96.5" y="473">Gate · Commit</tspan></text>
 
-    <rect x="218" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
-    <text x="308" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Planner</text>
-    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="308" y="452">Profile · Semantics</tspan><tspan x="308" y="473">Analysis contract</tspan></text>
+    <rect x="189" y="386" width="157" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+    <text x="267.5" y="422" text-anchor="middle" class="card-title" font-size="16" fill="#78350f">Intent Guard</text>
+    <text text-anchor="middle" class="card-detail" fill="#78350f"><tspan x="267.5" y="452">Compile · Validate</tspan><tspan x="267.5" y="473">Repair · Confirm</tspan></text>
 
-    <rect x="414" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
-    <text x="504" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Analysis Loop</text>
-    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="504" y="452">Safe SQL · Python</tspan><tspan x="504" y="473">Repair · Charts</tspan></text>
+    <rect x="360" y="386" width="157" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="438.5" y="422" text-anchor="middle" class="card-title" font-size="16" fill="#14532d">Planner</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="438.5" y="452">Profile · Semantics</tspan><tspan x="438.5" y="473">Analysis contract</tspan></text>
 
-    <rect x="610" y="386" width="180" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
-    <text x="700" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#78350f">Verifier</text>
-    <text text-anchor="middle" class="card-detail" fill="#78350f"><tspan x="700" y="452">Grain · Statistics</tspan><tspan x="700" y="473">Evidence</tspan></text>
+    <rect x="531" y="386" width="157" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="609.5" y="422" text-anchor="middle" class="card-title" font-size="16" fill="#14532d">Analysis Loop</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="609.5" y="452">Safe SQL · Python</tspan><tspan x="609.5" y="473">Repair · Charts</tspan></text>
 
-    <rect x="806" y="386" width="180" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
-    <text x="896" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#78350f">Reviewer</text>
-    <text text-anchor="middle" class="card-detail" fill="#78350f"><tspan x="896" y="452">Adversarial</tspan><tspan x="896" y="473">validation</tspan></text>
+    <rect x="702" y="386" width="157" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+    <text x="780.5" y="422" text-anchor="middle" class="card-title" font-size="16" fill="#78350f">Verifier</text>
+    <text text-anchor="middle" class="card-detail" fill="#78350f"><tspan x="780.5" y="452">Grain · Statistics</tspan><tspan x="780.5" y="473">Evidence</tspan></text>
 
-    <rect x="1002" y="386" width="180" height="120" rx="8" fill="#faf5ff" stroke="#c084fc" stroke-width="2"/>
-    <text x="1092" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#581c87">Report Loop</text>
-    <text text-anchor="middle" class="card-detail" fill="#581c87"><tspan x="1092" y="452">Draft · Repair</tspan><tspan x="1092" y="473">Verify · Commit</tspan></text>
+    <rect x="873" y="386" width="157" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+    <text x="951.5" y="422" text-anchor="middle" class="card-title" font-size="16" fill="#78350f">Reviewer</text>
+    <text text-anchor="middle" class="card-detail" fill="#78350f"><tspan x="951.5" y="452">Adversarial</tspan><tspan x="951.5" y="473">validation</tspan></text>
 
-    <rect x="1198" y="386" width="180" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
-    <text x="1288" y="422" text-anchor="middle" class="card-title" font-size="17" fill="#14532d">Assistant Graph</text>
-    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="1288" y="452">Retrieve · Tools</tspan><tspan x="1288" y="473">Confirm · Answer</tspan></text>
+    <rect x="1044" y="386" width="157" height="120" rx="8" fill="#faf5ff" stroke="#c084fc" stroke-width="2"/>
+    <text x="1122.5" y="422" text-anchor="middle" class="card-title" font-size="16" fill="#581c87">Report Loop</text>
+    <text text-anchor="middle" class="card-detail" fill="#581c87"><tspan x="1122.5" y="452">Draft · Repair</tspan><tspan x="1122.5" y="473">Verify · Commit</tspan></text>
+
+    <rect x="1215" y="386" width="157" height="120" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+    <text x="1293.5" y="422" text-anchor="middle" class="card-title" font-size="16" fill="#14532d">Assistant Graph</text>
+    <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="1293.5" y="452">Retrieve · Tools</tspan><tspan x="1293.5" y="473">Confirm · Answer</tspan></text>
 
     <rect x="22" y="714" width="211" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
     <text x="127.5" y="750" text-anchor="middle" class="card-title" font-size="17" fill="#334155">Data store</text>
@@ -119,12 +123,13 @@
 <text x="735" y="198" text-anchor="middle" class="flow-label">HTTPS</text>
 <line x1="700" y1="321" x2="700" y2="386" class="arrow" marker-end="url(#arrow)"/>
 <text x="750" y="357" text-anchor="middle" class="flow-label">dispatch</text>
-<line x1="202" y1="446" x2="218" y2="446" class="arrow" marker-end="url(#arrow)"/>
-<line x1="398" y1="446" x2="414" y2="446" class="arrow" marker-end="url(#arrow)"/>
-<line x1="594" y1="446" x2="610" y2="446" class="arrow" marker-end="url(#arrow)"/>
-<line x1="790" y1="446" x2="806" y2="446" class="arrow" marker-end="url(#arrow)"/>
-<line x1="986" y1="446" x2="1002" y2="446" class="arrow" marker-end="url(#arrow)"/>
-<line x1="1182" y1="446" x2="1198" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="175" y1="446" x2="189" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="346" y1="446" x2="360" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="517" y1="446" x2="531" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="688" y1="446" x2="702" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="859" y1="446" x2="873" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="1030" y1="446" x2="1044" y2="446" class="arrow" marker-end="url(#arrow)"/>
+<line x1="1201" y1="446" x2="1215" y2="446" class="arrow" marker-end="url(#arrow)"/>
 <line x1="700" y1="556" x2="700" y2="610" class="shared-connection" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
 <rect x="226" y="610" width="948" height="46" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>
 <text x="244" y="638" class="service-bus">Model execution boundary</text>
@@ -148,6 +153,6 @@
 <line x1="814.5" y1="700" x2="814.5" y2="714" class="shared-connection"/>
 <line x1="1043.5" y1="700" x2="1043.5" y2="714" class="shared-connection"/>
 <line x1="1272.5" y1="700" x2="1272.5" y2="714" class="shared-connection"/>
-<path d="M 1092 506 C 1092 548, 308 548, 308 506" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
-<text x="700" y="542" text-anchor="middle" class="flow-label">repair / replan</text>
+<path d="M 1122.5 506 C 1122.5 548, 438.5 548, 438.5 506" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<text x="780.5" y="542" text-anchor="middle" class="flow-label">repair / replan</text>
 </svg>

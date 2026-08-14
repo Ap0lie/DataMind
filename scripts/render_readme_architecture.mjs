@@ -32,6 +32,7 @@ const locales = {
     ],
     agents: [
       ["Cleaning Loop", "Decide · Execute", "Gate · Commit"],
+      ["Intent Guard", "Compile · Validate", "Repair · Confirm"],
       ["Planner", "Profile · Semantics", "Analysis contract"],
       ["Analysis Loop", "Safe SQL · Python", "Repair · Charts"],
       ["Verifier", "Grain · Statistics", "Evidence"],
@@ -75,6 +76,7 @@ const locales = {
     ],
     agents: [
       ["清洗 Loop", "决策 · 执行", "门禁 · 提交"],
+      ["意图 Guard", "编译 · 校验", "修复 · 确认"],
       ["Planner", "画像 · 语义计划", "分析契约"],
       ["分析 Loop", "安全 SQL · Python", "修复 · 图表"],
       ["验证器", "粒度 · 统计", "证据"],
@@ -121,6 +123,7 @@ const workflowLocales = {
       ["Profile & semantics", "Drift · Roles · Metrics", "Relationship graph", "control"],
     ],
     analysis: [
+      ["Intent Guard", "Compile · Validate", "Repair · Confirm", "verify"],
       ["Planner", "Question · Scope · Grain", "Analysis contract", "loop"],
       ["Tool Loop", "Safe SQL · Python", "Evidence artifacts", "loop"],
       ["Verifier", "Join grain · Statistics", "Numeric evidence", "verify"],
@@ -151,6 +154,7 @@ const workflowLocales = {
       ["画像与语义", "漂移 · 角色 · 指标", "实体关系图", "control"],
     ],
     analysis: [
+      ["意图 Guard", "编译 · 极性校验", "修复 · 用户确认", "verify"],
       ["Planner", "问题 · 范围 · 粒度", "分析契约", "loop"],
       ["工具 Loop", "安全 SQL · Python", "证据 Artifact", "loop"],
       ["验证器", "Join 粒度 · 统计", "数值证据", "verify"],
@@ -248,9 +252,18 @@ function svgStart({ svgHeight, title, description }) {
 function render(locale) {
   const experienceX = [63, 388, 713, 1038];
   const controlX = [...experienceX];
-  const agentX = Array.from({ length: 7 }, (_, index) => 22 + index * 196);
+  const agentX = Array.from({ length: 8 }, (_, index) => 18 + index * 171);
   const infrastructureX = Array.from({ length: 6 }, (_, index) => 22 + index * 229);
-  const agentTones = ["loop", "loop", "loop", "verify", "verify", "report", "loop"];
+  const agentTones = [
+    "loop",
+    "verify",
+    "loop",
+    "loop",
+    "verify",
+    "verify",
+    "report",
+    "loop",
+  ];
   const infrastructureTones = [
     "infrastructure",
     "infrastructure",
@@ -307,12 +320,12 @@ function render(locale) {
       card({
         x: agentX[index],
         y: 386,
-        w: 180,
+        w: 157,
         h: 120,
         title,
         details,
         tone: agentTones[index],
-        titleSize: 17,
+        titleSize: 16,
       }),
     );
   });
@@ -338,10 +351,10 @@ function render(locale) {
   parts.push(label(locale.flowLabels[1], 750, 357));
 
   for (let index = 0; index < agentX.length - 1; index += 1) {
-    parts.push(arrow(agentX[index] + 180, 446, agentX[index + 1], 446));
+    parts.push(arrow(agentX[index] + 157, 446, agentX[index + 1], 446));
   }
 
-  const agentCenters = agentX.map((x) => x + 90);
+  const agentCenters = agentX.map((x) => x + 78.5);
   parts.push(sharedConnection(700, 556, 700, 610));
   parts.push(
     `<rect x="226" y="610" width="948" height="46" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>`,
@@ -371,8 +384,8 @@ function render(locale) {
   const infrastructureCenters = infrastructureX.map((x) => x + 105.5);
   infrastructureCenters.forEach((x) => parts.push(serviceLink(x, 700, x, 714)));
 
-  const reportCenter = agentCenters[5];
-  const plannerCenter = agentCenters[1];
+  const reportCenter = agentCenters[6];
+  const plannerCenter = agentCenters[2];
   parts.push(
     `<path d="M ${reportCenter} 506 C ${reportCenter} 548, ${plannerCenter} 548, ${plannerCenter} 506" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>`,
   );
@@ -383,7 +396,7 @@ function render(locale) {
 
 function renderWorkflow(locale) {
   const preparationX = [63, 388, 713, 1038];
-  const analysisX = [40, 310, 580, 850, 1120];
+  const analysisX = [22, 250, 478, 706, 934, 1162];
   const deliveryX = [200, 550, 900];
   const parts = [
     svgStart({
@@ -425,7 +438,7 @@ function renderWorkflow(locale) {
       card({
         x: analysisX[index],
         y: 292,
-        w: 240,
+        w: 216,
         h: 130,
         title,
         details: rest,
@@ -459,10 +472,10 @@ function renderWorkflow(locale) {
   );
 
   for (let index = 0; index < analysisX.length - 1; index += 1) {
-    parts.push(arrow(analysisX[index] + 240, 357, analysisX[index + 1], 357));
+    parts.push(arrow(analysisX[index] + 216, 357, analysisX[index + 1], 357));
   }
   parts.push(
-    `<path d="M 1240 422 C 1240 456, 160 456, 160 422" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>`,
+    `<path d="M 1270 422 C 1270 456, 130 456, 130 422" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>`,
   );
   parts.push(label(locale.labels[0], 700, 449));
   parts.push(

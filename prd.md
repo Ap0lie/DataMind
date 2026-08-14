@@ -546,7 +546,15 @@ Default analysis graph:
 
 ```text
 START
+  -> intent_compile
+       ├─ compile -> deterministic guard
+       ├─ repairable -> feedback -> compile (at most two repairs)
+       └─ unresolved -> confirmation / reject before tools
+  -> scope_resolve
   -> planner
+  -> contract_validate
+       ├─ missing requirement -> planner repair (at most two replans)
+       └─ forbidden scope/relation -> reject before tools
   -> design_framework
   -> loop_bootstrap
   -> loop_decide
@@ -573,6 +581,10 @@ START
 Current behavior:
 
 - `agent_mode=auto` resolves to `loop` under the default deployment policy. The React analysis page presents “自主分析” as the default segmented mode and “兼容模式” as an explicit alternative.
+- The Intent Compiler converts the original question into a request-scoped declarative specification containing source spans, polarity, field bindings, filters, aggregations, dataset scope, and relationship constraints. It cannot modify runtime rules, source code, system prompts, permissions, or tool policy.
+- A deterministic Intent Guard verifies source-span fidelity, negation and required/forbidden polarity, authorized assets, field existence, type/role compatibility, and hallucinated mandatory requirements. Repairable findings are returned to the compiler for at most two repairs; unresolved enforced requests require confirmation or stop before tools run.
+- Dataset scope is resolved only from the approved intent. Relationship prohibitions remain edge constraints and cannot be promoted into dataset requirements.
+- After planning, a deterministic Contract Guard verifies that the frozen `AnalysisContract` preserves every required metric, dimension, filter, time field, aggregation, scope, relationship, and grain constraint without using forbidden fields or joins. Repairable gaps trigger at most two focused replans.
 - The Loop controller can choose one job-scoped, read-only analysis tool per decision. Identity, dataset scope, semantic decision, timeout, call budget, decision budget, token budget, and duplicate-action keys are injected server-side.
 - Tool errors are classified as repairable, policy, provider, timeout, budget, or terminal failures. Repair must change the tool or arguments; repeated identical failures cannot create an unbounded retry cycle.
 - Successful actions and report commits are idempotent across retries and checkpoint recovery. Ordered events expose decisions, tool execution, verification, repair, fallback, report validation, and commit without storing hidden reasoning or unbounded raw rows.
@@ -582,6 +594,7 @@ Current behavior:
 - `statistical_verify` deterministically checks every finding before report generation. Numeric evidence coverage must be 100%; comparison claims carry sample size and an effect size or 95% confidence interval; unsafe Join expansion without source-grain evidence and unqualified causal language fail validation.
 - High-severity statistical failures reuse the existing one-pass adversarial evidence-repair route. Findings that still fail after bounded repair are excluded from the final report and remain visible as validation issues.
 - `agent_mode=legacy` preserves the fixed planner -> SQL/Python -> iterative rounds -> review -> report graph for historical compatibility and operational diagnosis.
+- Intent compilation initially runs in `shadow` mode: Guard reports and attempts are persisted without changing the established execution result. After benchmark calibration, `enforce` mode makes approved intent and Contract Guard results authoritative.
 
 Related autonomous cleaning graph:
 
@@ -848,6 +861,7 @@ Semantic planning extensions:
 - `POST /api/v1/analysis/planner-decisions/{decision_id}/feedback`
 - Analysis job requests may include `planner_decision_id` and `confirmed_low_confidence`.
 - Planner responses expose semantic model ID/version, semantic plan, component scores, raw/calibrated confidence, decision band, ambiguities, evidence, and confirmation requirement.
+- Plan responses also expose `intent_spec`, `intent_validation`, `intent_attempts`, optional `contract_validation`, and intent-specific confirmation reasons while preserving existing clients.
 
 Report store extensions:
 
@@ -1241,6 +1255,7 @@ Implemented:
 - Workflow modularization phase 1: reusable prompt trust/experience/multi-dataset context lives in `app/analysis/workflow_prompt_context.py`.
 - LangGraph nodes execute through a unified Node Harness for transient retry classification, validation, timing, and trace events.
 - Unified context budget v1 covers cleaning, Planner, SQL/Python, Reviewer, Report and Kimi calls with stage-specific Token ceilings, deterministic domain reduction, Python repair-error preservation, character admission, and privacy-safe context budget events. The deterministic `context` Benchmark gates required-context preservation, oversized-request rate, Token reduction and compression latency; production remains in shadow mode until five valid calibration batches pass.
+- Guarded intent compilation v1 converts complex questions into source-backed declarative requirements, validates polarity, authorized assets, field bindings and relationship prohibitions, resolves dataset scope from the approved result, and validates the frozen AnalysisContract before any SQL/Python tool execution. Compilation and focused replanning are each bounded to two repairs; the rollout remains in shadow mode until five valid cross-domain Benchmark batches pass.
 - Process-level internal MCP Runtime reuse for API and Worker model/tool calls.
 - Chart support for bar, line, pie, histogram, box plot, and correlation heatmap.
 - Text analysis support in Python agent/rules fallback.
@@ -1304,6 +1319,7 @@ Implemented:
 - Trustworthy Memory v2 reverified 2026-08-12: Ruff passed; 211 Unit, 82 Workflow, 89 Integration, and 9 Sandbox tests passed; deterministic release and Memory benchmarks passed; the frontend production build and all 60 desktop/mobile Playwright cases passed. Alembic `0001 -> 0012`, `0012 -> 0011`, and re-upgrade to `0012` passed on fresh SQLite and PostgreSQL 16 databases, including Repository conflict-chain and lease smoke tests.
 - Memory v3 reverified 2026-08-12: Ruff passed; 213 Unit, 82 Workflow, and 89 Integration tests passed; deterministic release and Memory v3 benchmarks passed with `Precision@8=97.5%`, `Recall@8=97.5%`, harmful-memory adoption `0%`, and 500-memory retrieval P95 `79.3ms`; the frontend production build and all 60 desktop/mobile Playwright cases passed. Alembic `0001 -> 0013`, `0013 -> 0012`, and re-upgrade to `0013` passed on fresh SQLite; the running PostgreSQL stack upgraded from `0012` to `0013`, and Docker Compose readiness passed.
 - Conversation creation idempotency reverified 2026-08-12: Ruff passed; 395 Unit/Workflow/Integration tests and all 62 desktop/mobile Playwright cases passed; the frontend production build passed; Alembic `0001 -> 0014`, `0014 -> 0013`, and re-upgrade to `0014` passed on fresh SQLite and PostgreSQL 16 databases. Browser response-loss coverage confirms that retries reuse one key without duplicating the conversation or expiring the session.
+- Guarded intent compilation v1 reverified 2026-08-15: Ruff passed; 242 Unit, 84 Workflow, and 90 Integration tests passed; the deterministic release Benchmark and frontend production build passed. Docker Compose configuration, migration/init jobs, PostgreSQL, Redis, Celery Worker/Beat, Python Runner, API/frontend health, gateway access, and strict readiness all passed with the rebuilt application and frontend code layers.
 - Kimi ask-mode report fast path, database-level Top-N report retrieval, bounded summary-plus-cursor context, segmented first-answer latency telemetry, combined token accounting, and Benchmark P50/P95 aggregation.
 - Kimi report revision with frozen analytical evidence, deterministic evidence fingerprints, no analysis rerun, and one audited primary report deliverable per message.
 - Assistant LangGraph and local/Celery execution path with ordered SSE tool/analysis/message events, immediate terminal cancellation, checkpoint-safe pause/resume, low-confidence semantic-plan confirmation, and analysis-job reuse. Cancel and final-answer commits are atomic so a late model response cannot overwrite the user's stop action.
@@ -1311,6 +1327,7 @@ Implemented:
 
 Not complete yet:
 
+- Enforced intent compilation in production; the current default is shadow observation pending five valid cross-domain benchmark batches and confirmation-rate review.
 - A recorded successful execution of the real-stack production smoke workflow on a Docker-capable host.
 - Enterprise authentication, RBAC, SSO, password reset, and audit log management.
 - Per-cell manual cleaning approval workflow.
@@ -1342,6 +1359,7 @@ The current product is successful when users can:
 - Select multiple uploaded datasets, accept/edit join recommendations, and run joined analysis.
 - Select a dataset group, use its automatically validated relationship tree, and run chained joined analysis.
 - Ask questions in natural language.
+- Preserve complex negation, strict dataset allow/deny scope, required metrics and dimensions, and forbidden relationships through a source-backed intent specification; unresolved enforced intent must stop before tool execution.
 - Start in autonomous Loop mode by default, switch explicitly to the legacy compatibility path when needed, and see the selected execution path before submission.
 - Observe autonomous analysis decisions, allowlisted tool execution, evidence verification, classified repair, deterministic fallback, remaining budgets, and terminal reason without exposing hidden model reasoning.
 - Run SQL, Python, or hybrid analysis.
@@ -1385,6 +1403,7 @@ The current product is successful when users can:
 
 ## Next
 
+- Retain five valid intent-compiler shadow benchmark batches across e-commerce, finance, HR, logs, and generic business schemas; verify 100% required-clause and prohibition preservation before enabling `DATAMIND_INTENT_COMPILER_MODE=enforce`.
 - Retain five valid Memory v3 benchmark batches, review harmful-memory adoption and feedback calibration, then decide whether production automatic dormancy can be enabled.
 - Continue behavior-preserving module extraction only where it reduces ownership complexity: the next candidates are the autonomous analysis Loop handlers and database bootstrap/migration compatibility code. Keep `workflow.py` and `DatasetStoreRepository` as stable public composition facades.
 - Run and retain the real-stack production smoke artifact on a Docker-capable host before production acceptance.

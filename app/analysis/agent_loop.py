@@ -12,6 +12,7 @@ import duckdb
 import pandas as pd
 from sqlglot import exp, parse
 
+from app.analysis.column_references import resolve_column_reference
 from app.analysis.python_execution import PythonAnalysisExecutor
 from app.analysis.query_intent import SOURCE_METRIC_ALIASES
 from app.analysis.services import (
@@ -20,6 +21,7 @@ from app.analysis.services import (
     _run_python,
     _run_sql,
 )
+from app.analysis.sql_policy import validate_scoped_dataset_select
 from app.schemas.analysis import DatasetProfileResponse, PythonExecutionContextResponse
 from app.semantic.service import SemanticLayerService
 from app.storage.dataset_store import DatasetStoreRepository
@@ -753,24 +755,7 @@ def _python_referenced_columns(code: str, columns: Any) -> tuple[str, ...]:
 
 
 def _validate_safe_dataset_sql(sql: str) -> None:
-    if not sql:
-        raise ValueError("SQL is required.")
-    statements = parse(sql, read="duckdb")
-    if len(statements) != 1 or not isinstance(statements[0], (exp.Select, exp.Union)):
-        raise ValueError("Only one SELECT statement is allowed.")
-    root = statements[0]
-    forbidden = (exp.Insert, exp.Update, exp.Delete, exp.Create, exp.Drop, exp.Command, exp.Copy, exp.Attach, exp.Pragma)
-    if any(root.find(kind) is not None for kind in forbidden):
-        raise ValueError("SQL contains a forbidden statement.")
-    forbidden_functions = {"read_csv", "read_csv_auto", "read_parquet", "sqlite_scan", "postgres_scan", "httpfs", "glob"}
-    if any(str(function.sql_name()).lower() in forbidden_functions for function in root.find_all(exp.Func)):
-        raise ValueError("External table functions are forbidden.")
-    tables = {str(table.name).lower() for table in root.find_all(exp.Table)}
-    ctes = {str(cte.alias_or_name).lower() for cte in root.find_all(exp.CTE)}
-    if any(table != "dataset" and table not in ctes for table in tables):
-        raise ValueError("SQL may only read the job-scoped dataset table.")
-    if any(str(join.args.get("kind") or "").upper() in {"CROSS", "NATURAL"} for join in root.find_all(exp.Join)):
-        raise ValueError("CROSS and NATURAL JOIN are forbidden.")
+    validate_scoped_dataset_select(sql)
 
 
 def _required_column(frame: pd.DataFrame, value: Any) -> str:
@@ -787,11 +772,7 @@ def _optional_column(frame: pd.DataFrame, value: Any) -> str | None:
 
 
 def _source_contract_column(frame: pd.DataFrame, value: str) -> str | None:
-    if value in frame.columns:
-        return value
-    suffix = value.rsplit("__", 1)[-1]
-    matches = [str(column) for column in frame.columns if str(column) == suffix]
-    return matches[0] if len(matches) == 1 else None
+    return resolve_column_reference(value, tuple(str(column) for column in frame.columns))
 
 
 def _aggregate_frame(
