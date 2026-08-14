@@ -927,6 +927,7 @@ app/
       dataset_store.py
       deps.py
   analysis/
+    agent_prompts.py
     agent_loop.py
     analysis_contract.py
     checkpoints.py
@@ -941,6 +942,10 @@ app/
     prompt_utils.py
     python_execution.py
     workflow.py
+    workflow_nodes.py
+    workflow_prompts.py
+    workflow_report_nodes.py
+    workflow_support.py
     workflow_prompt_context.py
     services.py
     statistical_verifier.py
@@ -978,10 +983,18 @@ app/
   storage/
     auth_repository.py
     assistant_repository.py
+    data_reliability_repository.py
+    dataset_group_repository.py
+    dataset_repository.py
     dataset_store.py
+    job_repository.py
     models.py
+    recycle_repository.py
+    report_repository.py
+    repository_utils.py
     repositories.py
     row_mappers.py
+    semantic_repository.py
     sqlalchemy_compat.py
     migrate_sqlite_to_postgres.py
   harness/
@@ -998,10 +1011,19 @@ frontend/
     e2e/
     src/
       api-client.ts
+      domain-types.ts
+      formatters.ts
       workflow-ui.ts
       main.tsx
       styles.css
+      components/
+        AppShell.tsx
+        primitives.tsx
       features/
+        auth/
+          LoginPage.tsx
+        dashboard/
+          DashboardPage.tsx
         assistant/
           AssistantPage.tsx
           AssistantControlPanel.tsx
@@ -1013,11 +1035,17 @@ frontend/
           types.ts
         datasets/
           CleaningWorkspace.tsx
+          DatasetsPage.tsx
         data-reliability/
           DriftMonitorPanel.tsx
         analysis/
+          AnalysisPage.tsx
           AnalysisReliabilityPanel.tsx
+          WorkflowStatus.tsx
+          job-client.ts
         reports/
+          ReportContent.tsx
+          ReportsPage.tsx
           chart-export.ts
           report-templates.ts
         semantic/
@@ -1170,12 +1198,20 @@ Implemented:
 - Frontend modularization phase 1: Workflow node definitions, status derivation, log translation, and task labels live in `frontend/react/src/workflow-ui.ts` instead of the application entrypoint.
 - Frontend modularization phase 2: API base URL/fallback, Cookie/CSRF request headers, typed GET/POST/PATCH/DELETE helpers, cleaning compatibility calls, and auth cache live in `frontend/react/src/api-client.ts`.
 - Frontend modularization phase 3: Kimi Assistant components, the visual semantic-model workbench, cleaning version/rule UI, field metadata editing, report template transforms, and chart export utilities live under `frontend/react/src/features`; the extracted dataset workspace is the active implementation and its former duplicates were removed from `main.tsx`.
+- Frontend modularization phase 4: shared domain contracts and formatters live in `domain-types.ts` and `formatters.ts`; the dashboard, login experience, navigation shell, top bar, floating cross-page task status, and shared primitives are independent modules.
+- Frontend modularization phase 5: dataset, analysis, and report pages now live under their own feature modules. Shared report renderers, Workflow status UI, and analysis job transport are extracted as reusable components; `main.tsx` is the compatibility composition root for routing and cross-page state.
 - Frontend build tooling uses Vite 8.1.4 and `@vitejs/plugin-react` 6.0.3; the dependency audit is clean after replacing the vulnerable Vite 5/esbuild chain.
 - FastAPI backend.
 - SQLite persistence for users, datasets, reports, and analysis records.
 - Storage modularization phase 1: persisted dataset/group/job domain models live in `app/storage/models.py`, separate from repository SQL and migrations.
 - Storage modularization phase 2: password/session helpers and user-session persistence live in `app/storage/auth_repository.py` behind the existing `DatasetStoreRepository` facade.
 - Storage modularization phase 3: SQLite compatibility row decoding for datasets, groups, cleaning/analysis jobs, ordered events, semantic models, cleaning versions, column metadata, and reports lives in `app/storage/row_mappers.py`; the repository facade retains query, transaction, and domain behavior.
+- Storage modularization phase 4: report/chart persistence and asset recycle/restore/retention behavior live in `report_repository.py` and `recycle_repository.py`, composed behind the unchanged `DatasetStoreRepository` facade; shared retention timestamps live in `repository_utils.py`.
+- Storage modularization phase 5: dataset/record/cleaning-version persistence, dataset-group relationships, and cleaning/analysis jobs with ordered events and leases live in dedicated repository mixins. `DatasetStoreRepository` remains the compatible transaction facade, while shared relationship-graph validation is centralized in `repository_utils.py`.
+- Storage modularization phase 6: snapshots, drift events, relationship freshness and report invalidation live in `data_reliability_repository.py`; semantic models, embedding cache, Planner decisions/feedback and calibrators live in `semantic_repository.py`. Both remain composed behind the unchanged `DatasetStoreRepository` contract.
+- Workflow modularization phase 1: Planner, SQL, Python statistics/chart generation, and Python repair Prompt builders live in `app/analysis/agent_prompts.py`; `workflow.py` keeps compatibility aliases while LangGraph remains the only orchestration layer.
+- Workflow modularization phase 2: framework, reflection, chart-review, reviewer, report, and JSON-repair Prompt builders live in `workflow_prompts.py`; node names and pure routing decisions live in `workflow_nodes.py`.
+- Workflow modularization phase 3: adversarial review, deterministic statistical verification, the bounded Report Loop, evidence merging, report parsing and Workflow Trace formatting live in `workflow_report_nodes.py`. The module receives progress, event and DataFrame restoration through an explicit runtime boundary, while `workflow.py` retains compatibility aliases and the unchanged LangGraph/checkpoint contract.
 - PostgreSQL production persistence through the SQLAlchemy compatibility layer and Alembic.
 - SQLite-to-PostgreSQL UUID-preserving migration command.
 - Revocable HttpOnly Cookie sessions, CSRF/Origin validation, Argon2id password migration, and user-scoped records.
@@ -1350,7 +1386,7 @@ The current product is successful when users can:
 ## Next
 
 - Retain five valid Memory v3 benchmark batches, review harmful-memory adoption and feedback calibration, then decide whether production automatic dormancy can be enabled.
-- Continue behavior-preserving module extraction: move frontend domain types and page modules out of `main.tsx`; move Workflow Prompt builders into `workflow_prompts.py` and node factories into a `workflow_nodes` package; move relationship-graph validation into its own storage helper and split dataset/group/job/report repositories behind the existing facade.
+- Continue behavior-preserving module extraction only where it reduces ownership complexity: the next candidates are the autonomous analysis Loop handlers and database bootstrap/migration compatibility code. Keep `workflow.py` and `DatasetStoreRepository` as stable public composition facades.
 - Run and retain the real-stack production smoke artifact on a Docker-capable host before production acceptance.
 - Add per-cell manual cleaning approval workflow.
 - Expand the semantic-model visual editor from source-field/aggregation bindings to a complete expression-tree formula authoring experience.

@@ -759,6 +759,7 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
             <div>
               <button ref={newConversationButtonRef} type="button" className="icon-button" aria-label="新建对话" title="新建对话" disabled={loading || creatingConversation} aria-busy={creatingConversation} onClick={() => void createConversation()}>{creatingConversation ? <Loader2 className="animate-spin" size={18} /> : <Plus size={18} />}</button>
               <button type="button" className="icon-button assistant-history-toggle" title={historyCollapsed ? "展开消息记录" : "收起消息记录"} onClick={toggleHistoryCollapsed}>{historyCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}</button>
+              <button type="button" className="icon-button md:hidden" aria-label="关闭" title="关闭" onClick={() => setHistoryOpen(false)}><X size={18} /></button>
             </div>
           </div>
           <label className="assistant-history-search"><Search size={14} /><input aria-label="搜索对话" value={historySearch} onChange={(event) => setHistorySearch(event.target.value)} placeholder="搜索对话" /></label>
@@ -786,7 +787,6 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
               </div>
             ))}
           </div>
-          <button type="button" className="assistant-history-close md:hidden" onClick={() => setHistoryOpen(false)}><X size={16} /> 关闭</button>
         </aside>
 
         <div className="assistant-thread">
