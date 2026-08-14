@@ -3,6 +3,7 @@ export const AUTH_EXPIRED_EVENT = "datamind:auth-expired";
 const GET_RETRY_ATTEMPTS = 2;
 const GET_RETRY_DELAY_MS = 350;
 const IDEMPOTENT_POST_RETRY_ATTEMPTS = 2;
+const activeApiRequests = new Set<AbortController>();
 
 export const API_BASE_URL =
   import.meta.env.VITE_DATAMIND_API_BASE_URL ?? "http://127.0.0.1:8010/api/v1";
@@ -14,6 +15,11 @@ export type AuthUser = {
   csrf_token?: string | null;
   expires_at?: string | null;
 };
+
+export function abortPendingApiRequests() {
+  for (const controller of activeApiRequests) controller.abort();
+  activeApiRequests.clear();
+}
 
 export async function apiGet<T>(path: string): Promise<T> {
   let lastError: unknown = new Error("Request failed.");
@@ -338,7 +344,7 @@ export function saveAuthUser(user: AuthUser | null) {
 }
 
 async function fetchApi(path: string, init?: RequestInit, allowLocalFallback = true) {
-  const requestInit = withAuthHeader(init);
+  const { requestInit, release } = trackApiRequest(withAuthHeader(init));
   try {
     const response = await fetch(`${API_BASE_URL}${path}`, requestInit);
     await notifyAuthenticationFailure(path, response);
@@ -348,7 +354,25 @@ async function fetchApi(path: string, init?: RequestInit, allowLocalFallback = t
     const response = await fetch(`${API_FALLBACK_BASE_URL}${path}`, requestInit);
     await notifyAuthenticationFailure(path, response);
     return response;
+  } finally {
+    release();
   }
+}
+
+function trackApiRequest(init: RequestInit) {
+  const controller = new AbortController();
+  const upstreamSignal = init.signal;
+  const abortFromUpstream = () => controller.abort();
+  if (upstreamSignal?.aborted) controller.abort();
+  else upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+  activeApiRequests.add(controller);
+  return {
+    requestInit: { ...init, signal: controller.signal },
+    release: () => {
+      upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+      activeApiRequests.delete(controller);
+    },
+  };
 }
 
 async function notifyAuthenticationFailure(path: string, response: Response) {
