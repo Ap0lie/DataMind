@@ -22,8 +22,12 @@ const isolatedDataRoot = path.join(
 
 export default defineConfig({
   testDir: "./e2e",
-  outputDir: path.join(os.tmpdir(), "datamind-playwright-results"),
-  reporter: "line",
+  outputDir: path.resolve("test-results"),
+  reporter: process.env.CI
+    ? [["line"], ["html", { outputFolder: "playwright-report", open: "never" }]]
+    : "line",
+  retries: process.env.CI ? 1 : 0,
+  workers: process.env.CI ? 2 : undefined,
   timeout: 60_000,
   webServer: externalFrontendURL ? [] : [
     {
