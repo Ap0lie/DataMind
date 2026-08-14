@@ -8,6 +8,9 @@ from app.core.settings import get_settings
 from app.schemas.analysis import StatisticalVerificationResponse
 
 PLANNER_NODE = "planner"
+INTENT_COMPILE_NODE = "intent_compile"
+SCOPE_RESOLVE_NODE = "scope_resolve"
+CONTRACT_VALIDATE_NODE = "contract_validate"
 JOIN_PREPARE_NODE = "join_prepare"
 DESIGN_FRAMEWORK_NODE = "design_framework"
 SQL_NODE = "sql_agent"

@@ -7,6 +7,7 @@ import pandas as pd
 from app.analysis.analysis_contract import build_analysis_contract
 from app.analysis.services import DatasetProfiler, PlannedAnalysis
 from app.analysis.statistical_verifier import (
+    _sql_grain_safety_check,
     qualify_observational_findings,
     reportable_findings,
     statistical_validation_issues,
@@ -22,6 +23,26 @@ from app.schemas.analysis import (
     PlannerMetadataResponse,
     SQLAnalysisResponse,
 )
+
+
+def test_sql_grain_safety_rejects_prepared_dataset_self_join() -> None:
+    result = SQLAnalysisResponse(
+        sql=(
+            "SELECT c.customer_state, SUM(p.total_payment) FROM "
+            "(SELECT order_id, SUM(payment_value) AS total_payment "
+            "FROM dataset GROUP BY order_id) p "
+            "JOIN dataset o ON o.order_id = p.order_id "
+            "JOIN dataset c ON c.customer_id = o.customer_id "
+            "GROUP BY c.customer_state"
+        ),
+        rows=(),
+        explanation="unsafe self-join",
+    )
+
+    check = _sql_grain_safety_check(result)
+
+    assert check.status == "failed"
+    assert check.details["unsafe_dataset_self_join"] is True
 
 
 def test_analysis_contract_uses_plan_scope_and_server_budget() -> None:
@@ -55,6 +76,49 @@ def test_analysis_contract_uses_plan_scope_and_server_budget() -> None:
     assert contract.grain == ("region", "created_at")
     assert contract.causal_claim_allowed is False
     assert contract.analysis_budget["max_tool_calls"] >= 1
+
+
+def test_analysis_contract_requires_average_order_value_ratio() -> None:
+    dataset_id = uuid4()
+    profile = _profile(
+        dataset_id,
+        [
+            {"customer_state": "SP", "order_id": "o1", "payment_value": 10.0},
+            {"customer_state": "SP", "order_id": "o1", "payment_value": 20.0},
+        ],
+    )
+    plan = PlannedAnalysis(
+        route="sql",
+        category_column="customer_state",
+        metric_column="payment_value",
+        time_column=None,
+        steps=("aggregate",),
+        aggregations=(
+            AnalysisAggregationResponse(
+                operation="sum", column="payment_value", alias="total_payment_value"
+            ),
+            AnalysisAggregationResponse(
+                operation="count_distinct", column="order_id", alias="order_count"
+            ),
+        ),
+        requested_dimensions=("customer_state",),
+        derived_metrics=("average_order_value",),
+    )
+
+    contract = build_analysis_contract(
+        question="按客户州计算总支付金额、去重订单数和平均订单金额",
+        dataset_id=dataset_id,
+        additional_dataset_ids=(),
+        profile=profile,
+        plan=plan,
+        planner_metadata=PlannerMetadataResponse(confidence=0.9),
+        multi_dataset_context=None,
+    )
+
+    assert ("avg", "payment_value", "average_order_value") in {
+        (item.operation, item.column, item.alias) for item in contract.aggregations
+    }
+    assert contract.metric == "payment_value"
 
 
 def test_explicit_dimension_excludes_unrelated_planner_candidates() -> None:
@@ -1097,6 +1161,219 @@ def test_unused_cte_aggregation_cannot_cover_outer_result() -> None:
     coverage = next(check for check in result.checks if check.code == "request_coverage")
     assert coverage.status == "failed"
     assert coverage.details["aggregations"] == ["sum(payment_value)"]
+
+
+def test_requested_top_n_accepts_preaggregated_metric_lineage() -> None:
+    payments_id, orders_id, customers_id = uuid4(), uuid4(), uuid4()
+    frame = pd.DataFrame(
+        {
+            "order_id": ["o1", "o2", "o3"],
+            "order_payments_dataset_csv__payment_value": [100.0, 80.0, 60.0],
+            "orders_dataset_csv__order_status": ["delivered"] * 3,
+            "customers_dataset_csv__customer_state": ["SP", "RJ", "MG"],
+        }
+    )
+    contract = AnalysisContractResponse(
+        objective="按客户州统计已交付订单总支付金额、订单数和平均订单金额，输出前三个客户州",
+        population="已交付订单",
+        dataset_ids=(payments_id, orders_id, customers_id),
+        analysis_type="comparison",
+        metric="order_payments_dataset_csv__payment_value",
+        dimensions=("customers_dataset_csv__customer_state",),
+        aggregations=(
+            AnalysisAggregationResponse(
+                operation="sum",
+                column="order_payments_dataset_csv__payment_value",
+                alias="total_payment_value",
+            ),
+            AnalysisAggregationResponse(
+                operation="count_distinct",
+                column="order_id",
+                alias="order_count",
+            ),
+            AnalysisAggregationResponse(
+                operation="avg",
+                column="order_payments_dataset_csv__payment_value",
+                alias="average_payment_value",
+            ),
+        ),
+        filters=(
+            AnalysisFilterResponse(
+                column="orders_dataset_csv__order_status",
+                value="delivered",
+            ),
+        ),
+        grain=("customers_dataset_csv__customer_state",),
+        method="支付表先按订单预聚合，再连接客户维度",
+    )
+    sql = """
+        SELECT
+          c.customers_dataset_csv__customer_state AS customer_state,
+          COUNT(DISTINCT p.order_id) AS order_count,
+          SUM(p.total_payment) AS total_payment_value,
+          SUM(p.total_payment) / COUNT(DISTINCT p.order_id) AS average_payment_value
+        FROM (
+          SELECT order_id, SUM(order_payments_dataset_csv__payment_value) AS total_payment
+          FROM dataset
+          GROUP BY order_id
+        ) p
+        JOIN (
+          SELECT DISTINCT orders_dataset_csv__order_id,
+                    orders_dataset_csv__customer_id,
+                    orders_dataset_csv__order_status
+          FROM dataset
+          WHERE orders_dataset_csv__order_status = 'delivered'
+        ) o ON p.order_id = o.orders_dataset_csv__order_id
+        JOIN (
+          SELECT DISTINCT customers_dataset_csv__customer_id,
+                          customers_dataset_csv__customer_state
+          FROM dataset
+        ) c ON o.orders_dataset_csv__customer_id = c.customers_dataset_csv__customer_id
+        GROUP BY c.customers_dataset_csv__customer_state
+        ORDER BY order_count DESC
+        LIMIT 3
+    """
+    result = verify_statistical_analysis(
+        contract=contract,
+        profile=_profile(payments_id, frame.to_dict(orient="records")),
+        dataframe=frame,
+        findings=(),
+        sql_result=SQLAnalysisResponse(
+            sql=sql,
+            rows=(
+                {"customer_state": "SP", "order_count": 1, "total_payment_value": 100.0},
+                {"customer_state": "RJ", "order_count": 1, "total_payment_value": 80.0},
+                {"customer_state": "MG", "order_count": 1, "total_payment_value": 60.0},
+            ),
+            explanation="按客户州返回前三名。",
+        ),
+    )
+
+    coverage = next(check for check in result.checks if check.code == "request_coverage")
+    assert coverage.status == "passed"
+    assert coverage.details["covered_by"] == "sql_statement_1"
+
+
+def test_ratio_does_not_cover_average_without_a_declared_distinct_denominator() -> None:
+    dataset_id = uuid4()
+    frame = pd.DataFrame({"payment_value": [100.0], "order_id": ["o1"]})
+    contract = AnalysisContractResponse(
+        objective="计算平均支付金额",
+        population="支付记录",
+        dataset_ids=(dataset_id,),
+        analysis_type="descriptive",
+        metric="payment_value",
+        aggregations=(
+            AnalysisAggregationResponse(
+                operation="avg",
+                column="payment_value",
+                alias="average_payment_value",
+            ),
+        ),
+        grain=("dataset",),
+        method="确定性测试",
+    )
+    result = verify_statistical_analysis(
+        contract=contract,
+        profile=_profile(dataset_id, frame.to_dict(orient="records")),
+        dataframe=frame,
+        findings=(),
+        sql_result=SQLAnalysisResponse(
+            sql=(
+                "SELECT SUM(payment_value) / COUNT(DISTINCT order_id) "
+                "AS average_payment_value FROM dataset"
+            ),
+            rows=({"average_payment_value": 100.0},),
+            explanation="缺少已声明分母的比率。",
+        ),
+    )
+
+    coverage = next(check for check in result.checks if check.code == "request_coverage")
+    assert coverage.status == "failed"
+    assert coverage.details["aggregations"] == ["avg(payment_value)"]
+
+
+def test_average_order_amount_rejects_average_of_payment_rows() -> None:
+    dataset_id = uuid4()
+    frame = pd.DataFrame(
+        {
+            "customer_state": ["SP", "SP", "SP"],
+            "order_id": ["o1", "o1", "o2"],
+            "payment_value": [10.0, 20.0, 30.0],
+        }
+    )
+    contract = AnalysisContractResponse(
+        objective="按客户州计算总支付金额、去重订单数和平均订单金额",
+        population="订单支付记录",
+        dataset_ids=(dataset_id,),
+        analysis_type="descriptive",
+        metric="payment_value",
+        dimensions=("customer_state",),
+        aggregations=(
+            AnalysisAggregationResponse(
+                operation="sum", column="payment_value", alias="total_payment_value"
+            ),
+            AnalysisAggregationResponse(
+                operation="count_distinct", column="order_id", alias="order_count"
+            ),
+            AnalysisAggregationResponse(
+                operation="avg", column="payment_value", alias="average_order_value"
+            ),
+        ),
+        grain=("customer_state",),
+        method="确定性测试",
+    )
+    result = verify_statistical_analysis(
+        contract=contract,
+        profile=_profile(dataset_id, frame.to_dict(orient="records")),
+        dataframe=frame,
+        findings=(),
+        sql_result=SQLAnalysisResponse(
+            sql=(
+                "SELECT customer_state, SUM(payment_value) AS total_payment_value, "
+                "COUNT(DISTINCT order_id) AS order_count, "
+                "AVG(payment_value) AS average_order_value FROM dataset "
+                "GROUP BY customer_state"
+            ),
+            rows=(),
+            explanation="错误地按支付记录求平均。",
+        ),
+    )
+
+    coverage = next(check for check in result.checks if check.code == "request_coverage")
+    assert coverage.status == "failed"
+    assert coverage.details["aggregations"] == ["avg(payment_value)"]
+
+
+def test_unrequested_top_n_limit_remains_an_unauthorized_population_change() -> None:
+    dataset_id = uuid4()
+    frame = pd.DataFrame(
+        {
+            "customer_state": ["SP", "RJ"],
+            "order_status": ["delivered", "delivered"],
+            "payment_value": [100.0, 80.0],
+        }
+    )
+    sql = (
+        "SELECT customer_state, SUM(payment_value) AS total_payment FROM dataset "
+        "WHERE order_status = 'delivered' GROUP BY customer_state "
+        "ORDER BY total_payment DESC LIMIT 1"
+    )
+    result = verify_statistical_analysis(
+        contract=_payment_contract(dataset_id),
+        profile=_profile(dataset_id, frame.to_dict(orient="records")),
+        dataframe=frame,
+        findings=(),
+        sql_result=SQLAnalysisResponse(
+            sql=sql,
+            rows=({"customer_state": "SP", "total_payment": 100.0},),
+            explanation="未声明的 Top 1。",
+        ),
+    )
+
+    coverage = next(check for check in result.checks if check.code == "request_coverage")
+    assert coverage.status == "failed"
+    assert coverage.details["unexpected_filters"] == ["LIMIT LIMIT 1"]
 
 
 def test_hidden_cte_filter_cannot_narrow_the_contract_population() -> None:

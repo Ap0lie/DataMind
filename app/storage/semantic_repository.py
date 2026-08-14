@@ -204,6 +204,32 @@ class SemanticRepositoryMixin:
         }
 
 
+    def set_planner_decision_confirmation(
+        self,
+        decision_id: UUID,
+        *,
+        requires_confirmation: bool | None = None,
+        confirmed: bool | None = None,
+    ) -> dict[str, Any]:
+        self.get_planner_decision(decision_id)
+        assignments: list[str] = []
+        values: list[Any] = []
+        if requires_confirmation is not None:
+            assignments.append("requires_confirmation = ?")
+            values.append(int(requires_confirmation))
+        if confirmed is not None:
+            assignments.append("confirmed = ?")
+            values.append(int(confirmed))
+        if assignments:
+            with self._connect() as connection:
+                connection.execute(
+                    f"UPDATE planner_decisions SET {', '.join(assignments)} "
+                    "WHERE id = ? AND user_id = ?",
+                    (*values, str(decision_id), self._user_id),
+                )
+        return self.get_planner_decision(decision_id)
+
+
     def save_planner_feedback(
         self, *, decision_id: UUID, action: str, corrected_plan: dict[str, Any]
     ) -> dict[str, Any]:

@@ -5,6 +5,12 @@ from uuid import UUID
 
 from pydantic import Field
 
+from app.schemas.analysis_intent import (
+    AnalysisIntentSpec,
+    ContractGuardResult,
+    IntentCompilationAttempt,
+    IntentGuardResult,
+)
 from app.schemas.common import ApiModel
 
 ScopeType = Literal["dataset", "dataset_group"]
@@ -95,6 +101,11 @@ class PlannerDecisionResponse(ApiModel):
     requires_confirmation: bool = False
     ambiguities: tuple[str, ...] = ()
     evidence: tuple[str, ...] = ()
+    intent_spec: AnalysisIntentSpec | None = None
+    intent_validation: IntentGuardResult | None = None
+    intent_attempts: tuple[IntentCompilationAttempt, ...] = ()
+    contract_validation: ContractGuardResult | None = None
+    confirmation_reasons: tuple[str, ...] = ()
     created_at: str | None = None
 
 

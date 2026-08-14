@@ -69,6 +69,13 @@ def test_semantic_model_draft_publish_plan_and_execute(tmp_path, monkeypatch) ->
     decision = service.create_planner_decision(dataset_id=dataset.id, dataset_group_id=None, question="按 region 分析 revenue")
     assert decision["semantic_source"] == "published"
     assert decision["semantic_plan"]["metric_ids"]
+    confirmed = repository.set_planner_decision_confirmation(
+        decision["id"],
+        requires_confirmation=True,
+        confirmed=True,
+    )
+    assert bool(confirmed["requires_confirmation"])
+    assert bool(confirmed["confirmed"])
     monkeypatch.setattr(repository, "read_analysis_records", full_read)
     result = service.execute_semantic_plan(decision)
     assert len(result["rows"]) == 2

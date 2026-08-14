@@ -24,6 +24,8 @@ def planner_messages(
     profile: DatasetProfileResponse,
     multi_dataset_context: MultiDatasetProfileResponse | None = None,
     analysis_experiences: tuple[dict[str, Any], ...] = (),
+    approved_intent: dict[str, Any] | None = None,
+    contract_repair: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     schema = {
         "columns": [
@@ -49,6 +51,8 @@ def planner_messages(
         "validated_analysis_experiences": _compact_analysis_experiences(
             analysis_experiences
         ),
+        "approved_intent": approved_intent or {},
+        "contract_repair": contract_repair or {},
     }
     return [
         {
@@ -60,7 +64,11 @@ def planner_messages(
                 "Use experience_context as planning guidance, not as data evidence. For joined data, "
                 "use multi_dataset_context to respect field provenance, skipped joins, and row expansion. "
                 "validated_analysis_experiences are read-only route evidence: reconsider their route, "
-                "columns, joins, and permissions against the current request before using them."
+                "columns, joins, and permissions against the current request before using them. "
+                "approved_intent is authoritative: required fields must be used, candidates cannot "
+                "replace them, and forbidden datasets or relationships must never be selected. "
+                "When contract_repair is present, fix exactly those omissions without adding new "
+                "requirements."
             ),
         },
         {
@@ -273,6 +281,7 @@ def sql_messages(
         "required_filters": [
             item.model_dump(mode="json") for item in planned_analysis.filters
         ],
+        "derived_metrics": list(planned_analysis.derived_metrics),
         "columns": [
             {
                 "name": column.name,
@@ -303,9 +312,12 @@ def sql_messages(
                 "named dataset, and must not use DROP, DELETE, UPDATE, INSERT, ATTACH, or COPY. Use "
                 "experience_context only to choose useful aggregations or filters; never reference "
                 "columns outside the provided schema. For joined data, inspect multi_dataset_context: "
-                "do not SUM or AVG a metric across expanded duplicate rows unless the query explicitly "
-                "restores its source grain. The query must implement every required_aggregation and "
-                "required_filter exactly."
+                "dataset is already the prepared joined dataframe, so scan it exactly once and never "
+                "JOIN dataset to itself. Use GROUP BY and COUNT(DISTINCT ...) to preserve the requested "
+                "grain; source-table reconstruction belongs to source-grain tools. When derived_metrics "
+                "contains average_order_value, compute SUM(the requested amount) divided by "
+                "COUNT(DISTINCT the order key), never AVG of fact rows. The query must implement every "
+                "required_aggregation and required_filter exactly."
             ),
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},

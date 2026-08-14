@@ -30,14 +30,14 @@ a permission-aware conversational workspace over the same DataMind assets.
 | --- | --- |
 | Data preparation | Drag-and-drop CSV, XLSX, JSON, and TXT imports; multi-file packages; cleaning versions, diffs, rollback, and drift detection |
 | Semantic understanding | Column roles, bilingual semantic ranking, versioned metric DSL, relationship graph, Join cardinality and grain checks |
-| Autonomous analysis | Planner, safe SQL, sandboxed Python, bounded repair loops, deterministic fallback, and resumable jobs |
+| Autonomous analysis | Guarded intent compilation, Planner, safe SQL, sandboxed Python, bounded repair loops, deterministic fallback, and resumable jobs |
 | Trustworthy output | Statistical verification, evidence IDs, lineage, adversarial review, report repair, and auditable commit |
 | Kimi workspace | User-scoped conversations, structured summaries, trustworthy versioned memory, read-only analysis experience, image/data attachments, grants, audit, and recycle bin |
 | Production runtime | PostgreSQL, Redis, Celery, checkpoint recovery, SSE events, Cookie sessions, CSRF, rate limits, and Docker sandboxing |
 
 ## Architecture
 
-The named agents are specialized LangGraph nodes with separate prompts and model
+Intent Compiler, Planner, SQL, Python, Reviewer, and Report are specialized LangGraph nodes with separate prompts and model
 routing. They share one durable workflow state; they are not independently
 deployed microservices.
 
@@ -63,6 +63,14 @@ Failed generated Python code is returned to the model for at most two repairs;
 validated deterministic fallback keeps the job controlled when model execution
 cannot be trusted.
 
+Before planning, the Intent Compiler turns the raw question into a declarative
+specification with source spans, polarity, field bindings, and relationship
+constraints. A deterministic Intent Guard validates negation, asset scope, and
+field existence. After planning, the Contract Guard checks that metrics,
+dimensions, filters, joins, and grain still satisfy the approved intent. Guard
+feedback allows at most two repairs; unresolved requests require confirmation or
+stop before any analysis tool runs.
+
 ## Core Features
 
 - Batch and drag-and-drop upload for CSV, XLSX, JSON, and TXT, including
@@ -73,6 +81,9 @@ cannot be trusted.
   schema drift, data drift, and stale-asset propagation.
 - Versioned semantic models with stable field/entity IDs, metric DSL, Chinese
   semantic matching through BAAI/bge-small-zh-v1.5, validation, and publishing.
+- LLM intent compilation with deterministic Intent and Contract Guards preserves
+  complex negation, strict asset scope, required fields, and forbidden relations
+  while preventing hallucinated fields from entering execution.
 - Safe DuckDB SQL constrained to approved datasets, fields, and relationship paths.
 - Generated Python execution in a controlled subprocess or one-shot container,
   with timeout, output limits, chart compaction, repair attempts, and fallback.
@@ -154,6 +165,11 @@ Compose. The most important settings are:
 | `DATAMIND_KIMI_API_KEY` | Reviewer, report, multimodal, and Assistant provider |
 | `DATAMIND_PYTHON_RUNNER_URL` | Controlled container runner endpoint |
 | `DATAMIND_AGENT_LOOP_DEFAULT_MODE` | Default `loop`; `legacy` is compatibility mode |
+| `DATAMIND_INTENT_COMPILER_ENABLED` | Enables structured intent compilation and review |
+| `DATAMIND_INTENT_COMPILER_MODE` | `shadow` observes; `enforce` executes only guarded compiled intent |
+| `DATAMIND_INTENT_COMPILER_PROVIDER` | Provider used by the intent compiler |
+| `DATAMIND_INTENT_COMPILER_MAX_REPAIRS` | Maximum intent repairs after Guard feedback |
+| `DATAMIND_CONTRACT_GUARD_ENABLED` | Validates the AnalysisContract before tool execution |
 | `DATAMIND_CONTEXT_BUDGET_MODE` | Unified context-budget mode: `shadow` or `enforce` |
 | `DATAMIND_LLM_CONTEXT_WINDOW_TOKENS` | Conservative provider context-window token budget |
 | `DATAMIND_CONTEXT_SAFETY_RATIO` | Reserve for output and token-estimation variance |

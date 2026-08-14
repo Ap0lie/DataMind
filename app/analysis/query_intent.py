@@ -13,13 +13,13 @@ from app.schemas.analysis import (
 _NON_WORD_RE = re.compile(r"[^\w\u3400-\u9fff]+", re.UNICODE)
 _IDENTIFIER_TOKENS = ("_id", " id", "编号", "编码", "code", "uuid", "key")
 _NEGATED_CLAUSE_RE = re.compile(
-    r"(?:不要|不得|请勿|禁止|无需|排除|忽略)[^,，;；。.!?！？\n]*"
+    r"(?:不要|不得|请勿|禁止|严禁|无需|排除|忽略)[^,，;；。.!?！？\n]*"
     r"|(?:(?:do\s+not|don't|never)\s+[^,，;；。.!?！？\n]*"
     r"|without\s+[^,，;；。.!?！？\n]*|excluding?\s+[^,，;；。.!?！？\n]*)",
     re.IGNORECASE,
 )
 _NEGATED_GROUPING_RE = re.compile(
-    r"(?:不要|不得|请勿|禁止)\s*(?:按|依据|根据|以)\s*"
+    r"(?:不要|不得|请勿|禁止|严禁)\s*(?:按|依据|根据|以)\s*"
     r"[^,，;；。.!?！？\n]*?(?:分组|汇总|聚合)"
     r"|(?:(?:do\s+not|don't|never)\s+(?:group|aggregate)\s+by"
     r"|without\s+(?:grouping|aggregating)\s+by)\s*"
@@ -247,7 +247,7 @@ def infer_query_intent(
         aggregations=aggregations,
         filters=filters,
         derived_metrics=("average_order_value",)
-        if _wants_average_order_value(semantic_question)
+        if wants_average_order_value(semantic_question)
         else (),
     )
 
@@ -471,10 +471,20 @@ def _requested_aggregations(
 ) -> tuple[AnalysisAggregationResponse, ...]:
     folded = question.casefold()
     requested: list[AnalysisAggregationResponse] = []
+    average_order_value = wants_average_order_value(question)
+    explicit_distinct_order_count = any(
+        token in folded
+        for token in (
+            "去重订单",
+            "订单去重",
+            "distinct order",
+            "unique order",
+        )
+    )
     sum_requested = any(
         token in folded
         for token in ("总计", "合计", "总额", "销售额", "成交额", "sum", "total", "gmv")
-    )
+    ) or average_order_value
     aggregate_metrics = tuple(dict.fromkeys((*metrics, *((metric,) if metric else ()))))
     if sum_requested:
         requested.extend(
@@ -484,7 +494,6 @@ def _requested_aggregations(
             for column in aggregate_metrics
         )
 
-    average_order_value = _wants_average_order_value(question)
     count_requested = any(
         token in folded
         for token in ("数量", "订单数", "客户数", "用户数", "count", "number of")
@@ -517,7 +526,7 @@ def _requested_aggregations(
                 )
             )
 
-    if metric and not average_order_value and any(
+    if metric and not (average_order_value and explicit_distinct_order_count) and any(
         token in folded
         for token in ("平均", "均值", "average", "avg", "mean")
     ):
@@ -540,9 +549,21 @@ def _requested_aggregations(
     return tuple(_deduplicate_aggregations(requested))
 
 
-def _wants_average_order_value(question: str) -> bool:
+def wants_average_order_value(question: str) -> bool:
     folded = question.casefold()
-    return any(token in folded for token in ("客单价", "aov", "average order value"))
+    return any(
+        token in folded
+        for token in (
+            "客单价",
+            "平均订单金额",
+            "平均订单价值",
+            "平均每单金额",
+            "订单均价",
+            "aov",
+            "average order value",
+            "average order amount",
+        )
+    )
 
 
 def _requested_filters(

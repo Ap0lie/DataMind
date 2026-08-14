@@ -28,14 +28,14 @@ DataMind 数据资产提供受权限约束的对话式工作台。
 | --- | --- |
 | 数据准备 | 拖拽导入 CSV、XLSX、JSON、TXT；多文件数据包；清洗版本、Diff、回滚和漂移检测 |
 | 语义理解 | 字段角色、中英文语义排序、版本化指标 DSL、关系图、Join 基数与数据粒度检查 |
-| 自主分析 | Planner、安全 SQL、沙箱 Python、有边界修复 Loop、规则回退和任务恢复 |
+| 自主分析 | 受审查的意图编译、Planner、安全 SQL、沙箱 Python、有边界修复 Loop、规则回退和任务恢复 |
 | 可信交付 | 统计验证、evidence ID、血缘、对抗审查、报告修复和幂等提交 |
 | Kimi 工作台 | 用户隔离对话、结构化摘要、可信版本记忆、只读分析经验、图片与数据附件、授权、审计和回收站 |
 | 生产运行 | PostgreSQL、Redis、Celery、Checkpoint、SSE、Cookie 会话、CSRF、限流和容器沙箱 |
 
 ## 系统架构
 
-Planner、SQL、Python、Reviewer 和 Report 是具有独立 Prompt 与模型路由的
+Intent Compiler、Planner、SQL、Python、Reviewer 和 Report 是具有独立 Prompt 与模型路由的
 LangGraph 专职节点。它们共享一个可持久化的 Workflow State，并不是分别部署的微服务。
 
 [![DataMind 系统架构](docs/assets/datamind-architecture-zh.png)](docs/assets/datamind-architecture-zh.svg)
@@ -57,6 +57,11 @@ Python Runner 和受控工具，并通过 Redis/Celery 交换任务与事件。�
 Python 代码执行失败后，错误会被反馈给模型，最多进行两次修复；无法获得可信结果时，
 系统使用经过验证的确定性回退，而不是无限重试。
 
+分析前，Intent Compiler 将原始问题编译为带原文位置、极性、字段绑定和关系约束的
+声明式意图。确定性 Intent Guard 校验否定语义、资产范围和字段真实性；Planner 产出
+AnalysisContract 后，Contract Guard 再验证指标、维度、过滤、Join 与粒度是否忠实。
+Guard 可把具体错误反馈给模型修复，最多两次；仍不可靠时要求确认或拒绝执行工具。
+
 ## 核心功能
 
 - 批量拖拽导入 CSV、XLSX、JSON 和 TXT，支持 Excel Sheet 选择以及大文件落盘暂存。
@@ -64,6 +69,8 @@ Python 代码执行失败后，错误会被反馈给模型，最多进行两次�
 - 清洗版本、字段元数据、Diff 预览、激活、回滚、Schema/Data Drift 和过期资产传播。
 - 版本化语义模型、稳定字段与实体 ID、指标 DSL、BAAI/bge-small-zh-v1.5
   中文语义匹配、校验和发布。
+- LLM 意图编译配合确定性 Intent/Contract Guard，保留复杂否定、严格资产范围、
+  必选指标/维度和禁止关系，并阻止模型幻觉字段进入执行链。
 - DuckDB 安全 SQL，只允许访问授权数据集、字段和已声明的关系路径。
 - Python 代码在受控子进程或一次性容器执行，具备超时、输出限制、图表压缩、修复和回退。
 - 验证用户要求的指标/维度、Join 数据粒度、证据覆盖、比较型结论、置信区间和因果措辞。
@@ -139,6 +146,11 @@ Celery Beat、受控 Python Runner 和无网络 Sandbox 镜像。DNS、HTTPS、�
 | `DATAMIND_KIMI_API_KEY` | Reviewer、Report、多模态与 Assistant |
 | `DATAMIND_PYTHON_RUNNER_URL` | 受控容器 Runner 地址 |
 | `DATAMIND_AGENT_LOOP_DEFAULT_MODE` | 默认 `loop`，`legacy` 仅用于兼容 |
+| `DATAMIND_INTENT_COMPILER_ENABLED` | 启用结构化意图编译与审查 |
+| `DATAMIND_INTENT_COMPILER_MODE` | `shadow` 仅观测，`enforce` 使用审查通过的编译意图 |
+| `DATAMIND_INTENT_COMPILER_PROVIDER` | 意图编译使用的模型 Provider |
+| `DATAMIND_INTENT_COMPILER_MAX_REPAIRS` | Guard 反馈后的最大意图修复次数 |
+| `DATAMIND_CONTRACT_GUARD_ENABLED` | 在工具执行前校验 AnalysisContract |
 | `DATAMIND_CONTEXT_BUDGET_MODE` | 统一上下文预算的 `shadow` 或 `enforce` 模式 |
 | `DATAMIND_LLM_CONTEXT_WINDOW_TOKENS` | Provider 上下文窗口的保守 Token 预算 |
 | `DATAMIND_CONTEXT_SAFETY_RATIO` | 为输出和 Token 估算偏差预留的安全比例 |

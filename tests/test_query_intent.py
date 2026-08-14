@@ -214,6 +214,29 @@ def test_monthly_aov_uses_distinct_orders_and_a_derived_ratio() -> None:
     assert "LIMIT" not in result.sql
 
 
+def test_chinese_average_order_amount_uses_total_per_distinct_order() -> None:
+    profile = DatasetProfiler().profile(
+        dataset_id=uuid4(),
+        records=[
+            {"order_id": "O1", "customer_state": "SP", "payment_value": 10},
+            {"order_id": "O1", "customer_state": "SP", "payment_value": 20},
+            {"order_id": "O2", "customer_state": "SP", "payment_value": 30},
+        ],
+    )
+
+    plan = _plan("按客户州计算总支付金额、去重订单数和平均订单金额", profile)
+    result = _run_sql(pd.DataFrame(profile.sample_records), plan)
+
+    assert plan.derived_metrics == ("average_order_value",)
+    assert {(item.operation, item.column) for item in plan.aggregations} >= {
+        ("sum", "payment_value"),
+        ("count_distinct", "order_id"),
+    }
+    assert not any(item.operation == "avg" for item in plan.aggregations)
+    assert result.rows[0]["average_order_value"] == 30.0
+    assert "COUNT(DISTINCT" in result.sql
+
+
 def test_gmv_prefers_price_over_a_precomputed_total_price_column() -> None:
     profile = DatasetProfiler().profile(
         dataset_id=uuid4(),

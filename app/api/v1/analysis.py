@@ -10,7 +10,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from app.analysis.dataset_scope import resolve_analysis_dataset_scope
+from app.analysis.intent_compiler import (
+    IntentCompilationHarness,
+    build_intent_compilation_context,
+)
 from app.analysis.jobs import revoke_analysis_job, start_analysis_job
+from app.analysis.model_router import MCPAnalysisModelRouter
 from app.analysis.multidataset import suggest_dataset_joins
 from app.analysis.runtime import build_analysis_runner
 from app.api.v1.deps import current_user_id
@@ -24,6 +29,7 @@ from app.schemas.analysis import (
     JoinSuggestionRequest,
     JoinSuggestionResponse,
 )
+from app.schemas.analysis_intent import IntentCompilationResult
 from app.schemas.semantic import (
     PlannerDecisionResponse,
     PlannerFeedbackRequest,
@@ -43,12 +49,38 @@ def create_semantic_plan(
     request: SemanticPlanRequest, user_id: str = Depends(current_user_id)
 ) -> PlannerDecisionResponse:
     try:
-        decision = SemanticLayerService(_repository(user_id)).create_planner_decision(
+        repository = _repository(user_id)
+        decision = SemanticLayerService(repository).create_planner_decision(
             dataset_id=request.dataset_id,
             dataset_group_id=request.dataset_group_id,
             question=request.question,
         )
-        return _planner_decision_response(decision)
+        compilation = IntentCompilationHarness(
+            model_router=MCPAnalysisModelRouter(),
+        ).compile(
+            question=request.question,
+            context=build_intent_compilation_context(
+                repository,
+                dataset_ids=tuple(
+                    dict.fromkeys((request.dataset_id, *request.additional_dataset_ids))
+                ),
+            ),
+            semantic_plan=(
+                decision.get("semantic_plan")
+                if isinstance(decision.get("semantic_plan"), dict)
+                else None
+            ),
+        )
+        if compilation.intent.requires_confirmation and not bool(
+            decision["requires_confirmation"]
+        ):
+            decision = repository.set_planner_decision_confirmation(
+                UUID(str(decision["id"])),
+                requires_confirmation=True,
+            )
+        return _planner_decision_response(decision, compilation=compilation)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -91,6 +123,11 @@ def create_analysis_job(
                 raise ValueError(
                     "Low-confidence semantic plan requires confirmation before execution."
                 )
+            if request.confirmed_low_confidence and not bool(decision["confirmed"]):
+                decision = repository.set_planner_decision_confirmation(
+                    UUID(str(decision["id"])),
+                    confirmed=True,
+                )
         settings = get_settings()
         agent_mode = _resolve_agent_mode(request.agent_mode)
         enforce_rate_limit(
@@ -99,22 +136,54 @@ def create_analysis_job(
             window_seconds=60,
         )
         requested_join_plan = request.join_plan or request.relationship_plan
-        dataset_scope = resolve_analysis_dataset_scope(
+        submitted_dataset_ids = tuple(
+            dict.fromkeys(
+                (
+                    request.dataset_id,
+                    *request.additional_dataset_ids,
+                    *(
+                        dataset_id
+                        for item in requested_join_plan
+                        for dataset_id in (
+                            item.left_dataset_id,
+                            item.right_dataset_id,
+                        )
+                    ),
+                )
+            )
+        )
+        scope_intent = IntentCompilationHarness(model_router=None).compile(
+            question=request.question,
+            context=build_intent_compilation_context(
+                repository,
+                dataset_ids=submitted_dataset_ids,
+                authorized_dataset_ids=tuple(
+                    dataset.id for dataset in repository.list_datasets()
+                ),
+            ),
+            semantic_plan=(
+                decision.get("semantic_plan")
+                if decision and isinstance(decision.get("semantic_plan"), dict)
+                else None
+            ),
+        ).intent
+        scoped = resolve_analysis_dataset_scope(
             repository,
             question=request.question,
             dataset_id=request.dataset_id,
             additional_dataset_ids=request.additional_dataset_ids,
             join_plan=requested_join_plan,
+            intent_spec=scope_intent,
         )
-        scoped_plan = tuple(
-            item.model_dump(mode="json") for item in dataset_scope.join_plan
+        serialized_plan = tuple(
+            item.model_dump(mode="json") for item in scoped.join_plan
         )
         job = repository.create_analysis_job(
-            dataset_id=dataset_scope.dataset_id,
+            dataset_id=scoped.dataset_id,
             dataset_group_id=request.dataset_group_id,
-            additional_dataset_ids=dataset_scope.additional_dataset_ids,
-            join_plan=scoped_plan if request.join_plan else (),
-            relationship_plan=scoped_plan if request.relationship_plan else (),
+            additional_dataset_ids=scoped.additional_dataset_ids,
+            join_plan=serialized_plan if request.join_plan else (),
+            relationship_plan=serialized_plan if request.relationship_plan else (),
             question=request.question,
             prompt_overrides=request.prompt_overrides.as_dict(),
             multimodal_inputs=tuple(
@@ -283,9 +352,30 @@ def run_analysis(
     user_id: str = Depends(current_user_id),
 ) -> AnalysisRunResponse:
     try:
+        repository = _repository(user_id)
+        decision = (
+            repository.get_planner_decision(request.planner_decision_id)
+            if request.planner_decision_id
+            else None
+        )
+        if decision and bool(decision["requires_confirmation"]) and not (
+            bool(decision["confirmed"]) or request.confirmed_low_confidence
+        ):
+            raise ValueError(
+                "Low-confidence semantic plan requires confirmation before execution."
+            )
+        if (
+            decision
+            and request.confirmed_low_confidence
+            and not bool(decision["confirmed"])
+        ):
+            decision = repository.set_planner_decision_confirmation(
+                UUID(str(decision["id"])),
+                confirmed=True,
+            )
         agent_mode = _resolve_agent_mode(request.agent_mode)
         return build_analysis_runner(
-            _repository(user_id),
+            repository,
             prompt_overrides=request.prompt_overrides.as_dict(),
         ).run(
             dataset_id=request.dataset_id,
@@ -295,12 +385,14 @@ def run_analysis(
             relationship_plan=tuple(
                 item.model_dump(mode="json") for item in request.relationship_plan
             ),
+            planner_decision=decision,
             question=request.question,
             prompt_overrides=request.prompt_overrides.as_dict(),
             multimodal_inputs=request.multimodal_inputs,
             agent_mode=agent_mode,
+            confirmed_intent=request.confirmed_low_confidence,
         )
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Analysis run failed.")
@@ -345,7 +437,11 @@ def _resolve_agent_mode(requested: str) -> str:
     return requested
 
 
-def _planner_decision_response(decision: dict[str, object]) -> PlannerDecisionResponse:
+def _planner_decision_response(
+    decision: dict[str, object],
+    *,
+    compilation: IntentCompilationResult | None = None,
+) -> PlannerDecisionResponse:
     plan = decision.get("semantic_plan") if isinstance(decision.get("semantic_plan"), dict) else {}
     scores = (
         decision.get("component_scores")
@@ -381,9 +477,16 @@ def _planner_decision_response(decision: dict[str, object]) -> PlannerDecisionRe
         raw_confidence=float(decision["raw_confidence"]),
         calibrated_confidence=float(decision["calibrated_confidence"]),
         confidence_level=str(decision["confidence_level"]),
-        requires_confirmation=bool(decision["requires_confirmation"]),
+        requires_confirmation=bool(decision["requires_confirmation"])
+        or bool(compilation and compilation.intent.requires_confirmation),
         ambiguities=tuple(str(item) for item in plan.get("ambiguities") or ()),
         evidence=tuple(str(item) for item in plan.get("evidence") or ()),
+        intent_spec=compilation.intent if compilation else None,
+        intent_validation=compilation.validation if compilation else None,
+        intent_attempts=compilation.attempts if compilation else (),
+        confirmation_reasons=(
+            compilation.intent.confirmation_reasons if compilation else ()
+        ),
         created_at=str(decision.get("created_at") or ""),
     )
 

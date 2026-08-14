@@ -55,6 +55,7 @@ _REQUIRED_TEXT_KEYS = {
     "question",
     "requirement",
     "analysis_contract",
+    "approved_intent",
     "contract",
     "output_contract",
     "error",
