@@ -6,6 +6,11 @@ def test_architecture_modules_are_importable() -> None:
     import app.agents.document_models
     import app.agents.nlp_agent
     import app.agents.parser_agent
+    import app.analysis.agent_prompts
+    import app.analysis.workflow_nodes
+    import app.analysis.workflow_prompts
+    import app.analysis.workflow_report_nodes
+    import app.analysis.workflow_support
     import app.api.router
     import app.api.v1.mcp
     import app.core.entities
@@ -37,7 +42,15 @@ def test_architecture_modules_are_importable() -> None:
     import app.schemas.tasks
     import app.semantic.dsl
     import app.semantic.service
+    import app.storage.data_reliability_repository
+    import app.storage.dataset_group_repository
+    import app.storage.dataset_repository
+    import app.storage.job_repository
+    import app.storage.recycle_repository
+    import app.storage.report_repository
     import app.storage.repositories
+    import app.storage.repository_utils
+    import app.storage.semantic_repository
     import app.workflows.examples
     import app.workflows.graph
     import app.workflows.models
