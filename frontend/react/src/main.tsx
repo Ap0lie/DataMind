@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 import { FloatingTaskProgress, Sidebar, Topbar } from "./components/AppShell";
@@ -11,6 +12,7 @@ import { DatasetsPage } from "./features/datasets/DatasetsPage";
 import { ReportsPage } from "./features/reports/ReportsPage";
 import {
   AUTH_EXPIRED_EVENT,
+  abortPendingApiRequests,
   apiGet,
   apiPost,
   loadAuthUser,
@@ -234,6 +236,8 @@ function App() {
   };
 
   const logout = async () => {
+    abortPendingApiRequests();
+    flushSync(() => setAuthUser(null));
     try {
       const result = await logoutSession();
       if (result === "logged_out") setSessionNotice(null);
