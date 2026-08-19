@@ -6,10 +6,10 @@ from uuid import uuid4
 
 import pytest
 
+from app.assistant import memory_jobs
 from app.assistant.memory import (
     AssistantMemoryService,
     extract_memory_candidates,
-    parse_model_memory_candidates,
 )
 from app.core.settings import get_settings
 from app.semantic.embedding import DisabledEmbeddingProvider
@@ -53,39 +53,121 @@ def test_explicit_and_inferred_memory_are_separated_and_sensitive_values_are_rej
     assert extract_memory_candidates("请记住 API_KEY=not-a-real-secret-value") == ()
 
 
-def test_model_memory_candidate_requires_exact_source_and_builds_canonical_value() -> None:
+def test_langmem_candidate_requires_exact_source_and_builds_canonical_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATAMIND_DATASET_STORE_PATH", str(tmp_path / "datasets"))
+    monkeypatch.setenv("DATAMIND_ENVIRONMENT", "test")
+    get_settings.cache_clear()
     message_id = uuid4()
     source = "请记住，我们把净收入定义为销售额减去退款，单位是元。以后报告使用这个口径。"
-    payload = f"""{{
-      "memories": [{{
-        "memory_type": "metric_definition",
-        "entity_key": "net_revenue",
-        "predicate": "definition",
-        "typed_value": {{"type": "text", "value": "销售额减去退款"}},
-        "unit": "元",
-        "content": "净收入定义为销售额减去退款",
-        "evidence": "我们把净收入定义为销售额减去退款，单位是元。",
-        "source_message_ids": ["{message_id}"],
-        "confidence": 0.91
-      }}]
-    }}"""
-    parsed = parse_model_memory_candidates(
-        payload,
-        source_text=source,
+    monkeypatch.setattr(
+        memory_jobs.LangMemFormationManager,
+        "extract",
+        lambda *_args, **_kwargs: (
+            {
+                "memory_type": "metric_definition",
+                "entity_key": "net_revenue",
+                "predicate": "definition",
+                "typed_value": {"type": "text", "value": "销售额减去退款"},
+                "unit": "元",
+                "content": "净收入定义为销售额减去退款",
+                "evidence": "我们把净收入定义为销售额减去退款，单位是元。",
+                "source_message_ids": [str(message_id)],
+                "confidence": 0.91,
+                "scope": "conversation",
+            },
+        ),
+    )
+    try:
+        result = memory_jobs._model_memory_candidates(
+            source_message={
+                "message_id": message_id,
+                "role": "user",
+                "content": source,
+            },
+            source_message_id=message_id,
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.source == "langmem"
+    assert result.rejected_codes == ()
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.explicit is True
+    assert candidate.subject_key == "metric_definition:net_revenue:definition"
+    assert candidate.typed_value == {"type": "text", "value": "销售额减去退款"}
+    assert candidate.unit == "元"
+
+
+def test_langmem_guard_rejection_uses_only_deterministic_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATAMIND_DATASET_STORE_PATH", str(tmp_path / "datasets"))
+    monkeypatch.setenv("DATAMIND_ENVIRONMENT", "test")
+    get_settings.cache_clear()
+    message_id = uuid4()
+    content = "请记住，我们把净收入定义为销售额减去退款。以后报告都使用这个口径。"
+
+    monkeypatch.setattr(
+        memory_jobs.LangMemFormationManager,
+        "extract",
+        lambda *_args, **_kwargs: (
+            {
+                "memory_type": "metric_definition",
+                "entity_key": "net_revenue",
+                "predicate": "definition",
+                "typed_value": {"type": "text", "value": "销售额减去退款"},
+                "content": "净收入定义为销售额减去退款",
+                "evidence": "不存在于原文的证据",
+                "source_message_ids": [str(message_id)],
+                "confidence": 0.9,
+                "scope": "conversation",
+            },
+        ),
+    )
+    try:
+        result = memory_jobs._model_memory_candidates(
+            source_message={
+                "message_id": message_id,
+                "role": "user",
+                "content": content,
+            },
+            source_message_id=message_id,
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.candidates == extract_memory_candidates(content)
+    assert result.rejected_codes == ("invalid_evidence",)
+
+
+def test_langmem_guard_rejects_source_id_mismatch() -> None:
+    from app.memory.guards import DataMindMemoryGuard
+
+    message_id = uuid4()
+    result = DataMindMemoryGuard().validate(
+        (
+            {
+                "memory_type": "terminology",
+                "entity_key": "gmv",
+                "predicate": "meaning",
+                "typed_value": {"type": "text", "value": "支付金额总和"},
+                "content": "GMV 指支付金额总和",
+                "evidence": "GMV 指支付金额总和",
+                "source_message_ids": [str(uuid4())],
+            },
+        ),
+        source_message={
+            "message_id": message_id,
+            "role": "user",
+            "content": "请记住，GMV 指支付金额总和",
+        },
         source_message_id=message_id,
     )
-    assert len(parsed) == 1
-    assert parsed[0].explicit is True
-    assert parsed[0].subject_key == "metric_definition:net_revenue:definition"
-    assert parsed[0].typed_value == {"type": "text", "value": "销售额减去退款"}
-    assert parsed[0].unit == "元"
-
-    invalid = payload.replace(str(message_id), str(uuid4()))
-    assert parse_model_memory_candidates(
-        invalid,
-        source_text=source,
-        source_message_id=message_id,
-    ) == ()
+    assert result.accepted == ()
+    assert result.rejected_codes == ("source_mismatch",)
 
 
 def test_explicit_conflict_creates_auditable_version_chain(memory_context) -> None:
@@ -144,7 +226,7 @@ def test_inferred_conflict_remains_pending_until_confirmed(memory_context) -> No
         conversation=conversation,
         user_message=candidate_message,
     )
-    assert events[0]["event_type"] == "memory.conflict"
+    assert events[0]["event_type"] == "memory.conflicted"
     pending = repository.list(status="pending")[0]
     assert repository.get(active["memory_id"])["status"] == "active"
     assert pending["supersedes_id"] is None
@@ -298,7 +380,8 @@ def test_pending_confirm_recycle_restore_and_stale_lifecycle(memory_context) -> 
         conversation=conversation,
         user_message=message,
     )
-    assert events[0]["event_type"] == "memory.candidate"
+    assert events[0]["event_type"] == "memory.extracted"
+    assert events[0]["payload"]["requires_confirmation"] is True
     pending = repository.list(status="pending")[0]
     confirmed = repository.update(pending["memory_id"], status="active")
     assert confirmed["status"] == "active"
@@ -391,6 +474,8 @@ def test_retrieval_applies_relevance_gate_and_records_actual_usage(memory_contex
     usages = repository.list_usage(run_id=run_id)
     assert [item["memory_id"] for item in usages] == [relevant["memory_id"]]
     assert usages[0]["reason"]
+    assert usages[0]["agent"] == "kimi"
+    assert usages[0]["validation_result"] == "not_validated"
     all_usage = repository.list_usage(run_id=run_id, include_suppressed=True)
     assert len(all_usage) == 2
     assert any(
@@ -398,6 +483,10 @@ def test_retrieval_applies_relevance_gate_and_records_actual_usage(memory_contex
         and item["suppression_reason"] == "below_relevance_threshold"
         for item in all_usage
     )
+    assert repository.record_validated_reuse(run_id=run_id) == 1
+    validated = repository.list_usage(run_id=run_id)[0]
+    assert validated["validation_result"] == "validated"
+    assert validated["validated_at"] is not None
 
 
 def test_feedback_is_idempotent_and_repeated_wrong_memory_can_sleep(memory_context) -> None:

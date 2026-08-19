@@ -9,6 +9,7 @@ or several minutes of runtime.
 python -m app.evaluation.cli run --suite release
 python -m app.evaluation.cli run --suite memory
 python -m app.evaluation.cli run --suite context
+python -m app.evaluation.cli run --suite tool-context
 python -m app.evaluation.cli run --suite provider --repeats 3
 python -m app.evaluation.cli run --suite performance --backend compose
 python -m app.evaluation.cli run --suite resilience --backend compose
@@ -32,3 +33,12 @@ Memory v3 additionally injects a misleading memory, records idempotent negative
 feedback, verifies reversible dormancy, and requires harmful-memory adoption below
 1%. Keep production automatic dormancy in shadow mode until five valid benchmark
 batches have been retained for the current corpus and model configuration.
+
+The deterministic `tool-context` suite measures large SQL results, long reports,
+Python chart payloads, long error traces, and eight-call tool loops. It also drives a
+scripted small-model Map-Reduce path and an unsupported-number case. It gates fact and
+evidence preservation, summary verification, hallucination rejection, and byte
+reduction delivered to the main model without consuming provider credentials.
+The v3 suite also seeks a value near the end of a large artifact and blocks releases
+unless the same-run continuation recovers it exactly within its hard context limit and
+with at least 80% reduction. Full artifact replay is never part of the benchmark path.

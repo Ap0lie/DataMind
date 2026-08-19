@@ -515,10 +515,12 @@ class AssistantMemoryRepository:
         retrieval_rank: int | None = None,
         final_selected: bool = True,
         suppression_reason: str | None = None,
+        agent: str = "kimi",
     ) -> dict[str, Any]:
         return self.record_usage_batch(
             run_id=run_id,
             assistant_message_id=assistant_message_id,
+            agent=agent,
             entries=(
                 {
                     "memory": memory,
@@ -535,6 +537,7 @@ class AssistantMemoryRepository:
         run_id: UUID,
         entries: tuple[dict[str, Any], ...],
         assistant_message_id: UUID | None = None,
+        agent: str = "kimi",
     ) -> tuple[dict[str, Any], ...]:
         if not entries:
             return ()
@@ -569,6 +572,9 @@ class AssistantMemoryRepository:
                     utility_score,
                     final_score,
                     entry.get("suppression_reason"),
+                    agent,
+                    "not_validated",
+                    None,
                     False,
                     now,
                 )
@@ -580,8 +586,9 @@ class AssistantMemoryRepository:
                     (id,user_id,run_id,memory_id,score,lexical_score,embedding_score,
                      scope_score,recency_score,reason,scope_type,assistant_message_id,
                      retrieval_rank,final_selected,relevance_score,utility_score,final_score,
-                     suppression_reason,outcome_recorded,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     suppression_reason,agent,validation_result,validated_at,
+                     outcome_recorded,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT (run_id,memory_id) DO UPDATE SET
                     score=excluded.score,lexical_score=excluded.lexical_score,
                     embedding_score=excluded.embedding_score,scope_score=excluded.scope_score,
@@ -591,7 +598,8 @@ class AssistantMemoryRepository:
                     final_selected=excluded.final_selected,
                     relevance_score=excluded.relevance_score,
                     utility_score=excluded.utility_score,final_score=excluded.final_score,
-                    suppression_reason=excluded.suppression_reason
+                    suppression_reason=excluded.suppression_reason,
+                    agent=excluded.agent
                 """,
                 parameters,
             )
@@ -644,6 +652,23 @@ class AssistantMemoryRepository:
             ).fetchone()
             if usage is None:
                 raise RuntimeError("Assistant memory usage was not found.")
+            existing = connection.execute(
+                """
+                SELECT * FROM assistant_memory_feedback
+                WHERE user_id=? AND usage_id=?
+                """,
+                (self.user_id, str(usage_id)),
+            ).fetchone()
+            previous_memory = self._get_with_connection(
+                connection,
+                UUID(str(usage["memory_id"])),
+            )
+            changed = bool(
+                existing is None
+                or str(existing["feedback"]) != feedback
+                or (str(existing["reason"]) if existing["reason"] else None)
+                != (str(reason or "").strip() or None)
+            )
             feedback_id = uuid4()
             connection.execute(
                 """
@@ -682,7 +707,11 @@ class AssistantMemoryRepository:
                 """,
                 (self.user_id, str(usage_id)),
             ).fetchone()
-        return _feedback(row, memory)
+        return _feedback(row, memory) | {
+            "_changed": changed,
+            "_became_dormant": previous_memory["status"] != "dormant"
+            and memory["status"] == "dormant",
+        }
 
     def record_validated_reuse(self, *, run_id: UUID) -> int:
         now = _now()
@@ -699,9 +728,10 @@ class AssistantMemoryRepository:
                 connection.execute(
                     """
                     UPDATE assistant_memory_usage
-                    SET outcome_recorded=TRUE WHERE id=? AND user_id=?
+                    SET outcome_recorded=TRUE,validation_result='validated',validated_at=?
+                    WHERE id=? AND user_id=?
                     """,
-                    (str(row["id"]), self.user_id),
+                    (now, str(row["id"]), self.user_id),
                 )
                 connection.execute(
                     """
@@ -1163,6 +1193,7 @@ def _memory(row: Any) -> dict[str, Any]:
 
 
 def _usage(row: Any) -> dict[str, Any]:
+    keys = set(row.keys())
     return {
         "usage_id": UUID(str(row["id"])),
         "run_id": UUID(str(row["run_id"])),
@@ -1185,6 +1216,13 @@ def _usage(row: Any) -> dict[str, Any]:
         "reason": str(row["reason"]),
         "suppression_reason": str(row["suppression_reason"])
         if row["suppression_reason"]
+        else None,
+        "agent": str(row["agent"] or "unknown") if "agent" in keys else "unknown",
+        "validation_result": str(row["validation_result"] or "not_validated")
+        if "validation_result" in keys
+        else "not_validated",
+        "validated_at": str(row["validated_at"])
+        if "validated_at" in keys and row["validated_at"]
         else None,
         "scope_type": str(row["scope_type"]),
         "created_at": str(row["created_at"]),
@@ -1322,6 +1360,9 @@ def _ensure_v3_columns(connection: Any) -> None:
         "utility_score": "REAL NOT NULL DEFAULT 0.5",
         "final_score": "REAL NOT NULL DEFAULT 0",
         "suppression_reason": "TEXT",
+        "agent": "TEXT NOT NULL DEFAULT 'unknown'",
+        "validation_result": "TEXT NOT NULL DEFAULT 'not_validated'",
+        "validated_at": "TEXT",
         "outcome_recorded": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, definition in usage_additions.items():
@@ -1329,6 +1370,24 @@ def _ensure_v3_columns(connection: Any) -> None:
             connection.execute(f"ALTER TABLE assistant_memory_usage ADD COLUMN {name} {definition}")
     connection.execute(
         "UPDATE assistant_memory_usage SET relevance_score=score,final_score=score WHERE final_score=0"
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_assistant_memories_namespace
+        ON assistant_memories(user_id,scope_type,scope_key,memory_kind,status,updated_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_assistant_memories_source_message
+        ON assistant_memories(user_id,source_message_id,created_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_assistant_memory_usage_agent
+        ON assistant_memory_usage(user_id,agent,run_id,retrieval_rank)
+        """
     )
 
 
@@ -1359,6 +1418,10 @@ CREATE INDEX IF NOT EXISTS idx_assistant_memories_user_status
 ON assistant_memories(user_id,status,pinned,updated_at);
 CREATE INDEX IF NOT EXISTS idx_assistant_memories_scope
 ON assistant_memories(user_id,scope_type,scope_key,status);
+CREATE INDEX IF NOT EXISTS idx_assistant_memories_namespace
+ON assistant_memories(user_id,scope_type,scope_key,memory_kind,status,updated_at);
+CREATE INDEX IF NOT EXISTS idx_assistant_memories_source_message
+ON assistant_memories(user_id,source_message_id,created_at);
 CREATE TABLE IF NOT EXISTS assistant_memory_settings (
     user_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL
 );
@@ -1369,11 +1432,15 @@ CREATE TABLE IF NOT EXISTS assistant_memory_usage (
     scope_type TEXT NOT NULL,assistant_message_id TEXT,retrieval_rank INTEGER,
     final_selected INTEGER NOT NULL DEFAULT 1,relevance_score REAL NOT NULL DEFAULT 0,
     utility_score REAL NOT NULL DEFAULT 0.5,final_score REAL NOT NULL DEFAULT 0,
-    suppression_reason TEXT,outcome_recorded INTEGER NOT NULL DEFAULT 0,
+    suppression_reason TEXT,agent TEXT NOT NULL DEFAULT 'unknown',
+    validation_result TEXT NOT NULL DEFAULT 'not_validated',validated_at TEXT,
+    outcome_recorded INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,UNIQUE(run_id,memory_id)
 );
 CREATE INDEX IF NOT EXISTS idx_assistant_memory_usage_run
 ON assistant_memory_usage(user_id,run_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_assistant_memory_usage_agent
+ON assistant_memory_usage(user_id,agent,run_id,retrieval_rank);
 CREATE TABLE IF NOT EXISTS assistant_memory_feedback (
     id TEXT PRIMARY KEY,user_id TEXT NOT NULL,usage_id TEXT NOT NULL,memory_id TEXT NOT NULL,
     run_id TEXT NOT NULL,feedback TEXT NOT NULL,reason TEXT,source TEXT NOT NULL DEFAULT 'user',

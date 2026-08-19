@@ -42,6 +42,7 @@ const locales = {
     ],
     infrastructure: [
       ["Data store", "PostgreSQL · SQLite", "Assets · Versions · Reports"],
+      ["LangMem Store", "BaseStore adapter", "Versions · Audit · Guard"],
       ["BGE embedding", "Chinese semantics", "User-scoped cache"],
       ["Python Runner", "Disposable container", "No network"],
       ["Checkpoints", "Resume · Idempotency", "Ordered events"],
@@ -86,6 +87,7 @@ const locales = {
     ],
     infrastructure: [
       ["数据存储", "PostgreSQL · SQLite", "资产 · 版本 · 报告"],
+      ["LangMem Store", "BaseStore Adapter", "版本 · 审计 · Guard"],
       ["BGE Embedding", "中文语义排序", "用户隔离缓存"],
       ["Python Runner", "一次性容器", "禁止网络"],
       ["Checkpoint", "恢复 · 幂等", "有序事件"],
@@ -132,7 +134,7 @@ const workflowLocales = {
     ],
     delivery: [
       ["Report artifact", "Charts · Lineage · Versions", "HTML · Markdown · PDF", "report"],
-      ["Kimi assistant", "Retrieve cited evidence", "Ask · Execute · Attach", "experience"],
+      ["Kimi assistant", "Evidence · Scoped memory", "Ask · Execute · Attach", "experience"],
       ["Next action", "Follow-up · Reanalyze", "Audited and recoverable", "control"],
     ],
     labels: [
@@ -163,7 +165,7 @@ const workflowLocales = {
     ],
     delivery: [
       ["报告资产", "图表 · 血缘 · 版本", "HTML · Markdown · PDF", "report"],
-      ["Kimi 助手", "检索已引用证据", "问答 · 执行 · 附件", "experience"],
+      ["Kimi 助手", "证据 · 范围记忆", "问答 · 执行 · 附件", "experience"],
       ["后续行动", "追问 · 重新分析", "可审计 · 可恢复", "control"],
     ],
     labels: ["有边界的修复 / 重规划", "持久任务 · Checkpoint · 有序 SSE 事件"],
@@ -253,7 +255,10 @@ function render(locale) {
   const experienceX = [63, 388, 713, 1038];
   const controlX = [...experienceX];
   const agentX = Array.from({ length: 8 }, (_, index) => 18 + index * 171);
-  const infrastructureX = Array.from({ length: 6 }, (_, index) => 22 + index * 229);
+  const infrastructureX = Array.from(
+    { length: locale.infrastructure.length },
+    (_, index) => 20 + index * 196,
+  );
   const agentTones = [
     "loop",
     "verify",
@@ -265,6 +270,7 @@ function render(locale) {
     "loop",
   ];
   const infrastructureTones = [
+    "infrastructure",
     "infrastructure",
     "infrastructure",
     "runner",
@@ -335,12 +341,12 @@ function render(locale) {
       card({
         x: infrastructureX[index],
         y: 714,
-        w: 211,
+        w: 184,
         h: 128,
         title,
         details,
         tone: infrastructureTones[index],
-        titleSize: 17,
+        titleSize: 15,
       }),
     );
   });
@@ -381,7 +387,7 @@ function render(locale) {
     `<text x="700" y="690" text-anchor="middle" class="service-bus">${escapeXml(locale.flowLabels[3])}</text>`,
   );
   parts.push(serviceLink(700, 656, 700, 670));
-  const infrastructureCenters = infrastructureX.map((x) => x + 105.5);
+  const infrastructureCenters = infrastructureX.map((x) => x + 92);
   infrastructureCenters.forEach((x) => parts.push(serviceLink(x, 700, x, 714)));
 
   const reportCenter = agentCenters[6];

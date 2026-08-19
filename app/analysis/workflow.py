@@ -10,6 +10,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from itertools import islice
 from threading import Lock
 from typing import Annotated, Any, NotRequired, TypedDict, cast
@@ -151,6 +152,7 @@ from app.analysis.workflow_support import (
 )
 from app.assistant.memory import AssistantMemoryService
 from app.core.settings import get_settings
+from app.harness.context import ContextSection, PromptEnvelope
 from app.harness.node import NodeExecutionHarness, NodeHarnessPolicy
 from app.schemas.analysis import (
     AnalysisAggregationResponse,
@@ -186,6 +188,10 @@ from app.schemas.analysis_intent import (
 )
 from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.dataset_store import DatasetStoreRepository
+from app.storage.tool_result_repository import ToolResultRepository
+from app.tool_results.contracts import ToolResultEnvelope, ToolResultStatus
+from app.tool_results.distiller import ToolResultDistiller, build_tool_result_distiller
+from app.tool_results.reducers import reduce_tool_result
 
 _planner_messages = agent_prompts.planner_messages
 _python_chart_messages = agent_prompts.python_chart_messages
@@ -245,6 +251,10 @@ class _UsageTrackingModelRouter:
         self._delegate = delegate
         self._lock = Lock()
         self._usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        parameters = signature(delegate.complete).parameters
+        self._supports_context = "context" in parameters or any(
+            item.kind is Parameter.VAR_KEYWORD for item in parameters.values()
+        )
 
     def reset(self) -> None:
         with self._lock:
@@ -265,6 +275,7 @@ class _UsageTrackingModelRouter:
         metadata: dict[str, object] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        context: PromptEnvelope | None = None,
     ) -> Any:
         call_kwargs: dict[str, Any] = {
             "messages": messages,
@@ -280,7 +291,15 @@ class _UsageTrackingModelRouter:
             call_kwargs["tools"] = tools
         if tool_choice is not None:
             call_kwargs["tool_choice"] = tool_choice
-        response = self._delegate.complete(**call_kwargs)
+        if context is not None and self._supports_context:
+            call_kwargs["context"] = context
+        try:
+            response = self._delegate.complete(**call_kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'context'" not in str(exc):
+                raise
+            call_kwargs.pop("context", None)
+            response = self._delegate.complete(**call_kwargs)
         usage = response.token_usage or {}
         prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
         completion = int(
@@ -318,6 +337,7 @@ class AnalysisWorkflowState(TypedDict):
     analysis_framework: NotRequired[AnalysisFrameworkResponse]
     analysis_contract: NotRequired[AnalysisContractResponse]
     analysis_experiences: NotRequired[tuple[dict[str, Any], ...]]
+    memory_contexts: NotRequired[dict[str, tuple[dict[str, Any], ...]]]
     statistical_verification: NotRequired[StatisticalVerificationResponse]
     statistical_validation_issues: NotRequired[tuple[ValidationIssueResponse, ...]]
     analysis_lineage: NotRequired[AnalysisLineageResponse]
@@ -536,10 +556,31 @@ def build_analysis_workflow(
         NodeHarnessPolicy(timeout_seconds=settings.report_loop_timeout_seconds + 5.0),
         event_callback=_notify_node_event,
     )
+    tool_result_repository = (
+        ToolResultRepository(
+            repository.root_path,
+            user_id=repository.user_id,
+        )
+        if settings.tool_distillation_enabled
+        else None
+    )
     report_runtime = ReportNodeRuntime(
         notify_progress=_notify_progress,
         emit_loop_event=_emit_loop_event,
         workflow_dataframe=_workflow_dataframe,
+        retain_tool_results=(
+            lambda artifact_ids, report_id: tool_result_repository.retain_for_report(
+                tuple(UUID(item) for item in artifact_ids),
+                report_id=UUID(report_id),
+            )
+            if tool_result_repository is not None
+            else 0
+        ),
+    )
+    tool_result_distiller = (
+        build_tool_result_distiller(settings, model_router)
+        if settings.tool_distillation_enabled and model_router is not None
+        else None
     )
     nodes = {
         INTENT_COMPILE_NODE: _intent_compile_node(repository, model_router),
@@ -568,7 +609,12 @@ def build_analysis_workflow(
         REPORT_COMMIT_NODE: _report_commit_node(repository, report_runtime),
         LOOP_BOOTSTRAP_NODE: _loop_bootstrap_node(),
         LOOP_DECIDE_NODE: _loop_decide_node(repository, model_router),
-        LOOP_EXECUTE_NODE: _loop_execute_node(repository, resolved_python_executor),
+        LOOP_EXECUTE_NODE: _loop_execute_node(
+            repository,
+            resolved_python_executor,
+            tool_result_repository,
+            tool_result_distiller,
+        ),
         LOOP_OBSERVE_NODE: _loop_observe_node(repository),
         LOOP_VERIFY_NODE: _loop_verify_node(),
         LOOP_REPAIR_NODE: _loop_repair_node(),
@@ -1014,12 +1060,49 @@ def _planner_node(
             ),
             store=repository,
         )
-        analysis_experiences = memory_service.retrieve_analysis_experiences(
+        memory_contexts = memory_service.retrieve_analysis_memory_contexts(
             question=state["question"],
             dataset_id=dataset_id,
             dataset_group_id=state.get("dataset_group_id"),
             additional_dataset_ids=state.get("additional_dataset_ids", ()),
             run_id=state["run_id"],
+        )
+        memory_usages = memory_service.repository.list_usage(
+            run_id=state["run_id"],
+            include_suppressed=True,
+        )
+        recalled_count = sum(item["final_selected"] for item in memory_usages)
+        if recalled_count:
+            _notify_node_event(
+                state,
+                {
+                    "event_type": "memory.recalled",
+                    "status": "completed",
+                    "message": f"Planner adopted {recalled_count} memory records.",
+                    "payload": {"agent": "planner", "count": recalled_count},
+                },
+            )
+        suppressed = [item for item in memory_usages if not item["final_selected"]]
+        if suppressed:
+            _notify_node_event(
+                state,
+                {
+                    "event_type": "memory.suppressed",
+                    "status": "completed",
+                    "message": f"Planner suppressed {len(suppressed)} memory records.",
+                    "payload": {"agent": "planner", "count": len(suppressed)},
+                },
+            )
+        planner_memories = memory_contexts["planner"]
+        analysis_experiences = tuple(
+            item
+            for item in planner_memories
+            if item.get("memory_type") == "analysis_experience"
+        )
+        planner_semantic_memories = tuple(
+            item
+            for item in planner_memories
+            if item.get("memory_type") != "analysis_experience"
         )
         planned_analysis = _resolve_plan_columns(_plan(state["question"], profile), profile)
         planner_source = "rules"
@@ -1037,6 +1120,7 @@ def _planner_node(
                         profile=profile,
                         multi_dataset_context=multi_dataset_context,
                         analysis_experiences=analysis_experiences,
+                        memory_context=planner_semantic_memories,
                         approved_intent=(
                             state["intent_spec"].model_dump(mode="json")
                             if state.get("intent_spec")
@@ -1176,6 +1260,7 @@ def _planner_node(
             "planner_decision": semantic_decision,
             "analysis_contract": analysis_contract,
             "analysis_experiences": analysis_experiences,
+            "memory_contexts": memory_contexts,
             "plan_validation_issues": plan_validation_issues,
             "planner_source": planner_source,
             "analysis_fast_path": _analysis_fast_path_eligible(
@@ -1907,7 +1992,7 @@ def _compact_loop_multi_dataset_context(
 
 
 def _loop_evidence_prompt(item: dict[str, Any]) -> dict[str, Any]:
-    return {
+    payload = {
         "evidence_id": item.get("evidence_id"),
         "tool_name": item.get("tool_name"),
         "status": item.get("status"),
@@ -1915,10 +2000,16 @@ def _loop_evidence_prompt(item: dict[str, Any]) -> dict[str, Any]:
         "action_hash": str(item.get("action_hash") or "")[:16],
         "arguments": _compact_loop_arguments(item),
         "output_fields": list(item.get("output_fields") or ())[:20],
+        "tool_result_artifact_id": item.get("tool_result_artifact_id"),
         "contract_covered": bool(item.get("contract_covered")),
         "coverage_gaps": item.get("coverage_gaps") or {},
         "error_type": item.get("error_type"),
     }
+    if item.get("tool_name") == "inspect_tool_result" and isinstance(
+        item.get("result"), dict
+    ):
+        payload["bounded_continuation"] = item["result"]
+    return payload
 
 
 def _compact_loop_arguments(item: dict[str, Any]) -> dict[str, Any]:
@@ -2262,10 +2353,9 @@ def _loop_decide_node(
             if not required_tool or item["function"]["name"] == required_tool
         ]
         tool_choice = "required" if required_tool else "auto"
-        decision_messages = [
-            {
-                "role": "system",
-                "content": (
+        system_message = {
+            "role": "system",
+            "content": (
                     "You are DataMind's bounded analysis controller. Select at most one provided tool per turn. "
                     "Use only known columns and evidence IDs. Never request writes, files, network access, identity, or scope. "
                     "For multi-table questions that name original fact tables, first inspect source datasets and use "
@@ -2278,12 +2368,12 @@ def _loop_decide_node(
                     'When safe analysis is impossible, reply {"action":"fallback","reason":"..."}. '
                     'If native tool calls are unavailable, reply {"action":"tool_call","tool_name":"...","arguments":{...},"reason":"..."}. '
                     "Do not reveal hidden reasoning; provide only a short reason in tool arguments or final JSON."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
+            ),
+        }
+        contract_message = {
+            "role": "user",
+            "content": json.dumps(
+                {
                         "question": state["question"],
                         "columns": [
                             {
@@ -2307,18 +2397,48 @@ def _loop_decide_node(
                             else {}
                         ),
                         "multi_dataset_context": _compact_loop_multi_dataset_context(state),
-                        "evidence": evidence,
-                        "attempted_action_hashes": list(state.get("loop_action_counts", {}))[-12:],
                         "repair": repair_context,
                         "remaining_budget": _public_loop_budget(
                             state.get("loop_budget", {}), state
                         ),
-                    },
-                    ensure_ascii=False,
-                    default=str,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        }
+        evidence_message = {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "evidence": evidence,
+                    "attempted_action_hashes": list(state.get("loop_action_counts", {}))[-12:],
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        }
+        decision_messages = [system_message, contract_message, evidence_message]
+        decision_context = PromptEnvelope(
+            sections=(
+                ContextSection(
+                    name="agent_loop_policy",
+                    messages=(system_message,),
+                    priority=0,
+                    required=True,
                 ),
-            },
-        ]
+                ContextSection(
+                    name="agent_loop_contract",
+                    messages=(contract_message,),
+                    priority=0,
+                    required=True,
+                ),
+                ContextSection(
+                    name="agent_loop_evidence",
+                    messages=(evidence_message,),
+                    priority=4,
+                ),
+            )
+        )
         try:
             try:
                 response = model_router.complete(
@@ -2335,6 +2455,7 @@ def _loop_decide_node(
                     },
                     tools=available_tools,
                     tool_choice=tool_choice,
+                    context=decision_context,
                 )
             except Exception as exc:
                 if not _is_tool_capability_error(exc):
@@ -2352,6 +2473,7 @@ def _loop_decide_node(
                         "tool_adapter": "structured_json",
                         "allow_provider_fallback": False,
                     },
+                    context=decision_context,
                 )
             used_tokens = int(response.token_usage.get("total_tokens") or 0)
             budget = {
@@ -2625,8 +2747,150 @@ def _invalid_required_tool_decision(
     }
 
 
+def _archive_loop_tool_result(
+    state: AnalysisWorkflowState,
+    execution: dict[str, Any],
+    *,
+    tool_result_repository: ToolResultRepository | None,
+    tool_result_distiller: ToolResultDistiller | None,
+) -> None:
+    raw_result = execution.get("result")
+    if execution.get("status") == "succeeded" and isinstance(raw_result, dict):
+        execution["contract_result"] = _contract_result(raw_result)
+        execution["claim_result"] = _claim_result(raw_result)
+        execution["output_fields"] = _loop_output_fields(raw_result)
+        execution["result_summary"] = _loop_result_summary(raw_result)
+    if execution.get("tool_name") == "inspect_tool_result":
+        execution["tool_result_artifact_id"] = (
+            raw_result.get("tool_result_artifact_id")
+            if isinstance(raw_result, dict)
+            else None
+        )
+        _emit_loop_event(
+            state,
+            event_type="tool_result.continued",
+            status="completed",
+            message="Archived tool evidence was continued through a bounded exact projection.",
+            iteration=state.get("loop_iteration", 0) + 1,
+            tool_name="inspect_tool_result",
+            payload={
+                "artifact_id": execution.get("tool_result_artifact_id"),
+                "projection_id": raw_result.get("projection_id")
+                if isinstance(raw_result, dict)
+                else None,
+                "selected_path_count": raw_result.get("selected_path_count", 0)
+                if isinstance(raw_result, dict)
+                else 0,
+                "context_size_bytes": raw_result.get("context_size_bytes", 0)
+                if isinstance(raw_result, dict)
+                else 0,
+            },
+        )
+        return
+    if tool_result_repository is None:
+        return
+    payload = (
+        raw_result
+        if raw_result is not None
+        else {
+            "error_type": execution.get("error_type"),
+            "error": execution.get("error"),
+        }
+    )
+    envelope = ToolResultEnvelope(
+        run_id=state["run_id"],
+        tool_name=str(execution.get("tool_name") or "unknown_tool"),
+        action_hash=str(execution.get("action_hash") or "unknown_action"),
+        status=(
+            ToolResultStatus.SUCCEEDED
+            if execution.get("status") == "succeeded"
+            else ToolResultStatus.FAILED
+        ),
+        payload=payload,
+        metadata={
+            "dataset_id": str(state["dataset_id"]),
+            "question": str(state.get("question") or "")[:2_000],
+            "dataset_group_id": (
+                str(state["dataset_group_id"])
+                if state.get("dataset_group_id")
+                else None
+            ),
+        },
+    )
+    try:
+        bundle = tool_result_repository.archive_and_summarize(
+            envelope,
+            distiller=tool_result_distiller,
+        )
+    except Exception as exc:
+        summary = reduce_tool_result(envelope)
+        execution.update(
+            {
+                "status": "failed",
+                "error_type": "artifact_error",
+                "error": f"Tool result archival failed: {type(exc).__name__}",
+                "result": summary.model_dump(mode="json"),
+                "result_summary": summary.headline,
+            }
+        )
+        _emit_loop_event(
+            state,
+            event_type="tool_result.archive_failed",
+            status="failed",
+            message="Tool result archival failed; the tool call was rejected safely.",
+            iteration=state.get("loop_iteration", 0) + 1,
+            tool_name=str(execution.get("tool_name") or "") or None,
+            payload={"error_type": type(exc).__name__},
+        )
+        return
+    execution["tool_result_artifact_id"] = str(bundle.artifact_id)
+    execution["result"] = bundle.summary.model_dump(mode="json")
+    execution["result_summary"] = bundle.summary.headline
+    execution["tool_result_size_bytes"] = bundle.original_size_bytes
+    execution["tool_context_size_bytes"] = bundle.context_size_bytes
+    _emit_loop_event(
+        state,
+        event_type="tool_result.archived",
+        status="completed",
+        message="Complete tool result archived; workflow state keeps the verified summary.",
+        iteration=state.get("loop_iteration", 0) + 1,
+        tool_name=str(execution.get("tool_name") or "") or None,
+        payload={
+            "artifact_id": str(bundle.artifact_id),
+            "original_size_bytes": bundle.original_size_bytes,
+            "context_size_bytes": bundle.context_size_bytes,
+            "reduction_ratio": round(bundle.reduction_ratio, 4),
+            "distillation_mode": (
+                "deterministic" if bundle.summary.deterministic else "small_model"
+            ),
+            "distillation_attempts": len(bundle.distillation_attempts),
+        },
+    )
+    if bundle.distillation_attempts:
+        _emit_loop_event(
+            state,
+            event_type="tool_result.distilled",
+            status="completed",
+            message=(
+                "Large tool result distilled into verified source excerpts."
+                if not bundle.summary.deterministic
+                else "Model distillation rejected; deterministic summary retained."
+            ),
+            iteration=state.get("loop_iteration", 0) + 1,
+            tool_name=str(execution.get("tool_name") or "") or None,
+            payload={
+                "artifact_id": str(bundle.artifact_id),
+                "accepted": not bundle.summary.deterministic,
+                "attempts": len(bundle.distillation_attempts),
+            },
+        )
+
+
 def _loop_execute_node(
-    repository: DatasetStoreRepository, python_executor: PythonAnalysisExecutor
+    repository: DatasetStoreRepository,
+    python_executor: PythonAnalysisExecutor,
+    tool_result_repository: ToolResultRepository | None = None,
+    tool_result_distiller: ToolResultDistiller | None = None,
 ) -> Any:
     def run(state: AnalysisWorkflowState) -> dict[str, Any]:
         pending = state.get("loop_pending_call") or {}
@@ -2681,6 +2945,15 @@ def _loop_execute_node(
             restored = None
         if restored is not None:
             content = restored.get("content") if isinstance(restored.get("content"), dict) else {}
+            restored_result = content.get("result_summary") or content.get("result")
+            restored_tool_artifact_id = content.get("tool_result_artifact_id")
+            if restored_tool_artifact_id and tool_result_repository is not None:
+                try:
+                    restored_result = tool_result_repository.model_context(
+                        UUID(str(restored_tool_artifact_id))
+                    )["summary"]
+                except (RuntimeError, ValueError, OSError):
+                    restored_result = content.get("result_summary")
             execution = {
                 "tool_name": tool_name,
                 "arguments": arguments,
@@ -2688,10 +2961,20 @@ def _loop_execute_node(
                 "idempotency_key": idempotency_key,
                 "idempotency_artifact_id": str(idempotency_artifact_id),
                 "status": "succeeded",
-                "result": content.get("result"),
+                "result": restored_result,
                 "result_hash": content.get("result_hash"),
+                "tool_result_artifact_id": restored_tool_artifact_id,
                 "cached": True,
             }
+            _emit_loop_event(
+                state,
+                event_type="tool_result.restored",
+                status="completed",
+                message="Archived tool evidence was restored without replaying its full payload.",
+                iteration=next_iteration,
+                tool_name=tool_name,
+                payload={"artifact_id": restored_tool_artifact_id},
+            )
             return {
                 "loop_iteration": next_iteration,
                 "loop_last_execution": execution,
@@ -2751,13 +3034,23 @@ def _loop_execute_node(
                             "duplicate_evidence_id": matching_evidence.get("evidence_id"),
                         }
                     )
+                _archive_loop_tool_result(
+                    state,
+                    execution,
+                    tool_result_repository=tool_result_repository,
+                    tool_result_distiller=tool_result_distiller,
+                )
                 repository.save_artifact(
                     dataset_id=state["dataset_id"],
                     artifact_type="agent_loop_action",
                     content={
                         "idempotency_key": idempotency_key,
                         "tool_name": tool_name,
-                        "result": result.result,
+                        "result": result.result if tool_result_repository is None else None,
+                        "result_summary": execution.get("result"),
+                        "tool_result_artifact_id": execution.get(
+                            "tool_result_artifact_id"
+                        ),
                         "result_hash": result_hash,
                     },
                     file_name=f"{idempotency_key}.json",
@@ -2765,6 +3058,13 @@ def _loop_execute_node(
                     if_absent=True,
                 )
                 execution["idempotency_artifact_id"] = str(idempotency_artifact_id)
+            else:
+                _archive_loop_tool_result(
+                    state,
+                    execution,
+                    tool_result_repository=tool_result_repository,
+                    tool_result_distiller=tool_result_distiller,
+                )
         duplicate = bool(execution.get("duplicate_action"))
         _emit_loop_event(
             state,
@@ -2783,7 +3083,9 @@ def _loop_execute_node(
                 "error_type": execution.get("error_type"),
                 "result_hash": execution.get("result_hash"),
                 "duplicate_kind": execution.get("duplicate_kind"),
-                "result_summary": _loop_result_summary(execution.get("result")),
+                "result_summary": execution.get("result_summary")
+                or _loop_result_summary(execution.get("result")),
+                "tool_result_artifact_id": execution.get("tool_result_artifact_id"),
             },
         )
         return {
@@ -2818,7 +3120,11 @@ def _loop_observe_node(repository: DatasetStoreRepository) -> Any:
         evidence_id = f"ev_{len(evidence) + 1}"
         result = execution.get("result")
         artifact_id: str | None = None
-        if result and len(json.dumps(result, ensure_ascii=False, default=str)) > 32_000:
+        if execution.get("tool_result_artifact_id") and execution.get(
+            "idempotency_artifact_id"
+        ):
+            artifact_id = str(execution["idempotency_artifact_id"])
+        elif result and len(json.dumps(result, ensure_ascii=False, default=str)) > 32_000:
             artifact_id = str(
                 execution.get("idempotency_artifact_id")
                 or repository.save_artifact(
@@ -2831,13 +3137,14 @@ def _loop_observe_node(repository: DatasetStoreRepository) -> Any:
         item = {
             **execution,
             "result": None if artifact_id else result,
-            "contract_result": _contract_result(result),
-            "claim_result": _claim_result(result),
-            "output_fields": _loop_output_fields(result),
+            "contract_result": execution.get("contract_result") or _contract_result(result),
+            "claim_result": execution.get("claim_result") or _claim_result(result),
+            "output_fields": execution.get("output_fields") or _loop_output_fields(result),
             "evidence_id": evidence_id,
             "artifact_id": artifact_id,
+            "tool_result_artifact_id": execution.get("tool_result_artifact_id"),
             "result_hash": execution.get("result_hash") or canonical_result_hash(result),
-            "summary": _loop_result_summary(result),
+            "summary": execution.get("result_summary") or _loop_result_summary(result),
         }
         evidence.append(item)
         _emit_loop_event(

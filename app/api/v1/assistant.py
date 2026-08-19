@@ -448,6 +448,30 @@ def submit_memory_feedback(
             dormancy_min_feedback=settings.assistant_memory_dormancy_min_feedback,
             wrong_feedback_limit=settings.assistant_memory_wrong_feedback_limit,
         )
+        changed = bool(feedback.pop("_changed", False))
+        became_dormant = bool(feedback.pop("_became_dormant", False))
+        if changed:
+            with suppress(RuntimeError):
+                _repository(user_id).append_event(
+                    feedback["run_id"],
+                    event_type="memory.feedback",
+                    status="completed",
+                    message="已记录这条记忆的使用反馈。",
+                    payload={
+                        "memory_id": str(feedback["memory_id"]),
+                        "feedback": feedback["feedback"],
+                        "utility_score": feedback["utility_score"],
+                    },
+                )
+        if became_dormant:
+            with suppress(RuntimeError):
+                _repository(user_id).append_event(
+                    feedback["run_id"],
+                    event_type="memory.dormant",
+                    status="completed",
+                    message="低质量记忆已进入休眠，不再参与召回。",
+                    payload={"memory_id": str(feedback["memory_id"])},
+                )
         return AssistantMemoryFeedbackResponse.model_validate(feedback)
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

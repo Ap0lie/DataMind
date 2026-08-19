@@ -71,6 +71,30 @@ class Settings(BaseSettings):
     context_budget_mode: str = Field(default="shadow", pattern="^(shadow|enforce)$")
     llm_context_window_tokens: int = Field(default=65_536, ge=8_192, le=2_000_000)
     context_safety_ratio: float = Field(default=0.15, ge=0.05, le=0.40)
+    tool_distillation_enabled: bool = True
+    tool_distillation_strategy: str = Field(
+        default="auto", pattern="^(deterministic|auto|model)$"
+    )
+    tool_distillation_provider: str = "deepseek"
+    tool_distillation_model: str | None = None
+    tool_distillation_min_source_chars: int = Field(default=48_000, ge=4_000, le=2_000_000)
+    tool_distillation_chunk_chars: int = Field(default=8_000, ge=2_000, le=32_000)
+    tool_distillation_max_chunks: int = Field(default=24, ge=1, le=128)
+    tool_distillation_batch_size: int = Field(default=4, ge=1, le=16)
+    tool_distillation_max_attempts: int = Field(default=2, ge=1, le=4)
+    tool_distillation_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    tool_context_target_chars: int = Field(default=12_000, ge=2_000, le=60_000)
+    tool_context_max_chars: int = Field(default=24_000, ge=4_000, le=120_000)
+    tool_continuation_enabled: bool = True
+    tool_continuation_max_calls: int = Field(default=2, ge=0, le=8)
+    tool_continuation_max_chars: int = Field(default=12_000, ge=2_000, le=40_000)
+    tool_continuation_scan_max_bytes: int = Field(
+        default=33_554_432, ge=1_048_576, le=536_870_912
+    )
+    tool_artifact_path: str = "data/tool-artifacts"
+    tool_artifact_max_bytes: int = Field(default=209_715_200, ge=1024, le=1_073_741_824)
+    tool_artifact_ttl_days: int = Field(default=30, ge=1, le=365)
+    tool_artifact_failed_ttl_days: int = Field(default=7, ge=1, le=90)
     llm_allow_provider_fallback: bool = True
     intent_compiler_enabled: bool = True
     intent_compiler_mode: str = Field(default="shadow", pattern="^(shadow|enforce)$")
@@ -160,6 +184,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_profile(self) -> Settings:
+        if self.tool_context_max_chars < self.tool_context_target_chars:
+            raise ValueError("Tool context max chars must be at least its target chars.")
+        if self.tool_continuation_max_chars > self.tool_context_max_chars:
+            raise ValueError("Tool continuation context cannot exceed the tool context maximum.")
+        if self.tool_distillation_batch_size > self.tool_distillation_max_chunks:
+            raise ValueError("Tool distillation batch size cannot exceed max chunks.")
         if self.assistant_completion_total_max_tokens < self.assistant_completion_min_tokens:
             raise ValueError(
                 "Assistant total completion budget must be at least its per-call minimum."

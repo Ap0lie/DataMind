@@ -1,0 +1,107 @@
+{
+  "suite_id": "tool-context",
+  "version": "3.0.0",
+  "description": "Deterministic baselines for archival, fact reduction, verified Map-Reduce, and bounded exact continuation.",
+  "mode": "deterministic",
+  "corpus_checksum": "auto",
+  "max_duration_seconds": 60,
+  "cases": [
+    {
+      "case_id": "large-sql-result",
+      "name": "Large SQL rows are reduced",
+      "subsystem": "tool_results",
+      "operation": "tool_result.reduce",
+      "input": {"scenario": "sql"},
+      "validators": [
+        {"type": "minimum", "path": "reduction", "expected": 0.8},
+        {"type": "exact", "path": "evidence_preserved", "expected": true},
+        {"type": "exact", "path": "facts_preserved", "expected": true}
+      ]
+    },
+    {
+      "case_id": "long-report",
+      "name": "Long report keeps findings without raw body",
+      "subsystem": "tool_results",
+      "operation": "tool_result.reduce",
+      "input": {"scenario": "report"},
+      "validators": [{"type": "minimum", "path": "reduction", "expected": 0.8}]
+    },
+    {
+      "case_id": "large-python-statistics",
+      "name": "Python chart records are bounded",
+      "subsystem": "tool_results",
+      "operation": "tool_result.reduce",
+      "input": {"scenario": "python"},
+      "validators": [{"type": "minimum", "path": "reduction", "expected": 0.8}]
+    },
+    {
+      "case_id": "long-error-trace",
+      "name": "Error position survives trace reduction",
+      "subsystem": "tool_results",
+      "operation": "tool_result.reduce",
+      "input": {"scenario": "error"},
+      "validators": [
+        {"type": "exact", "path": "evidence_preserved", "expected": true},
+        {"type": "exact", "path": "facts_preserved", "expected": true}
+      ]
+    },
+    {
+      "case_id": "eight-tool-calls",
+      "name": "Eight tool calls remain bounded",
+      "subsystem": "tool_results",
+      "operation": "tool_result.reduce",
+      "input": {"scenario": "sql", "tool_calls": 8},
+      "validators": [
+        {"type": "exact", "path": "tool_calls", "expected": 8},
+        {"type": "minimum", "path": "reduction", "expected": 0.8}
+      ]
+    },
+    {
+      "case_id": "verified-map-reduce",
+      "name": "Small-model Map-Reduce preserves evidence",
+      "subsystem": "tool_results",
+      "operation": "tool_result.distill",
+      "input": {"hallucinate": false},
+      "validators": [
+        {"type": "exact", "path": "verified", "expected": true},
+        {"type": "exact", "path": "model_distilled", "expected": true},
+        {"type": "exact", "path": "evidence_preserved", "expected": true}
+      ]
+    },
+    {
+      "case_id": "hallucinated-number-rejected",
+      "name": "Unsupported numeric claim falls back safely",
+      "subsystem": "tool_results",
+      "operation": "tool_result.distill",
+      "input": {"hallucinate": true},
+      "validators": [
+        {"type": "exact", "path": "verified", "expected": true},
+        {"type": "exact", "path": "model_distilled", "expected": false},
+        {"type": "exact", "path": "unsupported_claim_rejected", "expected": true}
+      ]
+    },
+    {
+      "case_id": "bounded-exact-continuation",
+      "name": "A late exact value is recovered without replaying the full result",
+      "subsystem": "tool_results",
+      "operation": "tool_result.project",
+      "input": {"rows": 2000},
+      "validators": [
+        {"type": "exact", "path": "exact_target_preserved", "expected": true},
+        {"type": "exact", "path": "bounded", "expected": true},
+        {"type": "exact", "path": "verified", "expected": true},
+        {"type": "minimum", "path": "reduction", "expected": 0.8}
+      ]
+    }
+  ],
+  "thresholds": [
+    {"metric": "tool_context_reduction", "direction": "minimum", "value": 0.8, "hard_gate": true},
+    {"metric": "tool_evidence_preservation", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "tool_fact_preservation", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "tool_distillation_verification", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "tool_distillation_hallucination_rejection", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "tool_continuation_exactness", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "tool_continuation_bounded", "direction": "exact", "value": 1.0, "hard_gate": true},
+    {"metric": "tool_continuation_reduction", "direction": "minimum", "value": 0.8, "hard_gate": true}
+  ]
+}

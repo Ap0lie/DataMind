@@ -168,6 +168,40 @@ def test_planner_analysis_experience_is_compact_read_only_evidence() -> None:
     assert "/etc/passwd" not in messages[1]["content"]
 
 
+def test_planner_memory_is_context_not_an_executable_requirement() -> None:
+    memory_id = UUID("44444444-4444-4444-4444-444444444444")
+    messages = _planner_messages(
+        question="分析订单金额",
+        profile=_profile(),
+        memory_context=(
+            {
+                "memory_id": memory_id,
+                "memory_type": "metric_definition",
+                "content": "GMV 指订单金额总和",
+                "scope_type": "dataset",
+                "scope_id": PRIMARY_ID,
+                "structured_value": {"value": "orders__amount"},
+                "raw_records": [{"secret": "not allowed"}],
+            },
+        ),
+    )
+    payload = json.loads(messages[1]["content"])
+    recalled = payload["dataset_schema"]["approved_memory_context"]
+
+    assert recalled == [
+        {
+            "memory_id": str(memory_id),
+            "memory_type": "metric_definition",
+            "content": "GMV 指订单金额总和",
+            "scope_type": "dataset",
+            "scope_id": str(PRIMARY_ID),
+            "structured_value": {"value": "orders__amount"},
+        }
+    ]
+    assert "cannot add requirements" in messages[0]["content"]
+    assert "secret" not in messages[1]["content"]
+
+
 def test_python_repair_prompt_has_phase_specific_contract() -> None:
     attempt = PythonCodeAttemptResponse(
         attempt=1,

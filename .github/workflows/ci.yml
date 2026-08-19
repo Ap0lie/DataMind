@@ -74,6 +74,17 @@ jobs:
           path: artifacts/benchmarks/context
           if-no-files-found: warn
 
+      - name: Tool result context benchmark
+        run: python -m app.evaluation.cli run --suite tool-context --output artifacts/benchmarks/tool-context
+
+      - name: Upload tool result context benchmark
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: datamind-tool-context-benchmark
+          path: artifacts/benchmarks/tool-context
+          if-no-files-found: warn
+
       - uses: actions/setup-node@v6
         with:
           node-version: "24"

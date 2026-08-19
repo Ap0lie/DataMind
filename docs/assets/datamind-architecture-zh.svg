@@ -96,29 +96,33 @@
     <text x="1293.5" y="422" text-anchor="middle" class="card-title" font-size="16" fill="#14532d">Assistant Graph</text>
     <text text-anchor="middle" class="card-detail" fill="#14532d"><tspan x="1293.5" y="452">检索 · 工具</tspan><tspan x="1293.5" y="473">确认 · 回答</tspan></text>
 
-    <rect x="22" y="714" width="211" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
-    <text x="127.5" y="750" text-anchor="middle" class="card-title" font-size="17" fill="#334155">数据存储</text>
-    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="127.5" y="780">PostgreSQL · SQLite</tspan><tspan x="127.5" y="801">资产 · 版本 · 报告</tspan></text>
+    <rect x="20" y="714" width="184" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="112" y="750" text-anchor="middle" class="card-title" font-size="15" fill="#334155">数据存储</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="112" y="780">PostgreSQL · SQLite</tspan><tspan x="112" y="801">资产 · 版本 · 报告</tspan></text>
 
-    <rect x="251" y="714" width="211" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
-    <text x="356.5" y="750" text-anchor="middle" class="card-title" font-size="17" fill="#334155">BGE Embedding</text>
-    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="356.5" y="780">中文语义排序</tspan><tspan x="356.5" y="801">用户隔离缓存</tspan></text>
+    <rect x="216" y="714" width="184" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="308" y="750" text-anchor="middle" class="card-title" font-size="15" fill="#334155">LangMem Store</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="308" y="780">BaseStore Adapter</tspan><tspan x="308" y="801">版本 · 审计 · Guard</tspan></text>
 
-    <rect x="480" y="714" width="211" height="128" rx="8" fill="#fff7ed" stroke="#fb923c" stroke-width="2"/>
-    <text x="585.5" y="750" text-anchor="middle" class="card-title" font-size="17" fill="#7c2d12">Python Runner</text>
-    <text text-anchor="middle" class="card-detail" fill="#7c2d12"><tspan x="585.5" y="780">一次性容器</tspan><tspan x="585.5" y="801">禁止网络</tspan></text>
+    <rect x="412" y="714" width="184" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="504" y="750" text-anchor="middle" class="card-title" font-size="15" fill="#334155">BGE Embedding</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="504" y="780">中文语义排序</tspan><tspan x="504" y="801">用户隔离缓存</tspan></text>
 
-    <rect x="709" y="714" width="211" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
-    <text x="814.5" y="750" text-anchor="middle" class="card-title" font-size="17" fill="#334155">Checkpoint</text>
-    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="814.5" y="780">恢复 · 幂等</tspan><tspan x="814.5" y="801">有序事件</tspan></text>
+    <rect x="608" y="714" width="184" height="128" rx="8" fill="#fff7ed" stroke="#fb923c" stroke-width="2"/>
+    <text x="700" y="750" text-anchor="middle" class="card-title" font-size="15" fill="#7c2d12">Python Runner</text>
+    <text text-anchor="middle" class="card-detail" fill="#7c2d12"><tspan x="700" y="780">一次性容器</tspan><tspan x="700" y="801">禁止网络</tspan></text>
 
-    <rect x="938" y="714" width="211" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
-    <text x="1043.5" y="750" text-anchor="middle" class="card-title" font-size="17" fill="#334155">工具运行时</text>
-    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="1043.5" y="780">Schema · 策略</tspan><tspan x="1043.5" y="801">调用控制</tspan></text>
+    <rect x="804" y="714" width="184" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="896" y="750" text-anchor="middle" class="card-title" font-size="15" fill="#334155">Checkpoint</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="896" y="780">恢复 · 幂等</tspan><tspan x="896" y="801">有序事件</tspan></text>
 
-    <rect x="1167" y="714" width="211" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
-    <text x="1272.5" y="750" text-anchor="middle" class="card-title" font-size="17" fill="#334155">Redis + Celery</text>
-    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="1272.5" y="780">Broker · Worker</tspan><tspan x="1272.5" y="801">Beat</tspan></text>
+    <rect x="1000" y="714" width="184" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="1092" y="750" text-anchor="middle" class="card-title" font-size="15" fill="#334155">工具运行时</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="1092" y="780">Schema · 策略</tspan><tspan x="1092" y="801">调用控制</tspan></text>
+
+    <rect x="1196" y="714" width="184" height="128" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+    <text x="1288" y="750" text-anchor="middle" class="card-title" font-size="15" fill="#334155">Redis + Celery</text>
+    <text text-anchor="middle" class="card-detail" fill="#334155"><tspan x="1288" y="780">Broker · Worker</tspan><tspan x="1288" y="801">Beat</tspan></text>
 <line x1="700" y1="166" x2="700" y2="221" class="arrow" marker-end="url(#arrow)"/>
 <text x="735" y="198" text-anchor="middle" class="flow-label">HTTPS</text>
 <line x1="700" y1="321" x2="700" y2="386" class="arrow" marker-end="url(#arrow)"/>
@@ -147,12 +151,13 @@
 <rect x="226" y="670" width="948" height="30" rx="8" fill="#eef2f7" stroke="#94a3b8"/>
 <text x="700" y="690" text-anchor="middle" class="service-bus">共享运行支撑 · 调用 · 状态 · 队列 · 事件</text>
 <line x1="700" y1="656" x2="700" y2="670" class="shared-connection"/>
-<line x1="127.5" y1="700" x2="127.5" y2="714" class="shared-connection"/>
-<line x1="356.5" y1="700" x2="356.5" y2="714" class="shared-connection"/>
-<line x1="585.5" y1="700" x2="585.5" y2="714" class="shared-connection"/>
-<line x1="814.5" y1="700" x2="814.5" y2="714" class="shared-connection"/>
-<line x1="1043.5" y1="700" x2="1043.5" y2="714" class="shared-connection"/>
-<line x1="1272.5" y1="700" x2="1272.5" y2="714" class="shared-connection"/>
+<line x1="112" y1="700" x2="112" y2="714" class="shared-connection"/>
+<line x1="308" y1="700" x2="308" y2="714" class="shared-connection"/>
+<line x1="504" y1="700" x2="504" y2="714" class="shared-connection"/>
+<line x1="700" y1="700" x2="700" y2="714" class="shared-connection"/>
+<line x1="896" y1="700" x2="896" y2="714" class="shared-connection"/>
+<line x1="1092" y1="700" x2="1092" y2="714" class="shared-connection"/>
+<line x1="1288" y1="700" x2="1288" y2="714" class="shared-connection"/>
 <path d="M 1122.5 506 C 1122.5 548, 438.5 548, 438.5 506" class="arrow muted" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
 <text x="780.5" y="542" text-anchor="middle" class="flow-label">修复 / 重规划</text>
 </svg>

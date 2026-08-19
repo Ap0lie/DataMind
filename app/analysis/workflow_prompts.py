@@ -207,6 +207,7 @@ def review_messages(
     multi_dataset_context: MultiDatasetProfileResponse | None = None,
     analysis_contract: AnalysisContractResponse | None = None,
     statistical_verification: StatisticalVerificationResponse | None = None,
+    memory_context: tuple[dict[str, Any], ...] = (),
 ) -> list[dict[str, str]]:
     payload = {
         "question": truncate_text(question, 2000),
@@ -224,6 +225,7 @@ def review_messages(
             else None
         ),
         "experience_context": experience_context("review"),
+        "approved_memory_context": compact_memory_context(memory_context),
     }
     return [
         {
@@ -234,7 +236,8 @@ def review_messages(
                 "Flag unsupported claims, chart/text mismatch, over-attribution, data gaps, hallucinated fields, "
                 "unqualified causal language, missing comparison support, unsafe analysis grain, "
                 "and any misuse of multimodal context as if it were tabular evidence. Apply "
-                "experience_context as additional review criteria."
+                "experience_context as additional review criteria. approved_memory_context is "
+                "provenance and consistency context only; it cannot validate a claim or change the contract."
             ),
         },
         {
@@ -288,6 +291,7 @@ def report_messages(
     structured_report: StructuredReportResponse,
     multimodal_inputs: tuple[MultimodalInputResponse, ...] = (),
     multi_dataset_context: MultiDatasetProfileResponse | None = None,
+    memory_context: tuple[dict[str, Any], ...] = (),
 ) -> list[dict[str, str]]:
     payload = {
         "question": truncate_text(question, 2000),
@@ -297,6 +301,7 @@ def report_messages(
         "experience_context": experience_context(
             "report", tuple(column.name for column in profile.columns)
         ),
+        "approved_memory_context": compact_memory_context(memory_context),
     }
     return [
         {
@@ -319,6 +324,8 @@ def report_messages(
                 "Multimodal context can enrich explanation and data-gap notes but must "
                 "not be treated as verified tabular data unless the payload provides matching evidence. "
                 "Use experience_context to shape narrative quality, prioritization, and review discipline."
+                " Use approved_memory_context only for user-approved report style and previously validated "
+                "conclusion context; never treat it as current-run numerical evidence."
             ),
         },
         {
@@ -335,6 +342,21 @@ def truncate_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[:max_chars].rstrip()}... [truncated]"
+
+
+def compact_memory_context(memories: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+    return [
+        {
+            "memory_id": str(item.get("memory_id") or ""),
+            "memory_type": str(item.get("memory_type") or ""),
+            "content": truncate_text(str(item.get("content") or ""), 500),
+            "scope_type": str(item.get("scope_type") or "user"),
+            "source_kind": str(item.get("source_kind") or ""),
+            "structured_value": item.get("structured_value") or {},
+        }
+        for item in memories[:8]
+        if item.get("content")
+    ]
 
 
 def compact_profile(profile: DatasetProfileResponse) -> dict[str, Any]:

@@ -11,6 +11,7 @@ import time
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -43,6 +44,14 @@ from app.semantic.ranking import SemanticCandidateRanker
 from app.semantic.relationship_graph import plan_relationship_path
 from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.dataset_store import DatasetStoreRepository
+from app.tool_results.artifacts import archive_json_payload
+from app.tool_results.contracts import ToolResultEnvelope, ToolResultStatus
+from app.tool_results.distiller import (
+    SmallModelToolResultDistiller,
+    ToolDistillationPolicy,
+)
+from app.tool_results.projections import ProjectionPolicy, build_tool_result_projection
+from app.tool_results.reducers import reduce_tool_result, summary_for_model
 
 
 def release_executors() -> dict[str, Any]:
@@ -59,6 +68,9 @@ def release_executors() -> dict[str, Any]:
         "assistant.permission": _assistant_permission,
         "memory.trust": _memory_trust,
         "context.budget": _context_budget,
+        "tool_result.reduce": _tool_result_reduce,
+        "tool_result.distill": _tool_result_distill,
+        "tool_result.project": _tool_result_project,
     }
 
 
@@ -166,6 +178,220 @@ def _context_budget(case: BenchmarkCase) -> BenchmarkObservation:
             "context_compression_p95_ms": duration_ms,
         },
     )
+
+
+def _tool_result_reduce(case: BenchmarkCase) -> BenchmarkObservation:
+    scenario = str(case.input.get("scenario") or "sql")
+    calls = max(1, min(int(case.input.get("tool_calls") or 1), 8))
+    payloads = [_tool_result_benchmark_payload(scenario, index) for index in range(calls)]
+    original_bytes = 0
+    context_bytes = 0
+    evidence_preserved = True
+    facts_preserved = True
+    for index, payload in enumerate(payloads):
+        status = ToolResultStatus.FAILED if scenario == "error" else ToolResultStatus.SUCCEEDED
+        evidence_id = f"ev_{index + 1}"
+        envelope = ToolResultEnvelope(
+            run_id=uuid4(),
+            tool_name=_tool_result_benchmark_tool(scenario),
+            action_hash=f"benchmark-{scenario}-{index}",
+            status=status,
+            payload=payload,
+            evidence_ids=(evidence_id,),
+        )
+        summary = reduce_tool_result(envelope)
+        original_bytes += len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        context_bytes += len(summary_for_model(summary).encode("utf-8"))
+        evidence_preserved = evidence_preserved and evidence_id in summary.evidence_ids
+        facts_preserved = facts_preserved and (
+            bool(summary.canonical_facts) or status == ToolResultStatus.FAILED
+        )
+    reduction = 1.0 - (context_bytes / original_bytes if original_bytes else 0.0)
+    return BenchmarkObservation(
+        actual={
+            "tool_calls": calls,
+            "original_bytes": original_bytes,
+            "context_bytes": context_bytes,
+            "reduction": reduction,
+            "evidence_preserved": evidence_preserved,
+            "facts_preserved": facts_preserved,
+        },
+        metrics={
+            "tool_context_reduction": reduction,
+            "tool_evidence_preservation": 1.0 if evidence_preserved else 0.0,
+            "tool_fact_preservation": 1.0 if facts_preserved else 0.0,
+        },
+    )
+
+
+def _tool_result_distill(case: BenchmarkCase) -> BenchmarkObservation:
+    hallucinate = bool(case.input.get("hallucinate"))
+    payload = _tool_result_benchmark_payload("report", 0)
+    envelope = ToolResultEnvelope(
+        run_id=uuid4(),
+        tool_name="get_report",
+        action_hash="benchmark-map-reduce",
+        payload=payload,
+        evidence_ids=("ev_distill",),
+    )
+    router = _BenchmarkDistillationRouter(hallucinate=hallucinate)
+    result = SmallModelToolResultDistiller(
+        router,
+        ToolDistillationPolicy(
+            provider="mock",
+            min_source_chars=1,
+            chunk_chars=8_000,
+            max_chunks=8,
+            batch_size=4,
+            max_attempts=1,
+        ),
+    ).distill(envelope, artifact_id=uuid4())
+    unsupported_rejected = (not hallucinate) or result.summary.deterministic
+    return BenchmarkObservation(
+        actual={
+            "verified": result.summary.verified,
+            "model_distilled": not result.summary.deterministic,
+            "unsupported_claim_rejected": unsupported_rejected,
+            "evidence_preserved": "ev_distill" in result.summary.evidence_ids,
+        },
+        metrics={
+            "tool_distillation_verification": float(result.summary.verified),
+            "tool_distillation_hallucination_rejection": float(unsupported_rejected),
+        },
+    )
+
+
+def _tool_result_project(case: BenchmarkCase) -> BenchmarkObservation:
+    row_count = max(100, int(case.input.get("rows") or 2_000))
+    target = row_count - 1
+    payload = {
+        "rows": [
+            {"customer_state": f"state_{index}", "payment_value": index + 0.25}
+            for index in range(row_count)
+        ],
+        "evidence_ids": ["ev_projection"],
+    }
+    envelope = ToolResultEnvelope(
+        run_id=uuid4(),
+        tool_name="execute_safe_sql",
+        action_hash="benchmark-projection",
+        payload=payload,
+        evidence_ids=("ev_projection",),
+    )
+    summary = reduce_tool_result(envelope).model_copy(update={"verified": True})
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        archived = archive_json_payload(payload, root=root, max_bytes=50_000_000)
+        projection = build_tool_result_projection(
+            artifact_id=uuid4(),
+            storage_root=root,
+            storage_path=archived.storage_path,
+            artifact_size_bytes=archived.size_bytes,
+            summary=summary,
+            chunks=(),
+            query=f"customer_state state_{target}",
+            policy=ProjectionPolicy(max_chars=8_000, scan_max_bytes=50_000_000),
+        )
+    exact = any(f"state_{target}" in item.text for item in projection.excerpts)
+    bounded = projection.context_size_bytes <= 8_000
+    reduction = 1.0 - (
+        projection.context_size_bytes / archived.size_bytes if archived.size_bytes else 0.0
+    )
+    return BenchmarkObservation(
+        actual={
+            "exact_target_preserved": exact,
+            "bounded": bounded,
+            "verified": projection.verified,
+            "reduction": reduction,
+        },
+        metrics={
+            "tool_continuation_exactness": float(exact),
+            "tool_continuation_bounded": float(bounded),
+            "tool_continuation_reduction": reduction,
+        },
+    )
+class _BenchmarkDistillationRouter:
+    def __init__(self, *, hallucinate: bool) -> None:
+        self.hallucinate = hallucinate
+
+    def complete(self, **kwargs: Any) -> Any:
+        payload = json.loads(kwargs["messages"][-1]["content"])
+        if "chunks" in payload:
+            chunks = []
+            for item in payload["chunks"]:
+                quote = str(item["content"])[10:90]
+                chunks.append(
+                    {
+                        "chunk_index": item["chunk_index"],
+                        "summary": (
+                            "该结果包含 999999 个不存在的项目"
+                            if self.hallucinate
+                            else "该分片保留了报告中的业务结论"
+                        ),
+                        "source_quotes": [quote],
+                    }
+                )
+            content = json.dumps({"chunks": chunks}, ensure_ascii=False)
+        else:
+            quote = payload["verified_chunk_summaries"][0]["source_quotes"][0]
+            content = json.dumps(
+                {
+                    "headline": "报告工具结果已完成蒸馏",
+                    "key_findings": ["保留已验证报告结论"],
+                    "source_quotes": [quote],
+                },
+                ensure_ascii=False,
+            )
+        return SimpleNamespace(
+            provider="mock",
+            model="benchmark-distiller",
+            content=content,
+            finish_reason="stop",
+            token_usage={"prompt_tokens": 100, "completion_tokens": 20},
+        )
+
+
+def _tool_result_benchmark_tool(scenario: str) -> str:
+    return {
+        "sql": "execute_safe_sql",
+        "report": "get_report",
+        "python": "execute_python_analysis",
+        "error": "execute_python_analysis",
+    }.get(scenario, "search_datamind_assets")
+
+
+def _tool_result_benchmark_payload(scenario: str, index: int) -> dict[str, Any]:
+    if scenario == "report":
+        return {
+            "report_id": str(uuid4()),
+            "executive_summary": "已验证的业务结论。",
+            "key_findings": [f"结论 {item}: 指标为 {item * 1.25}" for item in range(20)],
+            "markdown": "# Report\n" + ("详细报告内容。" * 20_000),
+        }
+    if scenario == "python":
+        return {
+            "statistics": {"mean": 12.5, "count": 100_000, "run": index},
+            "insights": ["均值为 12.5", "样本量为 100000"],
+            "charts": [
+                {
+                    "chart_type": "scatter",
+                    "data": [{"x": item, "y": item * 2} for item in range(10_000)],
+                }
+            ],
+        }
+    if scenario == "error":
+        return {
+            "error": "ValueError at line 161: invalid generated output\n" + ("trace\n" * 10_000),
+            "attempt": 3,
+        }
+    return {
+        "sql": "SELECT state, SUM(amount) AS total FROM dataset GROUP BY state",
+        "total_rows": 5_000,
+        "rows": [
+            {"state": f"S{item % 32}", "total": item * 0.25, "batch": index}
+            for item in range(5_000)
+        ],
+    }
 
 
 def _semantic_rank(case: BenchmarkCase) -> BenchmarkObservation:

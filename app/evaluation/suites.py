@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ def available_suites() -> tuple[str, ...]:
 
 
 def load_suite_manifest(name: str) -> BenchmarkSuiteManifest:
-    if not name.replace("-", "_").isalnum():
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) is None:
         raise ValueError("Benchmark suite name is invalid.")
     path = BENCHMARK_ROOT / "suites" / f"{name}.json"
     if not path.is_file():

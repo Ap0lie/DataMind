@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, cast
 from uuid import uuid4
 
+import pandas as pd
 import pytest
 
 from app.analysis.agent_loop import (
@@ -12,6 +13,7 @@ from app.analysis.agent_loop import (
     canonical_action_hash,
     classify_tool_error,
 )
+from app.analysis.services import PlannedAnalysis
 from app.api.v1.analysis import _resolve_agent_mode
 from app.core.settings import Settings
 from app.evaluation.agent_loop import AgentLoopBenchmarkOutcome, evaluate_agent_loop_benchmark
@@ -80,6 +82,53 @@ def test_agent_tool_runtime_cannot_open_another_users_dataset(tmp_path) -> None:
             planner_decision=None,
             python_executor=cast(Any, None),
         )
+
+
+def test_agent_tool_runtime_hydrates_archived_evidence_only_on_demand(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = DatasetStoreRepository(str(tmp_path), user_id="owner")
+    dataset = repository.create_dataset(
+        name="sales.csv", source_type="csv", source_metadata={}
+    )
+    calls = 0
+
+    def load_result(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"rows": [{"total": 42}]}
+
+    monkeypatch.setattr("app.analysis.agent_loop.load_evidence_result", load_result)
+    runtime = AgentToolRuntime(
+        repository=repository,
+        job_id=uuid4(),
+        dataset_id=dataset.id,
+        allowed_dataset_ids=(dataset.id,),
+        dataframe=pd.DataFrame([{"total": 1}]),
+        question="total sales",
+        profile=cast(Any, None),
+        plan=PlannedAnalysis(
+            route="sql",
+            category_column=None,
+            metric_column=None,
+            time_column=None,
+            steps=("sum",),
+        ),
+        planner_decision=None,
+        python_executor=cast(Any, None),
+        evidence=(
+            {
+                "evidence_id": "ev_1",
+                "tool_result_artifact_id": str(uuid4()),
+                "result": {"headline": "bounded summary"},
+            },
+        ),
+    )
+
+    assert calls == 0
+    assert runtime._required_evidence("ev_1")["result"]["rows"][0]["total"] == 42
+    assert runtime._required_evidence("ev_1")["result"]["rows"][0]["total"] == 42
+    assert calls == 1
 
 
 def test_loop_request_mode_obeys_deployment_policy(monkeypatch: pytest.MonkeyPatch) -> None:

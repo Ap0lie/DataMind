@@ -811,7 +811,7 @@ export function AssistantPage({ datasets, datasetGroups, reports, onActiveRunsCh
                   <div className="assistant-message-meta"><b>{message.role === "user" ? "你" : "Kimi"}</b><span>{formatTime(message.created_at)}</span>{message.model && <span>{message.model}</span>}</div>
                   {message.attachments.length > 0 && <div className="assistant-message-images">{message.attachments.map((item) => item.attachment_kind === "image" ? <AssistantAttachmentImage key={item.attachment_id} attachment={item} /> : <div className="assistant-message-file" key={item.attachment_id}><FileSpreadsheet size={18} /><span><b>{item.file_name}</b><small>{item.import_status ?? "数据文件"}</small></span></div>)}</div>}
                   <MarkdownText text={message.content || (message.status === "pending" ? "正在准备回答..." : "")} />
-                  {memoryUpdates(message.metadata).map((item, index) => <div key={`${message.message_id}-memory-${index}`} className={`assistant-memory-feedback ${item.event_type === "memory.candidate" ? "candidate" : ""}`}><Brain size={14} /><span>{item.message}</span>{item.event_type === "memory.candidate" && <button type="button" onClick={() => { setWorkbenchTab("memory"); setControlOpen(true); }}>去确认</button>}</div>)}
+                  {memoryUpdates(message.metadata).map((item, index) => <div key={`${message.message_id}-memory-${index}`} className={`assistant-memory-feedback ${item.requires_confirmation ? "candidate" : ""}`}><Brain size={14} /><span>{item.message}</span>{item.requires_confirmation && <button type="button" onClick={() => { setWorkbenchTab("memory"); setControlOpen(true); }}>去确认</button>}</div>)}
                   <MemoryRecall usage={memoryUsage(message.metadata)} onOpenMemory={() => { setWorkbenchTab("memory"); setControlOpen(true); }} />
                   <AssistantEvidenceCards citations={message.citations} onOpenDataset={onOpenDataset} onOpenAnalysis={onOpenAnalysis} onOpenReport={onOpenReport} />
                 </div>
@@ -921,7 +921,7 @@ function inlineText(value: string) {
 function memoryUpdates(metadata: Record<string, unknown>) {
   const value = metadata.memory_updates;
   if (!Array.isArray(value)) return [];
-  return value.filter((item): item is { event_type: string; message: string } => !!item && typeof item === "object" && typeof (item as Record<string, unknown>).event_type === "string" && typeof (item as Record<string, unknown>).message === "string");
+  return value.filter((item): item is { event_type: string; message: string; requires_confirmation?: boolean } => !!item && typeof item === "object" && typeof (item as Record<string, unknown>).event_type === "string" && typeof (item as Record<string, unknown>).message === "string");
 }
 
 type RecalledMemory = {
@@ -1003,7 +1003,7 @@ function recalledMemoryLabel(memory: RecalledMemory) {
 
 function toolLabel(event: AssistantEvent) {
   const labels: Record<string, string> = { search_datamind_assets: "检索 DataMind 资产", get_dataset_context: "读取数据集结构", get_analysis_result: "读取分析结果", get_report: "读取报告", preview_analysis_plan: "规划分析", start_analysis: "运行 DataMind Workflow", get_analysis_status: "检查分析状态", start_cleaning: "运行自主清洗", get_cleaning_status: "检查清洗状态", activate_cleaning_version: "激活清洗版本", rollback_cleaning_version: "回滚清洗版本", update_column_metadata: "更新字段元数据", suggest_relationships: "生成关系建议", save_relationship_plan: "保存关系计划", cancel_analysis: "取消分析", retry_analysis: "重试分析", rename_report: "重命名报告", create_semantic_draft: "创建语义草稿", update_semantic_draft: "更新语义草稿", validate_semantic_model: "校验语义模型", publish_semantic_model: "发布语义模型", soft_delete_asset: "移入回收站", restore_asset: "恢复资产" };
-  const eventLabels: Record<string, string> = { "retrieval.completed": "自动检索", "message.completed": "生成回答", "permission.checked": "权限校验", "action.planned": "准备执行", "action.completed": "操作完成", "action.rolled_back": "操作已撤销", "import.progress": "数据包导入", "asset.recycled": "资产回收", "memory.recalled": "召回相关记忆", "memory.saved": "保存长期记忆", "memory.superseded": "更新长期记忆", "memory.candidate": "待确认记忆", "memory.conflict": "确认记忆冲突", "memory.summary_updated": "更新对话摘要", "memory.experience_saved": "保存分析经验", "memory.experience_stale": "分析经验已失效", "memory.maintenance_failed": "记忆维护异常", "memory.skipped": "跳过记忆维护" };
+  const eventLabels: Record<string, string> = { "retrieval.completed": "自动检索", "message.completed": "生成回答", "permission.checked": "权限校验", "action.planned": "准备执行", "action.completed": "操作完成", "action.rolled_back": "操作已撤销", "import.progress": "数据包导入", "asset.recycled": "资产回收", "memory.extracted": "形成长期记忆", "memory.rejected": "拒绝候选记忆", "memory.recalled": "召回相关记忆", "memory.suppressed": "抑制低相关记忆", "memory.conflicted": "处理记忆冲突", "memory.validated": "验证记忆效果", "memory.feedback": "记录记忆反馈", "memory.dormant": "休眠低质量记忆", "memory.summary_updated": "更新对话摘要", "memory.maintenance_failed": "记忆维护异常" };
   return labels[event.tool_name ?? ""] ?? eventLabels[event.event_type] ?? "Kimi 工具";
 }
 

@@ -40,6 +40,10 @@ TABLES = (
     "assistant_memory_usage",
     "assistant_memory_feedback",
     "assistant_memory_maintenance_jobs",
+    "tool_result_artifacts",
+    "tool_result_summaries",
+    "tool_result_summary_chunks",
+    "tool_result_projections",
     "user_sessions",
 )
 
