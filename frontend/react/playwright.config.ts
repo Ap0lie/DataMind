@@ -10,6 +10,8 @@ const backendURL = `http://127.0.0.1:${backendPort}`;
 const managedFrontendURL = `http://127.0.0.1:${frontendPort}`;
 const externalFrontendURL = process.env.DATAMIND_FRONTEND_URL;
 const reuseExistingServer = process.env.DATAMIND_E2E_REUSE_SERVER === "true";
+const browserChannel = process.env.DATAMIND_E2E_BROWSER_CHANNEL;
+const browserChannelOptions = browserChannel ? { channel: browserChannel } : {};
 const projectPython = path.resolve(
   "../..",
   process.platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python",
@@ -111,7 +113,13 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   projects: [
-    { name: "desktop-chromium", use: { ...devices["Desktop Chrome"] } },
-    { name: "mobile-chromium", use: { ...devices["Pixel 7"] } },
+    {
+      name: "desktop-chromium",
+      use: { ...devices["Desktop Chrome"], ...browserChannelOptions },
+    },
+    {
+      name: "mobile-chromium",
+      use: { ...devices["Pixel 7"], ...browserChannelOptions },
+    },
   ],
 });
