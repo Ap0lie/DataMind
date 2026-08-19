@@ -12,7 +12,7 @@ from app.tool_results.contracts import (
     ToolResultSummary,
 )
 
-_ROW_KEYS = ("rows", "records", "data", "sql_rows")
+_ROW_KEYS = ("rows", "records", "data", "sql_rows", "sql_results")
 _ISSUE_KEYS = ("validation_issues", "issues", "errors")
 _EVIDENCE_KEYS = ("evidence_id", "evidence_ids", "evidence_refs")
 

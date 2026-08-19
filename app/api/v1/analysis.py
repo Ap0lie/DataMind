@@ -15,7 +15,6 @@ from app.analysis.intent_compiler import (
     build_intent_compilation_context,
 )
 from app.analysis.jobs import revoke_analysis_job, start_analysis_job
-from app.analysis.model_router import MCPAnalysisModelRouter
 from app.analysis.multidataset import suggest_dataset_joins
 from app.analysis.runtime import build_analysis_runner
 from app.api.v1.deps import current_user_id
@@ -55,8 +54,14 @@ def create_semantic_plan(
             dataset_group_id=request.dataset_group_id,
             question=request.question,
         )
+        # Plan preview stays deterministic and fast. The queued workflow runs
+        # the authoritative LLM compiler and guarded repair loop before tools.
+        preview_settings = get_settings().model_copy(
+            update={"intent_compiler_mode": "shadow"}
+        )
         compilation = IntentCompilationHarness(
-            model_router=MCPAnalysisModelRouter(),
+            model_router=None,
+            settings=preview_settings,
         ).compile(
             question=request.question,
             context=build_intent_compilation_context(

@@ -600,6 +600,38 @@ def test_only_validated_analysis_becomes_experience_and_drift_marks_it_stale(
         str(dataset.id): str(cleaning_run_id)
     }
 
+    second_report_id = store.save_report(
+        dataset_id=dataset.id,
+        title="订单分析复跑",
+        markdown="# 订单分析复跑",
+        metadata={
+            "structured_report": {"executive_summary": "复跑后订单金额保持增长。"},
+            "analysis_contract": {"objective": "复跑", "metrics": ["order_value"]},
+        },
+    )
+    second_job = store.create_analysis_job(dataset_id=dataset.id, question="重新检查订单金额")
+    store.update_analysis_job(
+        second_job.id,
+        status="completed",
+        result={
+            "analysis_contract": {"objective": "不同表述", "metrics": ["order_value"]},
+            "statistical_verification": {"status": "passed", "checks": []},
+            "validation_issues": [],
+        },
+        report_id=second_report_id,
+        report_terminal_reason="validated",
+        completed=True,
+    )
+    repeated = service.save_analysis_experience(second_job.id)
+
+    assert repeated is not None
+    assert repeated["memory_id"] == experience["memory_id"]
+    assert repeated["version"] == 1
+    assert set(repeated["structured_value"]["source_job_ids"]) == {
+        str(job.id),
+        str(second_job.id),
+    }
+
     recalled = service.retrieve_analysis_experiences(
         question="分析订单金额",
         dataset_id=dataset.id,

@@ -18,6 +18,7 @@ from app.analysis.workflow import (
 from app.core.settings import Settings, get_settings
 from app.mcp.tool_schemas import ModelRouterResponse
 from app.schemas.analysis import (
+    ChartResponse,
     InsightFindingResponse,
     MultimodalInputResponse,
     StatisticalFindingVerdictResponse,
@@ -1050,6 +1051,57 @@ def test_join_cardinality_uses_declared_direction_and_sanitizes_model_claim() ->
     assert "一对一" not in sanitized.executive_summary
     assert "N:1" in sanitized.executive_summary
     assert sanitized.key_findings == ()
+    assert any(
+        issue.finding_ref == "join_cardinality"
+        for issue in sanitized.validation_issues
+    )
+
+
+def test_chart_explanation_cannot_restate_mixed_relationships_as_one_to_one() -> None:
+    relationship_findings = (
+        InsightFindingResponse(
+            title="事实表到主表关系",
+            content="transactions.key → orders.key 为 N:1。",
+            data_source="tool_evidence.relationships",
+        ),
+        InsightFindingResponse(
+            title="主表到维表关系",
+            content="orders.customer_key → customers.customer_key 为 1:1。",
+            data_source="tool_evidence.relationships",
+        ),
+    )
+    fallback_chart = ChartResponse(
+        title="分组金额",
+        chart_type="bar",
+        spec={"x": "segment", "y": "amount"},
+        data=({"segment": "A", "amount": 10},),
+        explanation="该图用于比较不同分组的金额。",
+    )
+    bad_chart = fallback_chart.model_copy(
+        update={"explanation": "所有表之间均为一对一关系，因此金额绝对安全。"}
+    )
+    fallback = StructuredReportResponse(
+        executive_summary="关系证据已验证。",
+        key_findings=relationship_findings,
+        charts=(fallback_chart,),
+        chart_explanations=(fallback_chart.explanation,),
+    )
+    report = fallback.model_copy(
+        update={
+            "charts": (bad_chart,),
+            "chart_explanations": (bad_chart.explanation,),
+        }
+    )
+
+    sanitized, changed = _sanitize_report_cardinality_claims(
+        report=report,
+        fallback=fallback,
+        verified_findings=relationship_findings,
+    )
+
+    assert changed is True
+    assert sanitized.charts[0].explanation == fallback_chart.explanation
+    assert sanitized.chart_explanations == (fallback_chart.explanation,)
     assert any(
         issue.finding_ref == "join_cardinality"
         for issue in sanitized.validation_issues

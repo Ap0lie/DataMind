@@ -56,6 +56,7 @@ class AnalysisModelRouter(Protocol):
         max_tokens: int | None = None,
         metadata: dict[str, object] | None = None,
         context: PromptEnvelope | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> ModelRouterResponse:
         """Stream visible answer tokens and return the final provider metadata."""
 
@@ -124,6 +125,7 @@ class MCPAnalysisModelRouter:
         max_tokens: int | None = None,
         metadata: dict[str, object] | None = None,
         context: PromptEnvelope | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> ModelRouterResponse:
         resolved_max_tokens = max_tokens or self._settings.llm_max_tokens
         messages, budget_metadata = self._prepare_messages(
@@ -151,6 +153,7 @@ class MCPAnalysisModelRouter:
                 temperature=temperature,
                 max_tokens=resolved_max_tokens,
                 metadata=request_metadata,
+                cancel_check=cancel_check,
             )
         )
 
@@ -279,6 +282,7 @@ class MCPAnalysisModelRouter:
         temperature: float,
         max_tokens: int | None,
         metadata: dict[str, object],
+        cancel_check: Callable[[], None] | None,
     ) -> ModelRouterResponse:
         enforce_rate_limit(
             f"llm:{metadata.get('user_id') or 'shared'}:{metadata.get('agent') or 'unknown'}",
@@ -303,6 +307,7 @@ class MCPAnalysisModelRouter:
         return await ConfiguredModelRouterBackend(self._settings).stream_complete(
             request,
             on_delta,
+            cancel_check=cancel_check,
         )
 
 

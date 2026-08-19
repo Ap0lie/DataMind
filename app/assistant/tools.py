@@ -839,6 +839,8 @@ class AssistantToolRuntime:
         )
         join_context = _compact_report_join_context(metadata)
         chart_context = _compact_report_chart_context(structured.get("charts"))
+        sql_results = _bounded_report_metadata(structured.get("sql_results") or [])
+        sql_result_scope = _bounded_report_metadata(metadata.get("sql_result_scope") or {})
         result = {
             "report_id": str(report_id),
             "dataset_id": str(dataset_id),
@@ -855,6 +857,8 @@ class AssistantToolRuntime:
             "statistical_verification": statistical_verification,
             "join_context": join_context,
             "chart_context": chart_context,
+            "sql_results": sql_results,
+            "sql_result_scope": sql_result_scope,
             "key_findings": (structured.get("key_findings") or [])[:8],
             "validation_issues": (structured.get("validation_issues") or [])[:4],
             "recommended_next_steps": (structured.get("recommended_next_steps") or [])[:5],
@@ -880,6 +884,8 @@ class AssistantToolRuntime:
                 "statistical_verification": statistical_verification,
                 "join_context": join_context,
                 "chart_context": chart_context,
+                "sql_results": sql_results,
+                "sql_result_scope": sql_result_scope,
                 "key_findings": [
                     str(item.get("content") or "").strip()
                     for item in result["key_findings"][:3]

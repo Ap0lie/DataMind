@@ -13,9 +13,11 @@ from app.analysis.services import (
     _apply_plan_filters,
     _build_final_insights,
     _build_validation_issues,
+    _chart_explanation,
     _structured_report,
     render_structured_report_html,
 )
+from app.analysis.sql_scope import analyze_sql_result_scope
 from app.analysis.statistical_verifier import (
     qualify_observational_findings,
     reportable_findings,
@@ -446,6 +448,7 @@ def _build_report_draft(
         validation_issues=issues,
         analysis_framework=framework,
         charts=charts,
+        analysis_row_count=_verified_population_row_count(verification),
     )
     structured = baseline_structured
     source = "rules"
@@ -662,6 +665,11 @@ _CARDINALITY_CLAIM_PATTERNS = {
     "M:N": re.compile(r"(?:[Mm]\s*:\s*[Nn]|多对多|many[- ]to[- ]many)", re.IGNORECASE),
 }
 
+_UNIVERSAL_CARDINALITY_RE = re.compile(
+    r"(?:(?:均|全部|都).{0,12}(?:为|是)|(?:all|both).{0,24}(?:are|is))",
+    re.IGNORECASE,
+)
+
 
 def _numeric_claim_tokens(value: Any) -> set[str]:
     if hasattr(value, "model_dump"):
@@ -682,6 +690,22 @@ def _cardinality_claims(value: str) -> set[str]:
     }
 
 
+def _unsupported_cardinality_claim(
+    value: str,
+    trusted_claims: set[str],
+) -> bool:
+    claims = _cardinality_claims(value)
+    if not claims:
+        return False
+    if claims - trusted_claims:
+        return True
+    return (
+        len(trusted_claims) > 1
+        and len(claims) == 1
+        and bool(_UNIVERSAL_CARDINALITY_RE.search(value))
+    )
+
+
 def _sanitize_report_cardinality_claims(
     *,
     report: StructuredReportResponse,
@@ -700,17 +724,37 @@ def _sanitize_report_cardinality_claims(
         for finding in relationship_findings
         for claim in _cardinality_claims(finding.content)
     }
-    summary_claims = _cardinality_claims(report.executive_summary)
-    unsupported_summary = bool(summary_claims - trusted_claims)
+    unsupported_summary = _unsupported_cardinality_claim(
+        report.executive_summary,
+        trusted_claims,
+    )
     filtered_findings = tuple(
         finding
         for finding in report.key_findings
-        if not (
-            (claims := _cardinality_claims(finding.content))
-            and claims - trusted_claims
-        )
+        if not _unsupported_cardinality_claim(finding.content, trusted_claims)
     )
-    changed = unsupported_summary or len(filtered_findings) != len(report.key_findings)
+    fallback_charts = {chart.title: chart for chart in fallback.charts}
+    sanitized_charts: list[ChartResponse] = []
+    chart_changed = False
+    for chart in report.charts:
+        if not _cardinality_claims(chart.explanation):
+            sanitized_charts.append(chart)
+            continue
+        fallback_chart = fallback_charts.get(chart.title)
+        safe_explanation = fallback_chart.explanation if fallback_chart else ""
+        if _cardinality_claims(safe_explanation):
+            safe_explanation = ""
+        sanitized_charts.append(
+            chart.model_copy(
+                update={"explanation": safe_explanation or _chart_explanation(chart)}
+            )
+        )
+        chart_changed = True
+    changed = (
+        unsupported_summary
+        or len(filtered_findings) != len(report.key_findings)
+        or chart_changed
+    )
     if not changed:
         return report, False
     trusted_summary = fallback.executive_summary
@@ -725,13 +769,23 @@ def _sanitize_report_cardinality_claims(
                     trusted_summary if unsupported_summary else report.executive_summary
                 ),
                 "key_findings": filtered_findings,
+                "charts": tuple(sanitized_charts),
+                "chart_explanations": (
+                    tuple(
+                        chart.explanation
+                        for chart in sanitized_charts
+                        if chart.explanation
+                    )
+                    if chart_changed
+                    else report.chart_explanations
+                ),
                 "validation_issues": (
                     *report.validation_issues,
                     ValidationIssueResponse(
                         severity="warning",
                         finding_ref="join_cardinality",
                         issue=(
-                            "模型报告包含未被关系画像支持的 Join 基数声明；"
+                            "模型报告或图表说明包含未被关系画像支持的 Join 基数声明；"
                             "已恢复为确定性关系方向和基数。"
                         ),
                         suggestion="仅引用关系证据中的表方向与 1:1、1:N、N:1 或 M:N。",
@@ -741,6 +795,20 @@ def _sanitize_report_cardinality_claims(
         ),
         True,
     )
+
+
+def _verified_population_row_count(
+    verification: StatisticalVerificationResponse | None,
+) -> int | None:
+    if verification is None:
+        return None
+    for check in verification.checks:
+        if check.code != "population_non_empty" or check.status != "passed":
+            continue
+        value = check.details.get("row_count")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return max(0, int(value))
+    return None
 
 
 def _unsupported_summary_numbers(
@@ -772,13 +840,20 @@ def _unsupported_summary_numbers(
         if isinstance(python_result, PythonAnalysisResponse)
         else None
     )
-    analysis_rows = (
+    analysis_rows = _verified_population_row_count(verification) or (
         max(0, int(row_value))
         if isinstance(row_value, (int, float)) and not isinstance(row_value, bool)
         else profile.row_count
     )
-    trusted_profile_phrase = f"基于 {analysis_rows} 行、{profile.column_count} 列数据"
-    summary = summary.replace(trusted_profile_phrase, "基于数据", 1)
+    trusted_scope_phrases = (
+        f"基于 {analysis_rows} 行、{profile.column_count} 列数据",
+        (
+            f"在 {profile.row_count} 行准备数据中，按当前过滤条件分析 "
+            f"{analysis_rows} 行、{profile.column_count} 列数据"
+        ),
+    )
+    for phrase in trusted_scope_phrases:
+        summary = summary.replace(phrase, "基于数据", 1)
     return sorted(_numeric_claim_tokens(summary) - allowed)
 
 
@@ -1079,6 +1154,12 @@ def _report_commit_node(
                 "model_router_error": state.get("model_router_error"),
                 "sql_source": state.get("sql_source", "none"),
                 "sql_validation_error": state.get("sql_validation_error"),
+                "sql_result_scope": analyze_sql_result_scope(
+                    state["sql_result"].sql if state.get("sql_result") else None,
+                    returned_rows=(
+                        len(state["sql_result"].rows) if state.get("sql_result") else None
+                    ),
+                ).as_dict(),
                 "structured_report": structured.model_dump(mode="json"),
                 "html_report": html,
                 "validation_issue_count": len(state.get("validation_issues", ())),
@@ -1678,6 +1759,10 @@ def _report_node(
                 "model_router_error": model_router_error,
                 "sql_source": state.get("sql_source", "none"),
                 "sql_validation_error": state.get("sql_validation_error"),
+                "sql_result_scope": analyze_sql_result_scope(
+                    sql_result.sql if sql_result else None,
+                    returned_rows=len(sql_result.rows) if sql_result else None,
+                ).as_dict(),
                 "structured_report": structured_report.model_dump(mode="json"),
                 "html_report": html_report,
                 "validation_issue_count": len(validation_issues),

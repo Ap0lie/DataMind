@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import PurePath
 from typing import Any
 from uuid import UUID
@@ -538,37 +539,55 @@ def _relationship_constraints(
     assets: tuple[dict[str, Any], ...],
 ) -> tuple[RelationshipConstraint, ...]:
     output: list[RelationshipConstraint] = []
+    seen: set[tuple[UUID, UUID, str, int, int]] = set()
     for match in _RELATIONSHIP_RE.finditer(question):
-        mentioned = sorted(
-            (
-                min(found.start() for found in matches),
-                UUID(str(asset["dataset_id"])),
-            )
-            for asset in assets
-            if (
-                matches := tuple(
-                    found
-                    for alias in _asset_patterns(str(asset["name"]))
-                    if (found := alias.search(match.group(0))) is not None
-                )
-            )
-        )
+        mentioned = _ordered_relationship_assets(match.group(0), assets)
         if len(mentioned) < 2:
             continue
         span = IntentSourceSpan(text=match.group(0), start=match.start(), end=match.end())
-        output.append(
-            RelationshipConstraint(
-                left_dataset_id=mentioned[0][1],
-                right_dataset_id=mentioned[1][1],
-                polarity=(
-                    "forbidden"
-                    if _NEGATION_RE.search(match.group(0))
-                    else "required"
-                ),
-                source_span=span,
+        polarity = "forbidden" if _NEGATION_RE.search(match.group(0)) else "required"
+        for left, right in pairwise(mentioned):
+            signature = (left, right, polarity, match.start(), match.end())
+            if signature in seen:
+                continue
+            seen.add(signature)
+            output.append(
+                RelationshipConstraint(
+                    left_dataset_id=left,
+                    right_dataset_id=right,
+                    polarity=polarity,
+                    source_span=span,
+                )
             )
-        )
     return tuple(output)
+
+
+def _ordered_relationship_assets(
+    text: str,
+    assets: tuple[dict[str, Any], ...],
+) -> tuple[UUID, ...]:
+    """Return unique relationship participants in source-text order.
+
+    A relationship clause may describe a path (A -> B -> C). Treating that
+    clause as one pair silently discards the final edge, so downstream scope
+    resolution receives adjacent edges instead.
+    """
+
+    mentions: list[tuple[int, UUID]] = []
+    for asset in assets:
+        dataset_id = UUID(str(asset["dataset_id"]))
+        positions = [
+            match.start()
+            for pattern in _asset_patterns(str(asset["name"]))
+            for match in pattern.finditer(text)
+        ]
+        if positions:
+            mentions.append((min(positions), dataset_id))
+    ordered: list[UUID] = []
+    for _, dataset_id in sorted(mentions):
+        if dataset_id not in ordered:
+            ordered.append(dataset_id)
+    return tuple(ordered)
 
 
 def _asset_matches(question: str, name: str) -> list[re.Match[str]]:

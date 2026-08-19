@@ -820,8 +820,22 @@ class AssistantMemoryService:
         metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
         raw_contract = result.get("analysis_contract") or metadata.get("analysis_contract")
         contract: dict[str, Any] = raw_contract if isinstance(raw_contract, dict) else {}
+        tool_sequence = _successful_tool_sequence(job.events)
+        experience_identity = _analysis_experience_identity(
+            contract=contract,
+            semantic_model_id=job.semantic_model_id,
+            semantic_model_version=job.semantic_model_version,
+            join_plan=job.join_plan,
+            relationship_plan=job.relationship_plan,
+            tool_sequence=tool_sequence,
+        )
         subject = "experience:" + hashlib.sha256(
-            json.dumps(contract, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(
+                experience_identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
         ).hexdigest()[:24]
         scope_type = "dataset_group" if job.dataset_group_id else "dataset"
         scope_id = job.dataset_group_id or job.dataset_id
@@ -831,10 +845,12 @@ class AssistantMemoryService:
             "semantic_model_version": job.semantic_model_version,
             "join_plan": list(job.join_plan),
             "relationship_plan": list(job.relationship_plan),
-            "tool_sequence": _successful_tool_sequence(job.events),
+            "tool_sequence": tool_sequence,
             "result_summary": _experience_result_summary(metadata),
             "asset_fingerprint": self._asset_fingerprint(job),
             "report_id": str(job.report_id),
+            "experience_signature": _stable_hash(experience_identity),
+            "source_job_ids": [str(job.id)],
         }
         return self._save_memory(
             memory_type="analysis_experience",
@@ -1301,6 +1317,66 @@ def _experience_result_summary(metadata: dict[str, Any]) -> dict[str, Any]:
 def _experience_content(question: str, structured: dict[str, Any]) -> str:
     tools = "、".join(structured.get("tool_sequence") or []) or "确定性分析路线"
     return f"已验证分析经验：{_truncate_middle(question, 500)}；成功路线：{tools}。"
+
+
+def _analysis_experience_identity(
+    *,
+    contract: dict[str, Any],
+    semantic_model_id: UUID | None,
+    semantic_model_version: int | None,
+    join_plan: Iterable[Any],
+    relationship_plan: Iterable[Any],
+    tool_sequence: Iterable[str],
+) -> dict[str, Any]:
+    """Return the stable execution semantics of a validated analysis."""
+
+    return {
+        "contract": {
+            "contract_version": contract.get("contract_version"),
+            "dataset_ids": sorted(str(item) for item in contract.get("dataset_ids") or ()),
+            "analysis_type": _normalized_scalar(contract.get("analysis_type")),
+            "metric": _normalized_scalar(contract.get("metric")),
+            "metrics": sorted(str(item) for item in contract.get("metrics") or ()),
+            "dimensions": sorted(str(item) for item in contract.get("dimensions") or ()),
+            "time_field": _normalized_scalar(contract.get("time_field")),
+            "aggregations": _canonical_sequence(contract.get("aggregations") or ()),
+            "filters": _canonical_sequence(contract.get("filters") or ()),
+            "grain": sorted(str(item) for item in contract.get("grain") or ()),
+            "method": _normalized_scalar(contract.get("method")),
+            "causal_claim_allowed": bool(contract.get("causal_claim_allowed")),
+        },
+        "semantic_model_id": str(semantic_model_id) if semantic_model_id else None,
+        "semantic_model_version": semantic_model_version,
+        "join_plan": _canonical_sequence(join_plan),
+        "relationship_plan": _canonical_sequence(relationship_plan),
+        "tool_sequence": list(dict.fromkeys(str(item) for item in tool_sequence if item)),
+    }
+
+
+def _canonical_sequence(values: Iterable[Any]) -> list[Any]:
+    normalized = [_canonical_execution_value(value) for value in values]
+    return sorted(
+        normalized,
+        key=lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+    )
+
+
+def _canonical_execution_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_execution_value(item)
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+            if item is not None
+        }
+    if isinstance(value, list | tuple | set):
+        return [_canonical_execution_value(item) for item in value]
+    return _normalized_scalar(value)
+
+
+def _normalized_scalar(value: Any) -> Any:
+    return " ".join(value.split()) if isinstance(value, str) else value
 
 
 def _stable_hash(value: Any) -> str:

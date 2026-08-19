@@ -16,6 +16,7 @@ from app.analysis.query_intent import (
     negated_grouping_columns,
     strip_negated_clauses,
 )
+from app.analysis.sql_scope import SQLResultScope, analyze_sql_result_scope
 from app.analysis.text_analysis import run_text_analysis_toolbox
 from app.analysis.validators import validate_chart_specs, validate_findings_traceability
 from app.schemas.analysis import (
@@ -247,6 +248,10 @@ class AnalysisService:
             metadata={
                 "question": question,
                 "route": plan.route,
+                "sql_result_scope": analyze_sql_result_scope(
+                    sql_result.sql if sql_result else None,
+                    returned_rows=len(sql_result.rows) if sql_result else None,
+                ).as_dict(),
                 "structured_report": structured_report.model_dump(mode="json"),
                 "html_report": html_report,
             },
@@ -1429,6 +1434,12 @@ def _sql_findings(
     )
     evidence_ref = "; ".join(f"evidence_id:{item}" for item in evidence_ids)
     source = "sql_result.rows"
+    result_scope = analyze_sql_result_scope(
+        sql_result.sql if sql_result else None,
+        returned_rows=len(rows),
+    )
+    partial_limit = result_scope.limit if result_scope.is_partial else None
+    scope_title, scope_intro, scope_warning = _sql_scope_language(result_scope)
     findings: list[InsightFindingResponse] = []
     ordered_values = [column for column in numeric_columns if column in values]
     if ordered_values:
@@ -1438,16 +1449,33 @@ def _sql_findings(
         )
         findings.append(
             InsightFindingResponse(
-                title="核心指标概览",
-                content=summary + "。",
+                title=scope_title,
+                content=(
+                    f"{scope_intro}：{summary}。"
+                    if scope_intro
+                    else summary + "。"
+                ),
                 data_source=source,
                 evidence=(
                     f"{evidence_ref}; 基于 {len(rows)} 个"
                     f"{_time_label(time_column) if time_column else '结果'}分组汇总"
+                    + (
+                        f"；{scope_warning}"
+                        if scope_warning
+                        else ""
+                    )
                 ).strip("; "),
                 confidence="high",
-                business_impact="形成经营规模、效率和履约表现的统一基线。",
-                recommended_action="按相同指标口径持续监控，并对显著偏离整体水平的期间下钻分析。",
+                business_impact=(
+                    "仅反映 SQL 返回范围，不能替代完整结果的总体规模基线。"
+                    if partial_limit is not None
+                    else "形成经营规模、效率和履约表现的统一基线。"
+                ),
+                recommended_action=(
+                    "如需总体规模或完整排名，应移除结果限制后重新计算。"
+                    if partial_limit is not None
+                    else "按相同指标口径持续监控，并对显著偏离整体水平的期间下钻分析。"
+                ),
             )
         )
 
@@ -1533,6 +1561,41 @@ def _sql_findings(
                     )
                 )
     return tuple(findings)
+
+
+def _sql_scope_language(result_scope: SQLResultScope) -> tuple[str, str, str]:
+    limit = result_scope.limit
+    if limit is None or not result_scope.is_partial:
+        return "核心指标概览", "", ""
+    if result_scope.kind == "top_n_groups":
+        return (
+            f"前 {limit} 个分组指标小计",
+            f"查询返回的前 {limit} 个分组小计",
+            f"SQL 仅返回降序排名前 {limit} 个分组，不能视为全量总计",
+        )
+    if result_scope.kind == "bottom_n_groups":
+        return (
+            f"最低 {limit} 个分组指标小计",
+            f"查询返回的最低 {limit} 个分组小计",
+            f"SQL 仅返回升序排列的最低 {limit} 个分组，不能视为全量总计",
+        )
+    if result_scope.kind == "ranked_groups":
+        return (
+            f"排序后的 {limit} 个分组指标小计",
+            f"查询返回排序后的 {limit} 个分组小计",
+            f"SQL 仅返回排序后的 {limit} 个分组，不能视为全量总计",
+        )
+    if result_scope.kind == "limited_groups":
+        return (
+            f"有限分组结果（最多 {limit} 个）",
+            f"查询返回最多 {limit} 个未排序分组的小计",
+            f"SQL 未定义排序且限制为 {limit} 个分组，不能视为排名或全量总计",
+        )
+    return (
+        f"有限结果样本（最多 {limit} 行）",
+        f"查询仅返回最多 {limit} 行结果的汇总",
+        f"SQL 结果限制为 {limit} 行，不能视为全量总体",
+    )
 
 
 def _is_average_metric(column: str) -> bool:
@@ -1688,10 +1751,15 @@ def _structured_report(
     validation_issues: tuple[ValidationIssueResponse, ...],
     analysis_framework: AnalysisFrameworkResponse | None = None,
     charts: tuple[ChartResponse, ...] | None = None,
+    analysis_row_count: int | None = None,
     provider: str | None = None,
     model: str | None = None,
 ) -> StructuredReportResponse:
-    analysis_row_count = _analysis_row_count(profile, python_result)
+    effective_row_count = _analysis_row_count(
+        profile,
+        python_result,
+        explicit_row_count=analysis_row_count,
+    )
     summary_findings = " ".join(
         dict.fromkeys(finding.content for finding in final_insights[:2])
     )
@@ -1704,8 +1772,7 @@ def _structured_report(
     )
     return StructuredReportResponse(
         executive_summary=(
-            f"围绕“{question}”，DataMind 基于 {analysis_row_count} 行、"
-            f"{profile.column_count} 列数据完成分析。"
+            f"围绕“{question}”，{_analysis_scope_text(profile, effective_row_count)}"
             f"{summary_findings or '已完成基础数据分析。'}"
         ),
         analysis_context=(
@@ -1736,11 +1803,29 @@ def _structured_report(
 def _analysis_row_count(
     profile: DatasetProfileResponse,
     python_result: PythonAnalysisResponse | None,
+    *,
+    explicit_row_count: int | None = None,
 ) -> int:
+    if explicit_row_count is not None:
+        return max(0, int(explicit_row_count))
     value = python_result.statistics.get("rows") if python_result else None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return max(0, int(value))
     return profile.row_count
+
+
+def _analysis_scope_text(
+    profile: DatasetProfileResponse,
+    analysis_row_count: int,
+) -> str:
+    if analysis_row_count != profile.row_count:
+        return (
+            f"DataMind 在 {profile.row_count} 行准备数据中，按当前过滤条件分析 "
+            f"{analysis_row_count} 行、{profile.column_count} 列数据。"
+        )
+    return (
+        f"DataMind 基于 {analysis_row_count} 行、{profile.column_count} 列数据完成分析。"
+    )
 
 
 def _chart_explanation(chart: ChartResponse) -> str:

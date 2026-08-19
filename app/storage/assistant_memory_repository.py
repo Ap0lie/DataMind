@@ -139,8 +139,12 @@ class AssistantMemoryRepository:
                 self._merge_source(
                     connection,
                     row=equivalent,
+                    content=content,
+                    structured_value=structured_value or {},
+                    typed_value=typed_value or structured_value or {},
                     source_conversation_id=source_conversation_id,
                     source_message_id=source_message_id,
+                    source_job_id=source_job_id,
                     explicit=explicit,
                     confidence=confidence,
                     pinned=pinned,
@@ -223,8 +227,12 @@ class AssistantMemoryRepository:
         connection: Any,
         *,
         row: Any,
+        content: str,
+        structured_value: dict[str, Any],
+        typed_value: dict[str, Any],
         source_conversation_id: UUID | None,
         source_message_id: UUID | None,
+        source_job_id: UUID | None,
         explicit: bool,
         confidence: float,
         pinned: bool,
@@ -233,11 +241,22 @@ class AssistantMemoryRepository:
         sources = list(_loads(row["source_message_ids"], []))
         if source_message_id and str(source_message_id) not in sources:
             sources.append(str(source_message_id))
+        merged_structured = structured_value
+        if str(row["memory_type"]) == "analysis_experience":
+            previous = _loads(row["structured_value"], {})
+            source_jobs = list(previous.get("source_job_ids") or ())
+            for candidate in (row["source_job_id"], source_job_id):
+                if candidate and str(candidate) not in source_jobs:
+                    source_jobs.append(str(candidate))
+            merged_structured = {**previous, **structured_value, "source_job_ids": source_jobs}
+            typed_value = {"type": "analysis_experience", "value": merged_structured}
         connection.execute(
             """
             UPDATE assistant_memories
             SET source_conversation_id=COALESCE(?,source_conversation_id),
                 source_message_id=COALESCE(?,source_message_id),source_message_ids=?,
+                source_job_id=COALESCE(?,source_job_id),content=?,structured_value=?,
+                typed_value=?,
                 explicit=CASE WHEN explicit OR ? THEN TRUE ELSE FALSE END,
                 confidence=CASE WHEN confidence>? THEN confidence ELSE ? END,
                 pinned=CASE WHEN pinned OR ? THEN TRUE ELSE FALSE END,updated_at=?
@@ -247,6 +266,10 @@ class AssistantMemoryRepository:
                 str(source_conversation_id) if source_conversation_id else None,
                 str(source_message_id) if source_message_id else None,
                 json.dumps(sources, ensure_ascii=False),
+                str(source_job_id) if source_job_id else None,
+                content,
+                json.dumps(merged_structured, ensure_ascii=False, default=str),
+                json.dumps(typed_value, ensure_ascii=False, default=str),
                 bool(explicit),
                 float(confidence),
                 float(confidence),
@@ -1266,9 +1289,12 @@ def _maintenance_job(row: Any) -> dict[str, Any]:
 
 
 def _same_value(row: Any, content: str, structured_value: dict[str, Any]) -> bool:
-    left = json.dumps(
-        _loads(row["structured_value"], {}), ensure_ascii=False, sort_keys=True, default=str
-    )
+    stored = _loads(row["structured_value"], {})
+    left_signature = stored.get("experience_signature")
+    right_signature = structured_value.get("experience_signature")
+    if left_signature and left_signature == right_signature:
+        return True
+    left = json.dumps(stored, ensure_ascii=False, sort_keys=True, default=str)
     right = json.dumps(structured_value, ensure_ascii=False, sort_keys=True, default=str)
     return " ".join(str(row["content"]).casefold().split()) == " ".join(
         content.casefold().split()

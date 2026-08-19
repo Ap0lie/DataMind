@@ -5,7 +5,15 @@ from uuid import uuid4
 import pandas as pd
 import pytest
 
-from app.analysis.services import AnalysisService, DatasetProfiler, _plan
+from app.analysis.services import (
+    AnalysisService,
+    DatasetProfiler,
+    _plan,
+    _sql_findings,
+    _structured_report,
+)
+from app.analysis.sql_scope import analyze_sql_result_scope
+from app.schemas.analysis import SQLAnalysisResponse
 from app.storage.dataset_store import DatasetStoreRepository
 
 
@@ -31,6 +39,109 @@ def test_dataset_profiler_returns_v1_profile(tmp_path) -> None:
     assert profile.duplicate_row_count == 1
     assert profile.numeric_columns == ("sales", "profit")
     assert profile.categorical_columns == ("region",)
+
+
+def test_grouped_limited_sql_is_reported_as_top_n_subtotal() -> None:
+    sql_result = SQLAnalysisResponse(
+        sql=(
+            'SELECT "segment", SUM("amount") AS "total_amount" FROM dataset '
+            'GROUP BY "segment" ORDER BY "total_amount" DESC LIMIT 3'
+        ),
+        rows=(
+            {"segment": "A", "total_amount": 30},
+            {"segment": "B", "total_amount": 20},
+            {"segment": "C", "total_amount": 10},
+        ),
+        explanation="Top segments",
+    )
+
+    scope = analyze_sql_result_scope(sql_result.sql, returned_rows=3)
+    findings = _sql_findings(
+        question="列出金额最高的三个分组",
+        sql_result=sql_result,
+        python_result=None,
+    )
+
+    assert scope.kind == "top_n_groups"
+    assert scope.limit == 3
+    assert findings[0].title == "前 3 个分组指标小计"
+    assert "不能视为全量总计" in findings[0].evidence
+    assert "总体规模" in findings[0].business_impact
+
+
+@pytest.mark.parametrize(
+    ("order_clause", "expected_kind", "expected_title"),
+    [
+        ("", "limited_groups", "有限分组结果"),
+        ('ORDER BY "total_cost" ASC', "bottom_n_groups", "最低 3 个分组"),
+        ('ORDER BY "total_cost" DESC', "top_n_groups", "前 3 个分组"),
+        (
+            'ORDER BY "total_cost" DESC, "warehouse" ASC',
+            "ranked_groups",
+            "排序后的 3 个分组",
+        ),
+    ],
+)
+def test_group_limit_semantics_follow_ordering(
+    order_clause: str,
+    expected_kind: str,
+    expected_title: str,
+) -> None:
+    sql_result = SQLAnalysisResponse(
+        sql=(
+            'SELECT "warehouse", SUM("cost") AS "total_cost" FROM dataset '
+            f'GROUP BY "warehouse" {order_clause} LIMIT 3'
+        ),
+        rows=(
+            {"warehouse": "North", "total_cost": 30},
+            {"warehouse": "West", "total_cost": 20},
+            {"warehouse": "South", "total_cost": 10},
+        ),
+        explanation="Warehouse costs",
+    )
+
+    scope = analyze_sql_result_scope(sql_result.sql, returned_rows=3)
+    findings = _sql_findings(
+        question="比较仓库成本",
+        sql_result=sql_result,
+        python_result=None,
+    )
+
+    assert scope.kind == expected_kind
+    assert expected_title in findings[0].title
+    assert "不能视为" in findings[0].evidence
+
+
+def test_limited_rows_are_never_described_as_a_complete_population() -> None:
+    scope = analyze_sql_result_scope(
+        'SELECT "event_type", "duration_ms" FROM dataset LIMIT 25',
+        returned_rows=25,
+    )
+
+    assert scope.kind == "limited_rows"
+    assert scope.is_partial is True
+    assert scope.grouped is False
+
+
+def test_structured_report_distinguishes_prepared_and_filtered_rows() -> None:
+    profile = DatasetProfiler().profile(
+        dataset_id=uuid4(),
+        records=[{"segment": "A", "amount": index} for index in range(10)],
+    )
+
+    report = _structured_report(
+        question="只分析有效记录",
+        profile=profile,
+        sql_result=None,
+        python_result=None,
+        rounds=(),
+        final_insights=(),
+        validation_issues=(),
+        analysis_row_count=7,
+    )
+
+    assert "10 行准备数据" in report.executive_summary
+    assert "按当前过滤条件分析 7 行" in report.executive_summary
 
 
 def test_planner_fallback_does_not_restore_a_negated_grouping_dimension() -> None:
