@@ -7,7 +7,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       DATAMIND_DEFAULT_LLM_PROVIDER: mock
       DATAMIND_PLANNER_LLM_PROVIDER: mock
@@ -97,7 +97,18 @@ jobs:
       - name: Build frontend
         run: npm --prefix frontend/react run build
 
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('frontend/react/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
       - name: Install Playwright Chromium
+        timeout-minutes: 15
+        env:
+          PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT: "120000"
         run: npm --prefix frontend/react exec -- playwright install --with-deps chromium
 
       - name: Playwright end-to-end tests
