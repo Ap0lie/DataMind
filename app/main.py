@@ -13,6 +13,7 @@ from app.mcp.bootstrap import build_mcp_runtime
 from app.observability import configure_observability
 from app.storage.assistant_memory_repository import AssistantMemoryRepository
 from app.storage.dataset_store import DatasetStoreRepository
+from app.storage.tool_result_repository import ToolResultRepository
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,15 @@ def _purge_expired_assets(settings: Settings) -> int:
         settings.dataset_store_path,
         user_id="default",
     )
-    user_ids = set(bootstrap.list_asset_user_ids()) | set(memory_bootstrap.list_user_ids())
+    tool_bootstrap = ToolResultRepository(
+        settings.dataset_store_path,
+        user_id="default",
+    )
+    user_ids = (
+        set(bootstrap.list_asset_user_ids())
+        | set(memory_bootstrap.list_user_ids())
+        | set(tool_bootstrap.list_user_ids())
+    )
     total = 0
     for user_id in user_ids:
         total += DatasetStoreRepository(
@@ -152,6 +161,17 @@ def _purge_expired_assets(settings: Settings) -> int:
             retention_days=settings.assistant_memory_recycle_days,
         )
         total += memory_repository.purge_expired()
+        total += ToolResultRepository(
+            settings.dataset_store_path,
+            user_id=user_id,
+        ).purge_expired()
+    orphan_files = tool_bootstrap.purge_orphan_files()
+    total += orphan_files
+    logger.info(
+        "asset_cleanup.completed total=%s tool_orphan_files=%s",
+        total,
+        orphan_files,
+    )
     return total
 
 

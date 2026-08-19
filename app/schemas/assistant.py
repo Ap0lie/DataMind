@@ -293,6 +293,9 @@ class AssistantMemoryUsageResponse(ApiModel):
     recency_score: float
     reason: str
     suppression_reason: str | None = None
+    agent: str = "unknown"
+    validation_result: str = "not_validated"
+    validated_at: str | None = None
     scope_type: AssistantMemoryScopeType
     created_at: str
 

@@ -434,7 +434,9 @@ def test_analysis_workflow_runner_executes_planner_sql_python_report(tmp_path) -
         "multimodal_context",
         "multi_dataset_context",
         "experience_context",
+        "approved_memory_context",
     }
+    assert report_payload["approved_memory_context"] == []
     assert report_content[1]["type"] == "image_url"
     planner_call = next(call for call in model_router.calls if call["metadata"]["agent"] == "planner")
     assert "experience_context" in planner_call["messages"][1]["content"]

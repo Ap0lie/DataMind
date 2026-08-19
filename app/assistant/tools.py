@@ -26,6 +26,10 @@ from app.schemas.prompt_overrides import AgentPromptOverrides
 from app.semantic.service import SemanticLayerService
 from app.storage.assistant_repository import AssistantRepository
 from app.storage.dataset_store import DatasetStoreRepository
+from app.storage.tool_result_repository import ToolResultRepository
+from app.tool_results.contracts import ToolResultEnvelope, ToolResultStatus
+from app.tool_results.distiller import build_tool_result_distiller
+from app.tool_results.reducers import reduce_tool_result
 
 
 def _tool(
@@ -114,6 +118,19 @@ ASSISTANT_READ_TOOLS: tuple[dict[str, Any], ...] = (
         "Read one cleaning job status.",
         {"dataset_id": {"type": "string"}, "job_id": {"type": "string"}},
         required=("dataset_id", "job_id"),
+    ),
+    _tool(
+        "inspect_tool_result",
+        (
+            "Read one bounded exact continuation from a tool-result artifact produced in this "
+            "Kimi run. Use only when the existing summary omits information required by the "
+            "current question."
+        ),
+        {
+            "artifact_id": {"type": "string"},
+            "query": {"type": "string", "maxLength": 1000},
+        },
+        required=("artifact_id", "query"),
     ),
     _tool(
         "suggest_relationships",
@@ -296,6 +313,7 @@ class AssistantToolRuntime:
         run_id: UUID,
         conversation: dict[str, Any],
         event: Callable[..., None],
+        model_router: Any | None = None,
     ) -> None:
         self.store = store
         self.assistant_store = assistant_store
@@ -306,6 +324,19 @@ class AssistantToolRuntime:
         self.evidence: dict[str, dict[str, Any]] = {}
         self.allowed_jobs: set[UUID] = set()
         self.permissions = AssistantPermissionService(store=store, assistant_store=assistant_store)
+        self.tool_result_distiller = (
+            build_tool_result_distiller(settings, model_router)
+            if settings.tool_distillation_enabled and model_router is not None
+            else None
+        )
+        self.tool_results = (
+            ToolResultRepository(
+                settings.dataset_store_path,
+                user_id=assistant_store.user_id,
+            )
+            if settings.tool_distillation_enabled
+            else None
+        )
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         run = self.assistant_store.get_run(self.run_id)
@@ -337,16 +368,34 @@ class AssistantToolRuntime:
             message=f"正在执行 {tool_name}",
             tool_name=tool_name,
         )
-        result = getattr(self, f"_tool_{tool_name}")(arguments)
-        compact = _compact(result)
+        try:
+            result = getattr(self, f"_tool_{tool_name}")(arguments)
+        except Exception as exc:
+            self._archive_model_result(
+                tool_name,
+                arguments,
+                {"error": f"{type(exc).__name__}: {exc}"},
+                status=ToolResultStatus.FAILED,
+            )
+            raise
+        model_result = self._archive_model_result(tool_name, arguments, result)
+        output = _with_artifact_reference(result, model_result)
         self.event(
             event_type="tool.completed",
             status="completed",
             message=f"{tool_name} 已完成",
             tool_name=tool_name,
-            payload={"summary": _summary(compact)},
+            payload={"summary": _summary(model_result)},
         )
-        return compact
+        return output
+
+    def execute_for_model(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._model_result(self.execute(tool_name, arguments))
+
+    def model_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        return self._model_result(result)
 
     def _execute_audited(
         self, tool_name: str, arguments: dict[str, Any], authorization: Any
@@ -357,10 +406,10 @@ class AssistantToolRuntime:
         ).hexdigest()
         previous = self.assistant_store.get_action_by_idempotency_key(idempotency_key)
         if previous and previous["status"] == "completed":
-            return _compact(
-                previous["result"]
-                | {"idempotent_replay": True, "action_id": str(previous["action_id"])}
-            )
+            return previous["result"] | {
+                "idempotent_replay": True,
+                "action_id": str(previous["action_id"]),
+            }
         action = previous or self.assistant_store.create_action(
             run_id=self.run_id,
             conversation_id=UUID(str(self.conversation["conversation_id"])),
@@ -392,10 +441,12 @@ class AssistantToolRuntime:
             before = raw.pop("_before_state", {}) if isinstance(raw, dict) else {}
             after = raw.pop("_after_state", {}) if isinstance(raw, dict) else {}
             reversible = bool(raw.pop("_reversible", False)) if isinstance(raw, dict) else False
-            compact = _compact(raw)
+            compact_action_result = _compact(raw)
+            model_result = self._archive_model_result(tool_name, arguments, raw)
+            output = _with_artifact_reference(raw, model_result)
             self.assistant_store.complete_action(
                 action["action_id"],
-                result=compact,
+                result=compact_action_result | _with_artifact_reference({}, model_result),
                 before_state=before,
                 after_state=after,
                 reversible=reversible,
@@ -405,12 +456,163 @@ class AssistantToolRuntime:
                 status="completed",
                 message=f"{tool_name} 已完成",
                 tool_name=tool_name,
-                payload={"action_id": str(action["action_id"]), "summary": _summary(compact)},
+                payload={
+                    "action_id": str(action["action_id"]),
+                    "summary": _summary(model_result),
+                },
             )
-            return compact | {"action_id": str(action["action_id"])}
+            return output | {"action_id": str(action["action_id"])}
         except Exception as exc:
+            self._archive_model_result(
+                tool_name,
+                arguments,
+                {"error": f"{type(exc).__name__}: {exc}"},
+                status=ToolResultStatus.FAILED,
+            )
             self.assistant_store.fail_action(action["action_id"], str(exc))
             raise
+
+    def _archive_model_result(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        status: ToolResultStatus = ToolResultStatus.SUCCEEDED,
+    ) -> dict[str, Any]:
+        if tool_name == "inspect_tool_result":
+            return payload
+        if self.tool_results is None:
+            return _compact(payload)
+        metadata = {
+            "conversation_id": str(self.conversation["conversation_id"]),
+            "question": str(
+                arguments.get("question")
+                or arguments.get("query")
+                or arguments.get("requirement")
+                or ""
+            )[:2_000],
+            "retention_policy": (
+                "report_evidence"
+                if tool_name in {"get_report", "revise_report"} and payload.get("report_id")
+                else "default"
+            ),
+        }
+        envelope = ToolResultEnvelope(
+            run_id=self.run_id,
+            tool_name=tool_name,
+            action_hash=canonical_action_hash(tool_name, arguments),
+            status=status,
+            payload=payload,
+            metadata=metadata,
+        )
+        try:
+            bundle = self.tool_results.archive_and_summarize(
+                envelope,
+                distiller=self.tool_result_distiller,
+            )
+        except Exception as exc:
+            summary = reduce_tool_result(envelope)
+            self.event(
+                event_type="tool_result.archive_failed",
+                status="failed",
+                message="工具结果归档失败，已使用本地压缩结果。",
+                tool_name=tool_name,
+                payload={"error_type": type(exc).__name__},
+            )
+            return {
+                "summary": summary.model_dump(mode="json"),
+                "continuation_available": False,
+                "archive_error": type(exc).__name__,
+            }
+        self.event(
+            event_type="tool_result.archived",
+            status="completed",
+            message="完整工具结果已安全归档。",
+            tool_name=tool_name,
+            payload={
+                "artifact_id": str(bundle.artifact_id),
+                "original_size_bytes": bundle.original_size_bytes,
+                "context_size_bytes": bundle.context_size_bytes,
+                "reduction_ratio": round(bundle.reduction_ratio, 4),
+                "distillation_mode": (
+                    "deterministic" if bundle.summary.deterministic else "small_model"
+                ),
+                "distillation_attempts": len(bundle.distillation_attempts),
+            },
+        )
+        if bundle.distillation_attempts:
+            self.event(
+                event_type="tool_result.distilled",
+                status="completed",
+                message=(
+                    "大型工具结果已完成语义蒸馏。"
+                    if not bundle.summary.deterministic
+                    else "语义蒸馏未通过校验，已安全回退本地摘要。"
+                ),
+                tool_name=tool_name,
+                payload={
+                    "artifact_id": str(bundle.artifact_id),
+                    "accepted": not bundle.summary.deterministic,
+                    "attempts": len(bundle.distillation_attempts),
+                },
+            )
+        return {
+            "tool_result_artifact_id": str(bundle.artifact_id),
+            "summary": bundle.summary.model_dump(mode="json"),
+            "continuation_available": True,
+        }
+
+    def _model_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        projection = result.get("tool_result_projection")
+        if isinstance(projection, dict):
+            return {
+                "tool_result_artifact_id": result.get("tool_result_artifact_id"),
+                "projection": projection,
+                "continuation_available": bool(result.get("continuation_available")),
+            }
+        artifact_id = result.get("tool_result_artifact_id")
+        if self.tool_results is not None and artifact_id:
+            try:
+                return self.tool_results.model_context(UUID(str(artifact_id)))
+            except (RuntimeError, ValueError):
+                pass
+        fallback_summary = result.get("tool_result_summary")
+        if isinstance(fallback_summary, dict):
+            return {
+                "summary": fallback_summary,
+                "continuation_available": False,
+            }
+        return _compact(result)
+
+    def _tool_inspect_tool_result(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not self.settings.tool_continuation_enabled or self.tool_results is None:
+            raise RuntimeError("Tool result continuation is disabled.")
+        artifact_id = UUID(str(arguments["artifact_id"]))
+        projection = self.tool_results.project_context(
+            artifact_id,
+            run_id=self.run_id,
+            query=str(arguments["query"]),
+        )
+        self.event(
+            event_type="tool_result.continued",
+            status="completed",
+            message="已按当前问题补充读取归档结果。",
+            tool_name="inspect_tool_result",
+            payload={
+                "artifact_id": str(artifact_id),
+                "projection_id": str(projection.projection_id),
+                "selected_path_count": len(projection.selected_paths),
+                "context_size_bytes": projection.context_size_bytes,
+                "scanned_bytes": projection.scanned_bytes,
+                "truncated": projection.truncated,
+            },
+        )
+        return {
+            "tool_result_artifact_id": str(artifact_id),
+            "tool_result_projection": projection.model_context(),
+            "continuation_available": projection.more_available,
+        }
 
     def auto_retrieve(self, query: str) -> tuple[dict[str, Any], ...]:
         started = time.perf_counter()
@@ -448,11 +650,12 @@ class AssistantToolRuntime:
         items: list[dict[str, Any]] = []
         for report in _latest_report_candidates(reports, limit=3):
             try:
-                items.append(
-                    self._tool_get_report(
-                        {"report_id": str(report.get("report_id") or report["id"])}
-                    )
-                )
+                arguments = {
+                    "report_id": str(report.get("report_id") or report["id"])
+                }
+                result = self._tool_get_report(arguments)
+                model_result = self._archive_model_result("get_report", arguments, result)
+                items.append(_with_artifact_reference(result, model_result))
             except RuntimeError:
                 continue
         duration_ms = round((time.perf_counter() - started) * 1000)
@@ -1680,8 +1883,18 @@ def _compact(value: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _with_artifact_reference(
+    payload: dict[str, Any], model_result: dict[str, Any]
+) -> dict[str, Any]:
+    artifact_id = model_result.get("tool_result_artifact_id")
+    if artifact_id:
+        return payload | {"tool_result_artifact_id": artifact_id}
+    summary = model_result.get("summary")
+    return payload | ({"tool_result_summary": summary} if isinstance(summary, dict) else {})
+
+
 def _summary(value: dict[str, Any]) -> dict[str, Any]:
-    return {
+    summary = {
         key: value[key]
         for key in (
             "dataset_id",
@@ -1694,3 +1907,15 @@ def _summary(value: dict[str, Any]) -> dict[str, Any]:
         )
         if key in value
     }
+    nested = value.get("summary")
+    if isinstance(nested, dict):
+        summary.update(
+            {
+                key: nested[key]
+                for key in ("headline", "kind", "status", "row_count")
+                if key in nested
+            }
+        )
+    if value.get("tool_result_artifact_id"):
+        summary["tool_result_artifact_id"] = value["tool_result_artifact_id"]
+    return summary

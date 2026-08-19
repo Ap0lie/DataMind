@@ -154,6 +154,15 @@ Celery Beat、受控 Python Runner 和无网络 Sandbox 镜像。DNS、HTTPS、�
 | `DATAMIND_CONTEXT_BUDGET_MODE` | 统一上下文预算的 `shadow` 或 `enforce` 模式 |
 | `DATAMIND_LLM_CONTEXT_WINDOW_TOKENS` | Provider 上下文窗口的保守 Token 预算 |
 | `DATAMIND_CONTEXT_SAFETY_RATIO` | 为输出和 Token 估算偏差预留的安全比例 |
+| `DATAMIND_TOOL_DISTILLATION_ENABLED` | 完整归档工具结果，并启用有界结果蒸馏 |
+| `DATAMIND_TOOL_DISTILLATION_STRATEGY` | `auto` 对大型结果使用已配置小模型，`deterministic` 禁用模型 Map-Reduce |
+| `DATAMIND_TOOL_DISTILLATION_PROVIDER` | 独立结果蒸馏子 Agent 使用的 Provider |
+| `DATAMIND_TOOL_DISTILLATION_MIN_SOURCE_CHARS` | 启动小模型蒸馏前的最小有界源文本长度 |
+| `DATAMIND_TOOL_CONTEXT_MAX_CHARS` | 单个报告或错误 Artifact 的最大上下文投影 |
+| `DATAMIND_TOOL_CONTINUATION_MAX_CALLS` | 每个 Artifact、每个 Run 允许的定向续读次数 |
+| `DATAMIND_TOOL_CONTINUATION_MAX_CHARS` | 单次来源摘录续读的硬大小上限 |
+| `DATAMIND_TOOL_ARTIFACT_PATH` | 完整工具输出的受保护短期 gzip 存储目录 |
+| `DATAMIND_TOOL_ARTIFACT_MAX_BYTES` | 单个工具归档的未压缩硬上限，默认 200MB |
 | `DATAMIND_SEMANTIC_EMBEDDING_ENABLED` | 启用本地语义向量排序 |
 | `DATAMIND_ASSISTANT_MEMORY_ENABLED` | 启用 Kimi 对话摘要与长期记忆 |
 | `DATAMIND_ASSISTANT_MEMORY_RELEVANCE_THRESHOLD` | 普通记忆进入上下文的最低综合相关性 |
@@ -167,9 +176,20 @@ Celery Beat、受控 Python Runner 和无网络 Sandbox 镜像。DNS、HTTPS、�
 
 所有清洗、分析、审查、报告和 Kimi 模型调用都会经过统一上下文预算器。系统规则、
 当前问题、分析契约、错误与证据优先保留；Profile、样本、SQL/Python 结果、图表、
-历史消息和工具输出按领域规则确定性压缩。默认 `shadow` 仅记录压缩建议，校准通过后
-切换到 `enforce` 才会发送压缩后的 Prompt。最终 Router 同时执行 Token 估算与字符
-硬上限检查，不会把超限请求发送给 Provider。
+历史消息和工具输出按领域规则确定性压缩。本地默认 `shadow` 仅记录压缩建议；生产
+Docker Compose 默认使用 `enforce`，只发送有界 Prompt。最终 Router 同时执行 Token
+估算与字符硬上限检查，不会把超限请求发送给 Provider。
+
+Assistant 与自主分析工具执行后，会先把完整结果写入受保护的短期 Tool Artifact Store，
+再构造模型上下文。SQL/表格、报告、Python、错误与通用 JSON Reducer 会保留 Schema、
+精确事实、Evidence ID、校验问题和错误位置，主模型只接收有界摘要与 Artifact 引用。
+原始结果不会写入 LangMem；普通结果默认保留 30 天，失败结果保留 7 天。大型输出会进入
+有界、批量的小模型 Map-Reduce；只有原文引用可定位、数字声明可核验的摘要才会被采用，
+截断、超时或校验失败会回退到确定性 Reducer。主模型接收动态额度的上下文投影，小模型
+不可用也不会丢失已归档的执行证据。若摘要缺少当前契约所需细节，Kimi 或 Analysis Loop
+最多可对同用户、同 Run 产生的 Artifact 发起两次定向、来源摘录式续读；完整结果回放、
+任意文件路径和跨 Run 访问都会被拒绝。被验证报告引用的 Artifact 跟随报告生命周期，
+过期结果与无引用文件由每日清理任务回收。
 
 ## Kimi 数据分析助手
 
@@ -181,13 +201,6 @@ Kimi 可以读取当前用户的数据集、已完成分析和报告。问答模
 用户对话；用户再次主动点击“新建对话”仍会创建新的对话。
 
 附件支持 JPEG、PNG、WebP、CSV、XLSX、JSON 和 TXT。大文件采用受保护的落盘暂存，
-
-Kimi Memory 分为对话结构化摘要、版本化长期记忆和任务 Checkpoint。Memory v3 将
-持久内容规范化为带类型的“实体 + 谓词 + 值”，并在回答提交后通过后台 Kimi 提取器
-补充跨句定义，同时严格校验来源消息。用户可对本轮实际使用的单条记忆标记“有用、
-无关、错误”；系统分别计算相关性与效用，并记录采用或抑制原因。低质量记忆只会进入
-可恢复的休眠状态，不会静默删除。自动休眠默认处于影子模式，完成至少 5 个有效基准
-批次后再启用。
 逐个文件解析。最终回答使用模型真实 Token 流，并且只能引用本轮实际读取过的资产。
 
 Kimi Memory 分为三层：带来源的结构化摘要压缩较早消息；版本化语义记忆跨对话保存
@@ -196,6 +209,18 @@ Kimi Memory 分为三层：带来源的结构化摘要压缩较早消息；版�
 经验，并且仅作为 Planner 的只读路线证据，不能直接执行工具或绕过重新规划。记忆经过
 相关性门槛、MMR、用户和资产范围过滤，每次实际采用均可审计；关闭总开关后停止长期
 记忆读写，但保留当前对话摘要和已有记忆。
+
+Memory v3 将持久内容规范化为带类型的“实体 + 谓词 + 值”，并在回答提交后通过后台
+提取器补充跨句定义，再由 `DataMindMemoryGuard` 校验来源、敏感信息和作用范围。
+LangMem 现已作为唯一长期记忆主链，通过严格的用户/范围/类型 Namespace 复用现有
+版本化 Repository，HTTP API、冲突链、反馈、审计和回滚数据保持兼容。本地开发使用
+SQLite，Docker/生产使用 PostgreSQL；现有 BGE Provider 只负责候选重排，不引入独立
+向量数据库。集中式投影允许 Kimi 读取语义记忆，允许 Planner 读取指标口径、业务上下文
+和已验证经验，Reviewer 只读取来源一致性上下文，Report 只读取样式偏好和已验证结论；
+SQL/Python 不直接检索 Memory。形成、召回、抑制、冲突、验证、反馈与休眠都会产生不含
+正文的审计事件。
+用户可以把实际召回的记忆标记为“有用、无关、错误”；低质量记忆只进入可恢复休眠，
+不会静默删除。自动休眠仍需完成至少 5 个有效基准批次后再启用。
 
 ## MCP 状态
 

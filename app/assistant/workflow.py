@@ -107,6 +107,7 @@ class AssistantWorkflowRunner:
             run_id=run_id,
             conversation=conversation,
             event=emit,
+            model_router=self.model_router,
         )
         graph: Any = StateGraph(AssistantState)
 
@@ -114,7 +115,8 @@ class AssistantWorkflowRunner:
             ensure_run_continuable(self.assistant_store, run_id)
             self.assistant_store.update_run(run_id, status="running", current_stage="retrieval")
             retrieval_started = time.perf_counter()
-            retrieved = tools.auto_retrieve(state["question"])
+            retrieved_reports = tools.auto_retrieve(state["question"])
+            retrieved = tuple(tools.model_result(item) for item in retrieved_reports)
             retrieval_ms = round((time.perf_counter() - retrieval_started) * 1000)
             ensure_run_continuable(self.assistant_store, run_id)
             current_run = self.assistant_store.get_run(run_id)
@@ -156,6 +158,7 @@ class AssistantWorkflowRunner:
                     "relevance_score": item["relevance_score"],
                     "utility_score": item["utility_score"],
                     "score": item["final_score"],
+                    "agent": "kimi",
                 }
                 for item in memories
             ]
@@ -165,6 +168,25 @@ class AssistantWorkflowRunner:
                     status="completed",
                     message=f"已采用 {len(memory_usage)} 条相关记忆。",
                     payload={"memories": memory_usage},
+                )
+            suppressed_usage = tuple(
+                item
+                for item in memory_service.repository.list_usage(
+                    run_id=run_id,
+                    include_suppressed=True,
+                )
+                if not item["final_selected"]
+            )
+            if suppressed_usage:
+                reasons: dict[str, int] = {}
+                for item in suppressed_usage:
+                    reason = str(item.get("suppression_reason") or "not_selected")
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                emit(
+                    event_type="memory.suppressed",
+                    status="completed",
+                    message=f"已抑制 {len(suppressed_usage)} 条低相关或重复记忆。",
+                    payload={"agent": "kimi", "reasons": reasons},
                 )
             memory_context = memory_service.render_prompt_context(memories)
             if memory_context:
@@ -208,7 +230,7 @@ class AssistantWorkflowRunner:
                     question=state["question"],
                     execution_mode=current_run.execution_mode,
                     scope_type=str(conversation["scope_type"]),
-                    retrieved_reports=retrieved,
+                    retrieved_reports=retrieved_reports,
                 )
             )
             timings["fast_path"] = skip_tool_router
@@ -305,7 +327,7 @@ class AssistantWorkflowRunner:
                             if isinstance(function, dict)
                             else {}
                         )
-                        result = tools.execute(
+                        result = tools.execute_for_model(
                             name, arguments if isinstance(arguments, dict) else {}
                         )
                         ensure_run_continuable(self.assistant_store, run_id)
@@ -351,7 +373,10 @@ class AssistantWorkflowRunner:
                         {
                             "role": "tool",
                             "tool_call_id": str(call.get("id") or name),
-                            "content": json.dumps(result, ensure_ascii=False, default=str)[:50_000],
+                            "content": _tool_message_content(
+                                result,
+                                max_chars=self.settings.tool_context_max_chars,
+                            ),
                         }
                     )
                     tool_count += 1
@@ -1605,6 +1630,37 @@ def _has_model_content(content: Any) -> bool:
             if item.get("type") in {"image_url", "file"} and item.get(item.get("type")):
                 return True
     return False
+
+
+def _tool_message_content(result: dict[str, Any], *, max_chars: int) -> str:
+    encoded = json.dumps(result, ensure_ascii=False, default=str)
+    if len(encoded) <= max_chars:
+        return encoded
+    summary = result.get("summary")
+    projection = result.get("projection")
+    bounded = {
+        "tool_result_artifact_id": result.get("tool_result_artifact_id"),
+        "summary": summary if isinstance(summary, dict) else None,
+        "projection": projection if isinstance(projection, dict) else None,
+        "continuation_available": bool(result.get("continuation_available")),
+        "context_truncated": True,
+    }
+    encoded = json.dumps(bounded, ensure_ascii=False, default=str)
+    if len(encoded) <= max_chars:
+        return encoded
+    bounded["projection"] = None
+    encoded = json.dumps(bounded, ensure_ascii=False, default=str)
+    if len(encoded) <= max_chars:
+        return encoded
+    minimal = {
+        "tool_result_artifact_id": result.get("tool_result_artifact_id"),
+        "continuation_available": bool(result.get("continuation_available")),
+        "context_truncated": True,
+    }
+    encoded = json.dumps(minimal, ensure_ascii=False, default=str)
+    if len(encoded) <= max_chars:
+        return encoded
+    return json.dumps({"context_truncated": True})
 
 
 def _message_content_with_images(

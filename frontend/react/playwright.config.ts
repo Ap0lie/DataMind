@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,11 +10,46 @@ const backendURL = `http://127.0.0.1:${backendPort}`;
 const managedFrontendURL = `http://127.0.0.1:${frontendPort}`;
 const externalFrontendURL = process.env.DATAMIND_FRONTEND_URL;
 const reuseExistingServer = process.env.DATAMIND_E2E_REUSE_SERVER === "true";
+const browserChannel = process.env.DATAMIND_E2E_BROWSER_CHANNEL;
+const browserChannelOptions = browserChannel ? { channel: browserChannel } : {};
 const projectPython = path.resolve(
   "../..",
   process.platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python",
 );
-const pythonCommand = fs.existsSync(projectPython) ? `"${projectPython}"` : "python";
+const projectPythonAvailable =
+  fs.existsSync(projectPython) &&
+  spawnSync(projectPython, ["--version"], { stdio: "ignore" }).status === 0;
+const systemPythonAvailable =
+  spawnSync("python", ["--version"], { stdio: "ignore" }).status === 0;
+const pythonCommand = projectPythonAvailable ? `"${projectPython}"` : "python";
+const dockerBackendCommand = [
+  "docker run --rm --init",
+  `-p 127.0.0.1:${backendPort}:8000`,
+  "-e DATAMIND_DATABASE_URL=",
+  "-e DATAMIND_DATASET_STORE_PATH=/tmp/datamind-e2e/datasets",
+  "-e DATAMIND_AUTH_MODE=session",
+  "-e DATAMIND_SESSION_COOKIE_SECURE=false",
+  "-e DATAMIND_EXECUTION_BACKEND=local",
+  "-e DATAMIND_DEFAULT_LLM_PROVIDER=mock",
+  "-e DATAMIND_CLEANING_LLM_PROVIDER=mock",
+  "-e DATAMIND_PLANNER_LLM_PROVIDER=mock",
+  "-e DATAMIND_SQL_LLM_PROVIDER=mock",
+  "-e DATAMIND_PYTHON_LLM_PROVIDER=mock",
+  "-e DATAMIND_REPORT_LLM_PROVIDER=mock",
+  "-e DATAMIND_REVIEW_LLM_PROVIDER=mock",
+  "-e DATAMIND_AGENT_LOOP_PROVIDER=mock",
+  "-e DATAMIND_ASSISTANT_ENABLED=true",
+  "-e DATAMIND_ASSISTANT_LLM_PROVIDER=mock",
+  "-e DATAMIND_ASSISTANT_LLM_MODEL=mock-assistant",
+  "-e DATAMIND_SEMANTIC_EMBEDDING_ENABLED=false",
+  `-e DATAMIND_CORS_ORIGINS=${managedFrontendURL}`,
+  "datamind-app:latest",
+  `uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --log-level warning`,
+].join(" ");
+const defaultBackendCommand =
+  projectPythonAvailable || systemPythonAvailable
+    ? `${pythonCommand} -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port ${backendPort} --log-level warning`
+    : dockerBackendCommand;
 const isolatedDataRoot = path.join(
   os.tmpdir(),
   "datamind-playwright",
@@ -33,7 +69,7 @@ export default defineConfig({
     {
       command:
         process.env.DATAMIND_E2E_BACKEND_COMMAND ??
-        `${pythonCommand} -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port ${backendPort} --log-level warning`,
+        defaultBackendCommand,
       cwd: path.resolve("../.."),
       url: `${backendURL}/api/v1/health/ready`,
       reuseExistingServer,
@@ -77,7 +113,13 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   projects: [
-    { name: "desktop-chromium", use: { ...devices["Desktop Chrome"] } },
-    { name: "mobile-chromium", use: { ...devices["Pixel 7"] } },
+    {
+      name: "desktop-chromium",
+      use: { ...devices["Desktop Chrome"], ...browserChannelOptions },
+    },
+    {
+      name: "mobile-chromium",
+      use: { ...devices["Pixel 7"], ...browserChannelOptions },
+    },
   ],
 });

@@ -87,6 +87,7 @@ class ReportNodeRuntime:
     notify_progress: Callable[..., None]
     emit_loop_event: Callable[..., None]
     workflow_dataframe: Callable[..., Any]
+    retain_tool_results: Callable[[tuple[str, ...], str], int] | None = None
 
 
 def _adversarial_validate_node(
@@ -136,6 +137,9 @@ def _adversarial_validate_node(
                         analysis_contract=state.get("analysis_contract"),
                         statistical_verification=state.get(
                             "statistical_verification"
+                        ),
+                        memory_context=(state.get("memory_contexts") or {}).get(
+                            "reviewer", ()
                         ),
                     ),
                     temperature=0.1,
@@ -457,6 +461,7 @@ def _build_report_draft(
                 structured_report=structured,
                 multimodal_inputs=state.get("multimodal_inputs", ()),
                 multi_dataset_context=state.get("multi_dataset_context"),
+                memory_context=(state.get("memory_contexts") or {}).get("report", ()),
             )
             if state.get("report_validation"):
                 report_messages.append(
@@ -1107,6 +1112,23 @@ def _report_commit_node(
                 ],
             },
         )
+        tool_artifact_ids = tuple(
+            str(item["tool_result_artifact_id"])
+            for item in state.get("tool_evidence", ())
+            if item.get("tool_result_artifact_id")
+        )
+        if runtime.retain_tool_results is not None and tool_artifact_ids:
+            try:
+                runtime.retain_tool_results(tool_artifact_ids, str(report_id))
+            except Exception as exc:
+                runtime.emit_loop_event(
+                    state,
+                    event_type="tool_result.retention_failed",
+                    status="warning",
+                    message="Report committed, but evidence retention metadata could not be updated.",
+                    iteration=state.get("report_revision_count", 0),
+                    payload={"error_type": type(exc).__name__},
+                )
         for chart in charts:
             repository.save_chart(
                 dataset_id=dataset_id,

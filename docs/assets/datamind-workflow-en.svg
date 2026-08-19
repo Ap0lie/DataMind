@@ -77,7 +77,7 @@
 
     <rect x="550" y="567" width="300" height="110" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
     <text x="700" y="603" text-anchor="middle" class="card-title" font-size="19" fill="#064e3b">Kimi assistant</text>
-    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="700" y="633">Retrieve cited evidence</tspan><tspan x="700" y="654">Ask · Execute · Attach</tspan></text>
+    <text text-anchor="middle" class="card-detail" fill="#064e3b"><tspan x="700" y="633">Evidence · Scoped memory</tspan><tspan x="700" y="654">Ask · Execute · Attach</tspan></text>
 
     <rect x="900" y="567" width="300" height="110" rx="8" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
     <text x="1050" y="603" text-anchor="middle" class="card-title" font-size="19" fill="#1e3a8a">Next action</text>

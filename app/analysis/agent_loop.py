@@ -149,6 +149,18 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
         {"evidence_id": {"type": "string"}},
         required=("evidence_id",),
     ),
+    _tool(
+        "inspect_tool_result",
+        (
+            "Read a bounded exact continuation from an artifact already present in this job's "
+            "evidence. Use only when its verified summary omits a required contract detail."
+        ),
+        {
+            "artifact_id": {"type": "string"},
+            "focus": {"type": "string", "maxLength": 1000},
+        },
+        required=("artifact_id",),
+    ),
 )
 TOOL_NAMES = frozenset(item["function"]["name"] for item in TOOL_DEFINITIONS)
 
@@ -226,6 +238,8 @@ def error_fingerprint(error_type: LoopErrorType, message: str) -> str:
 
 def classify_tool_error(tool_name: str, exc: Exception) -> LoopErrorType:
     text = str(exc).lower()
+    if isinstance(exc, PermissionError):
+        return LoopErrorType.POLICY_ERROR
     if isinstance(exc, (KeyError, TypeError)) or "required" in text or "unknown field" in text:
         return LoopErrorType.INVALID_ARGUMENTS
     if "forbidden" in text or "only select" in text or "policy" in text:
@@ -252,6 +266,18 @@ def load_evidence_result(
 ) -> dict[str, Any] | None:
     """Load one evidence payload regardless of its storage representation."""
 
+    direct_tool_result_id = evidence.get("tool_result_artifact_id")
+    if direct_tool_result_id:
+        from app.storage.tool_result_repository import ToolResultRepository
+
+        try:
+            loaded = ToolResultRepository(
+                repository.root_path,
+                user_id=repository.user_id,
+            ).load_payload(UUID(str(direct_tool_result_id)))
+            return loaded if isinstance(loaded, dict) else None
+        except (RuntimeError, ValueError, OSError):
+            pass
     result = evidence.get("result")
     if isinstance(result, dict):
         return result
@@ -262,8 +288,23 @@ def load_evidence_result(
     content = artifact.get("content")
     if not isinstance(content, dict):
         return None
+    tool_result_artifact_id = content.get("tool_result_artifact_id")
+    if tool_result_artifact_id:
+        from app.storage.tool_result_repository import ToolResultRepository
+
+        try:
+            loaded = ToolResultRepository(
+                repository.root_path,
+                user_id=repository.user_id,
+            ).load_payload(UUID(str(tool_result_artifact_id)))
+            return loaded if isinstance(loaded, dict) else None
+        except (RuntimeError, ValueError, OSError):
+            pass
     nested = content.get("result")
-    return nested if isinstance(nested, dict) else content
+    if isinstance(nested, dict):
+        return nested
+    summary = content.get("result_summary")
+    return summary if isinstance(summary, dict) else content
 
 
 class AgentToolRuntime:
@@ -303,13 +344,8 @@ class AgentToolRuntime:
         self._source_frames: dict[UUID, pd.DataFrame] = {}
         self.evidence: dict[str, dict[str, Any]] = {}
         for item in evidence:
-            hydrated = dict(item)
-            hydrated["result"] = load_evidence_result(
-                repository,
-                dataset_id,
-                hydrated,
-            )
-            self.evidence[str(hydrated.get("evidence_id"))] = hydrated
+            bounded = dict(item)
+            self.evidence[str(bounded.get("evidence_id"))] = bounded
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolExecution:
         action_hash = canonical_action_hash(tool_name, arguments)
@@ -317,7 +353,7 @@ class AgentToolRuntime:
             return ToolExecution(tool_name, arguments, action_hash, error_type=LoopErrorType.POLICY_ERROR, error="Tool is not in the job allowlist.")
         try:
             result = getattr(self, f"_tool_{tool_name}")(arguments)
-            return ToolExecution(tool_name, arguments, action_hash, result=_compact(result))
+            return ToolExecution(tool_name, arguments, action_hash, result=result)
         except Exception as exc:
             return ToolExecution(tool_name, arguments, action_hash, error_type=classify_tool_error(tool_name, exc), error=str(exc)[:1200])
 
@@ -356,6 +392,34 @@ class AgentToolRuntime:
                 "Aggregate monetary facts on their original source dataset before joining "
                 "multiple one-to-many tables."
             ),
+        }
+
+    def _tool_inspect_tool_result(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = UUID(str(arguments["artifact_id"]))
+        allowed = {
+            str(item.get("tool_result_artifact_id"))
+            for item in self.evidence.values()
+            if item.get("tool_result_artifact_id")
+        }
+        if str(artifact_id) not in allowed:
+            raise PermissionError("Tool result artifact is outside the current evidence scope.")
+        from app.storage.tool_result_repository import ToolResultRepository
+
+        projection = ToolResultRepository(
+            self.repository.root_path,
+            user_id=self.repository.user_id,
+        ).project_context(
+            artifact_id,
+            run_id=self.job_id,
+            query=str(arguments.get("focus") or self.question),
+        )
+        return {
+            "tool_result_artifact_id": str(artifact_id),
+            "projection": projection.model_context(),
+            "projection_id": str(projection.projection_id),
+            "selected_path_count": len(projection.selected_paths),
+            "context_size_bytes": projection.context_size_bytes,
+            "continuation_available": projection.more_available,
         }
 
     def _tool_profile_dataset(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -521,6 +585,15 @@ class AgentToolRuntime:
         evidence = self.evidence.get(str(value or ""))
         if evidence is None:
             raise KeyError("Unknown evidence_id.")
+        if evidence.get("tool_result_artifact_id") and not evidence.get(
+            "_raw_result_loaded"
+        ):
+            evidence["result"] = load_evidence_result(
+                self.repository,
+                self.dataset_id,
+                evidence,
+            )
+            evidence["_raw_result_loaded"] = True
         return evidence
 
     def required_source_aggregates(
@@ -936,14 +1009,3 @@ def _normalized_source_name(value: Any) -> str:
 
 def _frame_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return json.loads(frame.where(frame.notna(), None).to_json(orient="records", force_ascii=False, date_format="iso"))
-
-
-def _compact(value: dict[str, Any]) -> dict[str, Any]:
-    encoded = json.dumps(value, ensure_ascii=False, default=str)
-    if len(encoded) <= 250_000:
-        return value
-    compact = dict(value)
-    if isinstance(compact.get("rows"), list):
-        compact["rows"] = compact["rows"][:200]
-        compact["truncated"] = True
-    return compact

@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from app.core.settings import Settings, get_settings
+from app.memory.guards import sensitive_memory_reason
+from app.memory.models import MemoryAgent, MemoryKind
+from app.memory.namespaces import build_memory_namespace
+from app.memory.projections import (
+    memory_store_key,
+    project_agent_memories,
+    store_value_to_memory,
+)
+from app.memory.store import DataMindMemoryStore
 from app.semantic.embedding import (
     PersistentEmbeddingProvider,
     SemanticEmbeddingProvider,
@@ -31,6 +41,8 @@ MEMORY_TYPES = {
 }
 MEMORY_SCOPES = {"user", "dataset", "dataset_group", "report"}
 MEMORY_STATUSES = {"active", "pending", "superseded", "stale", "dormant", "recycled"}
+
+logger = logging.getLogger(__name__)
 
 _EXPLICIT_MARKERS = (
     "请记住",
@@ -58,15 +70,6 @@ _INFERRED_MARKERS = (
     "we usually",
 )
 _ONE_TIME_MARKERS = ("这次", "本次", "当前这", "这份", "临时", "仅本次", "for this", "this time")
-_SENSITIVE_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
-    re.compile(r"\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|密码|口令)\s*[:=：]\s*\S+", re.I),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
-    re.compile(r"\b\d{17}[\dXx]\b"),
-    re.compile(r"\b\d{16,19}\b"),
-)
-
-
 @dataclass(frozen=True)
 class MemoryCandidate:
     memory_type: str
@@ -100,6 +103,10 @@ class AssistantMemoryService:
         self.settings = settings or get_settings()
         base_provider = embedding_provider or get_semantic_embedding_provider(self.settings)
         self.embedding_provider = PersistentEmbeddingProvider(base_provider, store)
+        self.langmem_store = DataMindMemoryStore(
+            repository,
+            recycle_retention_days=self.settings.assistant_memory_recycle_days,
+        )
 
     def create_manual(
         self,
@@ -119,7 +126,7 @@ class AssistantMemoryService:
             raise ValueError("敏感凭证、个人信息或原始数据不能写入长期记忆。")
         subject = _normalized_key(memory_type, cleaned)
         canonical = _canonical_memory_value(memory_type, cleaned, subject)
-        return self.repository.save(
+        return self._save_memory(
             memory_type=memory_type,
             scope_type=scope_type,
             scope_id=scope_id,
@@ -160,7 +167,7 @@ class AssistantMemoryService:
             else _normalized_key(next_type, next_content)
         )
         canonical = _canonical_memory_value(next_type, next_content, subject)
-        return self.repository.save(
+        return self._save_memory(
             memory_type=next_type,
             scope_type=current["scope_type"],
             scope_id=current["scope_id"],
@@ -190,6 +197,7 @@ class AssistantMemoryService:
         run_id: UUID | None = None,
         assistant_message_id: UUID | None = None,
         semantic_model: dict[str, Any] | None = None,
+        agent: MemoryAgent = "kimi",
     ) -> tuple[dict[str, Any], ...]:
         if not self._enabled():
             return ()
@@ -200,28 +208,22 @@ class AssistantMemoryService:
             if semantic_model is not None
             else self._published_semantic_models(scope_scores)
         )
-        candidates: list[dict[str, Any]] = []
-        for item in self.repository.list(
+        recalled = self._recall_kind(
             memory_kind="semantic",
-            status="active",
-            limit=500,
-        ):
-            if (item["scope_type"], str(item["scope_id"] or "user")) not in scope_scores:
-                continue
-            if not _is_current(item, now) or any(
-                _overridden_by_semantic_model(item, model) for model in semantic_models
-            ):
-                continue
-            candidates.append(item)
-        return self._rank_memories(
             question=question,
-            candidates=candidates,
             scope_scores=scope_scores,
             run_id=run_id,
             assistant_message_id=assistant_message_id,
+            agent=agent,
             limit=self.settings.assistant_memory_retrieval_limit,
             context_chars=self.settings.assistant_memory_context_chars,
+            accept=lambda item: _is_current(item, now)
+            and not any(
+                _overridden_by_semantic_model(item, model)
+                for model in semantic_models
+            ),
         )
+        return project_agent_memories(agent, recalled)
 
     def retrieve_analysis_experiences(
         self,
@@ -246,33 +248,169 @@ class AssistantMemoryService:
         }
         scope_scores = self._scope_scores(conversation, evidence)
         now = datetime.now(UTC)
-        candidates: list[dict[str, Any]] = []
-        for item in self.repository.list(
-            memory_kind="episodic",
-            status="active",
-            limit=500,
-        ):
-            key = (item["scope_type"], str(item["scope_id"] or "user"))
-            if key not in scope_scores or not _is_current(item, now):
-                continue
+        def accept(item: dict[str, Any]) -> bool:
+            if not _is_current(item, now):
+                return False
             if not self.experience_is_current(item):
                 self.repository.mark_stale(
                     item["memory_id"],
                     reason="数据 Schema、清洗版本、关系计划或语义版本已变化",
                 )
-                continue
-            candidates.append(item)
-        return self._rank_memories(
+                return False
+            return True
+
+        recalled = self._recall_kind(
+            memory_kind="episodic",
+            question=question,
+            scope_scores=scope_scores,
+            run_id=run_id,
+            assistant_message_id=assistant_message_id,
+            agent="planner",
+            limit=min(3, self.settings.assistant_memory_retrieval_limit),
+            context_chars=min(2_500, self.settings.assistant_memory_context_chars),
+            accept=accept,
+        )
+        return project_agent_memories("planner", recalled)
+
+    def retrieve_analysis_memory_contexts(
+        self,
+        *,
+        question: str,
+        dataset_id: UUID,
+        dataset_group_id: UUID | None = None,
+        additional_dataset_ids: tuple[UUID, ...] = (),
+        run_id: UUID | None = None,
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
+        agents: tuple[MemoryAgent, ...] = (
+            "planner",
+            "sql",
+            "python",
+            "reviewer",
+            "report",
+        )
+        if not self._enabled():
+            return {agent: () for agent in agents}
+        evidence = tuple(
+            {"source_type": "dataset", "source_id": item, "dataset_id": item}
+            for item in (dataset_id, *additional_dataset_ids)
+        )
+        conversation = {
+            "scope_type": "dataset_group" if dataset_group_id else "dataset",
+            "scope_id": dataset_group_id or dataset_id,
+        }
+        scope_scores = self._scope_scores(conversation, evidence)
+        now = datetime.now(UTC)
+        semantic_models = self._published_semantic_models(scope_scores)
+        semantic = self._recall_kind(
+            memory_kind="semantic",
+            question=question,
+            scope_scores=scope_scores,
+            run_id=run_id,
+            assistant_message_id=None,
+            agent="planner",
+            limit=self.settings.assistant_memory_retrieval_limit,
+            context_chars=self.settings.assistant_memory_context_chars,
+            accept=lambda item: _is_current(item, now)
+            and not any(
+                _overridden_by_semantic_model(item, model)
+                for model in semantic_models
+            ),
+        )
+
+        def accept_experience(item: dict[str, Any]) -> bool:
+            if not _is_current(item, now):
+                return False
+            if self.experience_is_current(item):
+                return True
+            self.repository.mark_stale(
+                item["memory_id"],
+                reason="数据 Schema、清洗版本、关系计划或语义版本已变化",
+            )
+            return False
+
+        episodic = (
+            self._recall_kind(
+                memory_kind="episodic",
+                question=question,
+                scope_scores=scope_scores,
+                run_id=run_id,
+                assistant_message_id=None,
+                agent="planner",
+                limit=min(3, self.settings.assistant_memory_retrieval_limit),
+                context_chars=min(2_500, self.settings.assistant_memory_context_chars),
+                accept=accept_experience,
+            )
+            if self.settings.assistant_memory_experience_enabled
+            else ()
+        )
+        combined = (*semantic, *episodic)
+        return {
+            agent: project_agent_memories(agent, combined)
+            for agent in agents
+        }
+
+    def _recall_kind(
+        self,
+        *,
+        memory_kind: MemoryKind,
+        question: str,
+        scope_scores: dict[tuple[str, str], float],
+        run_id: UUID | None,
+        assistant_message_id: UUID | None,
+        agent: MemoryAgent,
+        limit: int,
+        context_chars: int,
+        accept: Callable[[dict[str, Any]], bool],
+    ) -> tuple[dict[str, Any], ...]:
+        candidates = [
+            item
+            for item in self._active_memories(
+                memory_kind=memory_kind,
+                scope_scores=scope_scores,
+            )
+            if (item["scope_type"], str(item["scope_id"] or "user"))
+            in scope_scores
+            and accept(item)
+        ]
+        return self._rank_and_record(
             question=question,
             candidates=candidates,
             scope_scores=scope_scores,
             run_id=run_id,
             assistant_message_id=assistant_message_id,
-            limit=min(3, self.settings.assistant_memory_retrieval_limit),
-            context_chars=min(2_500, self.settings.assistant_memory_context_chars),
+            agent=agent,
+            limit=limit,
+            context_chars=context_chars,
         )
 
-    def _rank_memories(
+    def _active_memories(
+        self,
+        *,
+        memory_kind: MemoryKind,
+        scope_scores: dict[tuple[str, str], float],
+    ) -> tuple[dict[str, Any], ...]:
+        memories: dict[str, dict[str, Any]] = {}
+        try:
+            for scope_type, scope_key in scope_scores:
+                namespace = build_memory_namespace(
+                    user_id=self.repository.user_id,
+                    scope_type=scope_type,
+                    scope_id=None if scope_type == "user" else scope_key,
+                    memory_kind=memory_kind,
+                )
+                for item in self.langmem_store.search(
+                    namespace,
+                    filter={"status": "active"},
+                    limit=500,
+                ):
+                    memory = store_value_to_memory(item.value)
+                    memories[str(memory["memory_id"])] = memory
+            return tuple(memories.values())
+        except Exception:
+            logger.exception("LangMem recall failed; long-term memory was skipped safely.")
+            return ()
+
+    def _rank_and_record(
         self,
         *,
         question: str,
@@ -280,6 +418,7 @@ class AssistantMemoryService:
         scope_scores: dict[tuple[str, str], float],
         run_id: UUID | None,
         assistant_message_id: UUID | None,
+        agent: MemoryAgent,
         limit: int,
         context_chars: int,
     ) -> tuple[dict[str, Any], ...]:
@@ -409,6 +548,7 @@ class AssistantMemoryService:
                 run_id=run_id,
                 entries=tuple(usage_entries),
                 assistant_message_id=assistant_message_id,
+                agent=agent,
             )
             usage_by_memory = {
                 item["memory_id"]: usage
@@ -501,7 +641,14 @@ class AssistantMemoryService:
         reason = _sensitive_reason(str(user_message.get("content") or ""))
         if reason:
             if any(marker in str(user_message.get("content") or "").casefold() for marker in _EXPLICIT_MARKERS):
-                events.append({"event_type": "memory.skipped", "status": "completed", "message": reason})
+                events.append(
+                    {
+                        "event_type": "memory.rejected",
+                        "status": "warning",
+                        "message": reason,
+                        "payload": {"reason_codes": ["sensitive_content"]},
+                    }
+                )
         else:
             candidates = tuple(model_candidates) or extract_memory_candidates(
                 str(user_message.get("content") or "")
@@ -522,7 +669,7 @@ class AssistantMemoryService:
                     ),
                     None,
                 )
-                memory = self.repository.save(
+                memory = self._save_memory(
                     memory_type=candidate.memory_type,
                     scope_type=scope_type,
                     scope_id=scope_id,
@@ -543,14 +690,22 @@ class AssistantMemoryService:
                     application_policy=candidate.application_policy,
                     correction=candidate.correction,
                 )
-                event_type = "memory.saved" if candidate.explicit else "memory.candidate"
+                event_type = "memory.extracted"
                 if previous and previous["memory_id"] != memory["memory_id"]:
-                    event_type = "memory.superseded" if candidate.explicit else "memory.conflict"
+                    event_type = "memory.conflicted"
                 events.append(
                     {
                         "event_type": event_type,
                         "status": "completed" if candidate.explicit else "pending",
-                        "message": "已记住这项偏好。" if candidate.explicit else "发现一项可能长期有用的记忆，等待确认。",
+                        "message": (
+                            "已记住这项偏好。"
+                            if candidate.explicit
+                            and candidate.memory_type
+                            in {"preference", "workflow_preference"}
+                            else "已保存这项长期记忆。"
+                            if candidate.explicit
+                            else "发现一项可能长期有用的记忆，等待确认。"
+                        ),
                         "payload": {
                             "memory_id": str(memory["memory_id"]),
                             "memory_type": memory["memory_type"],
@@ -558,6 +713,14 @@ class AssistantMemoryService:
                             "supersedes_id": str(memory["supersedes_id"])
                             if memory.get("supersedes_id")
                             else None,
+                            "requires_confirmation": not candidate.explicit,
+                            "resolution": (
+                                "superseded"
+                                if candidate.explicit and previous is not None
+                                else "pending"
+                                if not candidate.explicit
+                                else "created"
+                            ),
                         },
                     }
                 )
@@ -567,6 +730,21 @@ class AssistantMemoryService:
         return bool(
             self.settings.assistant_memory_enabled
             and self.repository.get_settings()["enabled"]
+        )
+
+    def _save_memory(self, **fields: Any) -> dict[str, Any]:
+        namespace = build_memory_namespace(
+            user_id=self.repository.user_id,
+            scope_type=str(fields["scope_type"]),
+            scope_id=fields.get("scope_id"),
+            memory_kind=str(fields.get("memory_kind") or "semantic"),
+        )
+        value = dict(fields)
+        value.setdefault("source_kind", "langmem_manager")
+        return self.langmem_store.put_versioned(
+            namespace,
+            memory_store_key(value),
+            value,
         )
 
     def update_conversation_summary(
@@ -611,11 +789,14 @@ class AssistantMemoryService:
             render_conversation_summary(summary_payload),
             self.settings.assistant_memory_summary_max_chars,
         )
-        return assistant_store.update_conversation_summary(
-            conversation_id,
-            summary=next_summary,
-            summary_payload=summary_payload,
-            through_message_id=summarized[-1]["message_id"],
+        return cast(
+            dict[str, Any],
+            assistant_store.update_conversation_summary(
+                conversation_id,
+                summary=next_summary,
+                summary_payload=summary_payload,
+                through_message_id=summarized[-1]["message_id"],
+            ),
         )
 
     def save_analysis_experience(self, job_id: UUID) -> dict[str, Any] | None:
@@ -655,7 +836,7 @@ class AssistantMemoryService:
             "asset_fingerprint": self._asset_fingerprint(job),
             "report_id": str(job.report_id),
         }
-        return self.repository.save(
+        return self._save_memory(
             memory_type="analysis_experience",
             memory_kind="episodic",
             scope_type=scope_type,
@@ -799,38 +980,6 @@ class AssistantMemoryService:
             self.store.get_report(scope_id)
 
 
-class PersistentAssistantMemoryHarness:
-    """Small persistent adapter for the generic Harness memory contract."""
-
-    def __init__(self, repository: AssistantMemoryRepository) -> None:
-        self.repository = repository
-
-    async def recall(self, key: str) -> dict[str, Any] | None:
-        normalized = "harness:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
-        matches = self.repository.list(memory_type="business_context", status="active", limit=500)
-        item = next((memory for memory in matches if memory["normalized_key"] == normalized), None)
-        if item is None:
-            return None
-        try:
-            value = json.loads(item["content"])
-            return value if isinstance(value, dict) else {"value": value}
-        except json.JSONDecodeError:
-            return {"value": item["content"]}
-
-    async def remember(self, key: str, value: dict[str, Any]) -> None:
-        normalized = "harness:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
-        self.repository.save(
-            memory_type="business_context",
-            scope_type="user",
-            scope_id=None,
-            normalized_key=normalized,
-            content=json.dumps(value, ensure_ascii=False, default=str),
-            explicit=True,
-            confidence=1.0,
-            status="active",
-        )
-
-
 def extract_memory_candidates(text: str) -> tuple[MemoryCandidate, ...]:
     if _sensitive_reason(text):
         return ()
@@ -888,71 +1037,6 @@ def should_use_model_memory_extractor(
         or len(_sentences(text)) > 1
         or any(re.fullmatch(r"[0-9a-f]{24}", item.subject_key) for item in candidates)
     )
-
-
-def parse_model_memory_candidates(
-    payload: str,
-    *,
-    source_text: str,
-    source_message_id: UUID,
-) -> tuple[MemoryCandidate, ...]:
-    try:
-        parsed = json.loads(_extract_json_payload(payload))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return ()
-    items = parsed.get("memories") if isinstance(parsed, dict) else None
-    if not isinstance(items, list):
-        return ()
-    output: list[MemoryCandidate] = []
-    source_ids = {str(source_message_id)}
-    for item in items[:3]:
-        if not isinstance(item, dict):
-            continue
-        if set(str(value) for value in item.get("source_message_ids") or []) != source_ids:
-            continue
-        try:
-            evidence = _clean_content(str(item.get("evidence") or ""))
-        except ValueError:
-            continue
-        if evidence not in source_text or _sensitive_reason(evidence):
-            continue
-        memory_type = str(item.get("memory_type") or "")
-        if memory_type not in MEMORY_TYPES or memory_type == "analysis_experience":
-            continue
-        entity = _canonical_identifier(str(item.get("entity_key") or ""))
-        predicate = _canonical_identifier(str(item.get("predicate") or "value")) or "value"
-        if not entity:
-            continue
-        typed_value = item.get("typed_value")
-        if not isinstance(typed_value, dict) or "value" not in typed_value:
-            continue
-        explicit = any(marker in source_text.casefold() for marker in _EXPLICIT_MARKERS)
-        subject = f"{memory_type}:{entity}:{predicate}"[:160]
-        try:
-            content = _clean_content(str(item.get("content") or evidence))
-        except ValueError:
-            continue
-        output.append(
-            MemoryCandidate(
-                memory_type=memory_type,
-                normalized_key=subject,
-                subject_key=subject,
-                entity_key=entity,
-                predicate=predicate,
-                content=content,
-                explicit=explicit,
-                confidence=min(0.95, max(0.5, float(item.get("confidence") or 0.65))),
-                structured_value={"value": typed_value.get("value"), "evidence": evidence},
-                typed_value={
-                    "type": str(typed_value.get("type") or "text"),
-                    "value": typed_value.get("value"),
-                },
-                unit=str(item.get("unit") or "").strip() or None,
-                correction=bool(item.get("correction")) and explicit,
-                application_policy=_application_policy(memory_type, subject, explicit=explicit),
-            )
-        )
-    return tuple(output)
 
 
 def deterministic_conversation_summary(source: str) -> str:
@@ -1116,7 +1200,7 @@ def _memory_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
     left_vector = left.get("_vector")
     right_vector = right.get("_vector")
     if left_vector and right_vector:
-        return max(0.0, cosine_similarity(left_vector, right_vector))
+        return float(max(0.0, cosine_similarity(left_vector, right_vector)))
     return _lexical_similarity(str(left["content"]), str(right["content"]))
 
 
@@ -1317,23 +1401,6 @@ def _canonical_memory_value(
     }
 
 
-def _canonical_identifier(value: str) -> str:
-    normalized = "_".join(
-        part for part in re.split(r"[^\w\u4e00-\u9fff]+", value.casefold()) if part
-    )
-    return normalized[:80]
-
-
-def _extract_json_payload(value: str) -> str:
-    cleaned = str(value or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    return cleaned[start : end + 1] if start >= 0 and end >= start else cleaned
-
-
 def _clean_content(value: str | None) -> str:
     cleaned = " ".join(str(value or "").strip().split())
     if not cleaned:
@@ -1342,8 +1409,9 @@ def _clean_content(value: str | None) -> str:
 
 
 def _sensitive_reason(text: str) -> str | None:
-    if any(pattern.search(text) for pattern in _SENSITIVE_PATTERNS):
-        return "检测到敏感凭证或高风险个人信息，未写入长期记忆。"
+    sensitive = sensitive_memory_reason(text)
+    if sensitive:
+        return sensitive
     stripped = text.strip()
     if stripped.startswith(("[{", "{")) and stripped.count(":") >= 3:
         return "疑似原始结构化数据，未写入长期记忆。"

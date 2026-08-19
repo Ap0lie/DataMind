@@ -26,6 +26,7 @@ _STAGE_TOKEN_LIMITS = {
     "assistant_route": 24_576,
     "assistant_compose": 40_960,
     "assistant": 24_576,
+    "tool_result_distiller": 24_576,
     "default": 16_384,
 }
 
@@ -49,6 +50,7 @@ _AGENT_PROFILES = {
     "report_execute": "report",
     "report": "report",
     "assistant": "assistant_route",
+    "tool_result_distiller": "tool_result_distiller",
 }
 
 _REQUIRED_TEXT_KEYS = {

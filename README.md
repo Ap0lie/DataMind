@@ -173,6 +173,15 @@ Compose. The most important settings are:
 | `DATAMIND_CONTEXT_BUDGET_MODE` | Unified context-budget mode: `shadow` or `enforce` |
 | `DATAMIND_LLM_CONTEXT_WINDOW_TOKENS` | Conservative provider context-window token budget |
 | `DATAMIND_CONTEXT_SAFETY_RATIO` | Reserve for output and token-estimation variance |
+| `DATAMIND_TOOL_DISTILLATION_ENABLED` | Archives complete tool results and enables bounded result distillation |
+| `DATAMIND_TOOL_DISTILLATION_STRATEGY` | `auto` uses the configured small model for large results; `deterministic` disables model Map-Reduce |
+| `DATAMIND_TOOL_DISTILLATION_PROVIDER` | Provider used by the isolated result-distillation sub-agent |
+| `DATAMIND_TOOL_DISTILLATION_MIN_SOURCE_CHARS` | Minimum bounded source size before small-model distillation starts |
+| `DATAMIND_TOOL_CONTEXT_MAX_CHARS` | Maximum context projection for one report/error artifact |
+| `DATAMIND_TOOL_CONTINUATION_MAX_CALLS` | Maximum query-focused continuation reads per artifact and run |
+| `DATAMIND_TOOL_CONTINUATION_MAX_CHARS` | Hard size limit for one source-extractive continuation |
+| `DATAMIND_TOOL_ARTIFACT_PATH` | Protected short-term gzip storage for complete tool outputs |
+| `DATAMIND_TOOL_ARTIFACT_MAX_BYTES` | Uncompressed hard limit per archived tool result; defaults to 200 MB |
 | `DATAMIND_SEMANTIC_EMBEDDING_ENABLED` | Enables local semantic embedding ranking |
 | `DATAMIND_ASSISTANT_MEMORY_ENABLED` | Enables Kimi conversation summaries and long-term memory |
 | `DATAMIND_ASSISTANT_MEMORY_RELEVANCE_THRESHOLD` | Minimum combined relevance for ordinary recalled memory |
@@ -187,10 +196,27 @@ defaults, not hard requirements; tests use the mock provider.
 Every cleaning, analysis, review, report, and Kimi model call passes through the
 shared context budget manager. System policy, the current question, analysis
 contract, errors, and evidence are retained first; profiles, samples, SQL/Python
-results, charts, history, and tool output use deterministic domain reducers. The
-default `shadow` mode records proposed compression without changing provider input;
-`enforce` sends the bounded prompt. Router admission uses both conservative token
-estimation and the existing character hard limit.
+results, charts, history, and tool output use deterministic domain reducers. Local
+`shadow` mode records proposed compression without changing provider input; the
+production Compose profile defaults to `enforce` and sends only the bounded prompt.
+Router admission uses both conservative token estimation and the existing character
+hard limit.
+
+Complete Assistant and autonomous-analysis tool outputs are written to the protected,
+short-lived Tool Artifact Store before model context is built. SQL/table, report,
+Python, error, and generic JSON reducers preserve schemas, exact facts, evidence IDs,
+validation issues, and error locations while returning only a bounded summary plus an
+artifact reference to the main model. These raw artifacts are not LangMem records;
+normal results expire after 30 days and failures after 7 days. Large outputs use a
+bounded, batched small-model Map-Reduce pass. Exact source quotations and numeric
+claims are verified before adoption; failed, truncated, or unsupported summaries fall
+back to deterministic reducers. The main model receives a dynamically sized projection,
+while model unavailability can never erase the archived execution evidence. If a required
+detail is absent, Kimi or the Analysis Loop may request at most two query-focused,
+source-extractive continuations from an artifact created by the same user and run. Full
+payload replay, arbitrary paths, and cross-run reads are rejected. Artifacts referenced by
+a validated report follow that report's lifecycle; unreferenced files and expired results
+are removed by the daily cleanup task.
 
 ## Kimi Data Assistant
 
@@ -225,6 +251,17 @@ mark each recalled memory as helpful, irrelevant, or wrong. Relevance and utilit
 are scored separately; suppressed candidates keep an auditable reason. Low-quality
 memory enters a reversible dormant state only after sufficient feedback. Automatic
 dormancy is disabled by default during the five-batch calibration period.
+
+LangMem is the only long-term-memory path. Its LangGraph `BaseStore` adapter uses
+strict user/scope/kind namespaces over DataMind's existing versioned repository, so
+the current HTTP API, version chains, feedback, usage audit, and rollback data remain
+compatible. SQLite backs local development and PostgreSQL backs Docker/production;
+the existing BGE provider reranks candidates without a separate vector database.
+Post-answer formation is validated by `DataMindMemoryGuard` before a write. Central
+projections expose semantic memory to Kimi, approved metric/business context and
+validated experience to Planner, provenance checks to Reviewer, and style preferences
+to Report. SQL and Python never search the memory store directly. Formation, recall,
+suppression, conflict, validation, feedback, and dormancy emit privacy-safe audit events.
 
 ## MCP Status
 

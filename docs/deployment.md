@@ -60,6 +60,28 @@ The application image downloads the pinned `BAAI/bge-small-zh-v1.5` revision
 during the build. The API and Worker reuse this image layer; the Python sandbox
 does not contain the embedding model.
 
+Complete tool outputs are stored under `DATAMIND_TOOL_ARTIFACT_PATH` (the Compose
+default is `/data/tool-artifacts`) and shared by API and Worker through the application
+data volume. Keep `DATAMIND_TOOL_ARTIFACT_MAX_BYTES=209715200` unless the host has a
+stricter storage policy. Normal artifacts expire after 30 days and failed outputs after
+7 days. The files are gzip-compressed, user/run scoped, never served as static content,
+and are deliberately separate from LangMem long-term memory.
+
+`DATAMIND_TOOL_DISTILLATION_STRATEGY=auto` activates the configured distillation
+provider only for results above `DATAMIND_TOOL_DISTILLATION_MIN_SOURCE_CHARS`.
+Map batches are bounded by the chunk, batch, and maximum-chunk settings. Every model
+summary is checked against exact source quotations and source-supported numbers before
+it can replace the deterministic projection. Provider failures therefore reduce
+summary quality only; they do not fail the tool or discard its archived result.
+
+Production Compose defaults `DATAMIND_CONTEXT_BUDGET_MODE=enforce`. A missing detail
+can be recovered through a bounded continuation only when the artifact belongs to the
+same user and run. `DATAMIND_TOOL_CONTINUATION_MAX_CALLS` limits distinct continuation
+queries, `DATAMIND_TOOL_CONTINUATION_MAX_CHARS` bounds model-facing excerpts, and
+`DATAMIND_TOOL_CONTINUATION_SCAN_MAX_BYTES` bounds one streaming scan. The model never
+receives the protected storage path or the full archived payload. Report evidence is
+retained with the report and purged after the report's recycle lifecycle ends.
+
 Assistant structured summaries, versioned semantic memory, maintenance leases, usage
 audit, and validated analysis experience use the existing application database and
 BGE cache. API, Worker, and Beat must share the same PostgreSQL database; no extra
@@ -75,6 +97,15 @@ long-term reads and writes off without deleting existing memory. Tune
 `DATAMIND_ASSISTANT_MEMORY_MMR_LAMBDA` only after running the deterministic `memory`
 benchmark. `DATAMIND_ASSISTANT_MEMORY_EXPERIENCE_ENABLED` controls read-only Planner
 experience reuse independently.
+
+LangMem is the single production long-term-memory path. Its LangGraph `BaseStore`
+adapter reads and writes the existing versioned repository, so there is one physical
+source of truth and no second memory database to synchronize. Local development uses
+the SQLite application database; Docker and production use the shared PostgreSQL
+database. Background formation must pass `DataMindMemoryGuard`; rejected or failed
+model extraction falls back only to the deterministic extractor. Agent projections
+are centralized: SQL and Python cannot search memory directly. The former rollout
+engine/mode switches were removed after Phase C convergence.
 
 Memory v3 model extraction runs only in the post-answer maintenance job. Keep
 `DATAMIND_ASSISTANT_MEMORY_MODEL_EXTRACTION_ENABLED=true` when the Kimi provider is

@@ -4,10 +4,14 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: datamind-ci-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       DATAMIND_DEFAULT_LLM_PROVIDER: mock
       DATAMIND_PLANNER_LLM_PROVIDER: mock
@@ -16,6 +20,7 @@ jobs:
       DATAMIND_REPORT_LLM_PROVIDER: mock
       DATAMIND_REVIEW_LLM_PROVIDER: mock
       DATAMIND_EXECUTION_BACKEND: local
+      DATAMIND_E2E_BROWSER_CHANNEL: chrome
 
     steps:
       - uses: actions/checkout@v6
@@ -74,6 +79,17 @@ jobs:
           path: artifacts/benchmarks/context
           if-no-files-found: warn
 
+      - name: Tool result context benchmark
+        run: python -m app.evaluation.cli run --suite tool-context --output artifacts/benchmarks/tool-context
+
+      - name: Upload tool result context benchmark
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: datamind-tool-context-benchmark
+          path: artifacts/benchmarks/tool-context
+          if-no-files-found: warn
+
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -85,9 +101,6 @@ jobs:
 
       - name: Build frontend
         run: npm --prefix frontend/react run build
-
-      - name: Install Playwright Chromium
-        run: npm --prefix frontend/react exec -- playwright install --with-deps chromium
 
       - name: Playwright end-to-end tests
         run: npm --prefix frontend/react run test:e2e

@@ -312,21 +312,27 @@ def _complete_job(
         report_terminal_reason=result.report_terminal_reason,
     )
     try:
+        memory_repository = AssistantMemoryRepository(
+            repository.root_path,
+            user_id=repository.user_id,
+        )
         experience = AssistantMemoryService(
-            repository=AssistantMemoryRepository(
-                repository.root_path,
-                user_id=repository.user_id,
-            ),
+            repository=memory_repository,
             store=repository,
         ).save_analysis_experience(job_id)
         if experience is not None:
+            validated_reuses = memory_repository.record_validated_reuse(run_id=job_id)
             repository.append_analysis_job_event(
                 job_id,
                 node="memory",
                 status="completed",
                 message="Validated analysis experience saved for future planning.",
-                event_type="memory.experience_saved",
-                payload={"memory_id": str(experience["memory_id"])},
+                event_type="memory.validated",
+                payload={
+                    "memory_id": str(experience["memory_id"]),
+                    "memory_kind": "episodic",
+                    "validated_usage_count": validated_reuses,
+                },
             )
     except Exception:
         logger.exception(
