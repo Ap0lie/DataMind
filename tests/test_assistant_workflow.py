@@ -917,6 +917,10 @@ def test_report_evidence_exposes_verification_join_and_chart_scope(
                     "delivered 总支付额为 643,547.75，SP 州支付总额为 248,007.22。"
                 ),
                 "analysis_context": ("payments 通过 order_id 连接 orders；连接后无行扩展。"),
+                "sql_results": [
+                    {"customer_state": "SP", "total_payment_value": 248007.22},
+                    {"customer_state": "RJ", "total_payment_value": 90500.50},
+                ],
                 "charts": [
                     {
                         "title": "payment_value 总额分组对比",
@@ -932,6 +936,14 @@ def test_report_evidence_exposes_verification_join_and_chart_scope(
                         "explanation": "SP 占全部 27 州支付总额的 38.5%。",
                     }
                 ],
+            },
+            "sql_result_scope": {
+                "kind": "top_n_groups",
+                "grouped": True,
+                "ordered": True,
+                "limit": 2,
+                "returned_rows": 2,
+                "is_partial": True,
             },
             "join_summary": {
                 "mode": "joined",
@@ -1042,6 +1054,9 @@ def test_report_evidence_exposes_verification_join_and_chart_scope(
     assert result["chart_context"][0]["displayed_category_count"] == 24
     assert result["chart_context"][0]["data_point_count"] == 27
     assert result["chart_context"][0]["denominator_scope"] == ("not_applicable_for_bar_chart")
+    assert result["sql_results"][0]["customer_state"] == "SP"
+    assert result["sql_results"][0]["total_payment_value"] == 248007.22
+    assert result["sql_result_scope"]["kind"] == "top_n_groups"
 
     repaired, changed = _ensure_requested_evidence_details(
         "当前证据未提供这些信息。",

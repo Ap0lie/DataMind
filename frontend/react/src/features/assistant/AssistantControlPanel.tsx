@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, ArchiveRestore, Brain, Check, History, Loader2, Pencil, Pin, PinOff, RotateCcw, ShieldCheck, Trash2, Undo2, X } from "lucide-react";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../../api-client";
 import { assistantCapabilitiesForAsset } from "./types";
@@ -65,6 +65,7 @@ export function AssistantControlPanel({ open, initialTab = "permissions", onClos
   const [target, setTarget] = useState("");
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const memorySettingsVersion = useRef(0);
 
   const assets = useMemo(() => [
     ...datasetGroups.map((item) => ({ ...item, type: "dataset_group" as const })),
@@ -114,6 +115,7 @@ export function AssistantControlPanel({ open, initialTab = "permissions", onClos
   }, [initialTab, open]);
 
   const refresh = async () => {
+    const settingsVersion = memorySettingsVersion.current;
     const [grantResult, actionResult, memoryResult, memorySettingsResult, effectivenessResult, recycleResult] = await Promise.allSettled([
       apiGet<{ grants: AssistantPermissionGrant[] }>("/assistant/permission-grants"),
       apiGet<{ actions: AssistantAction[] }>("/assistant/actions?limit=100"),
@@ -129,7 +131,9 @@ export function AssistantControlPanel({ open, initialTab = "permissions", onClos
     if (grantResult.status === "fulfilled") setGrants(nextGrants);
     if (actionResult.status === "fulfilled") setActions(nextActions);
     if (memoryResult.status === "fulfilled") setMemories(nextMemories);
-    if (memorySettingsResult.status === "fulfilled") setMemoryEnabled(memorySettingsResult.value.enabled);
+    if (memorySettingsResult.status === "fulfilled" && settingsVersion === memorySettingsVersion.current) {
+      setMemoryEnabled(memorySettingsResult.value.enabled);
+    }
     if (effectivenessResult.status === "fulfilled") setMemoryEffectiveness(effectivenessResult.value);
     if (recycleResult.status === "fulfilled") setRecycled(nextRecycled);
     onSummaryChange?.({ grants: nextGrants.length, actions: nextActions.filter((item) => item.status === "running" || (item.reversible && !item.undone_at)).length, recycled: nextRecycled.length, memories: nextMemories.filter((item) => item.status !== "recycled").length });
@@ -294,11 +298,15 @@ export function AssistantControlPanel({ open, initialTab = "permissions", onClos
   };
 
   const toggleMemoryEnabled = async () => {
+    const nextEnabled = !memoryEnabled;
+    memorySettingsVersion.current += 1;
     setBusyKey("memory-settings");
+    setMemoryEnabled(nextEnabled);
     try {
-      const result = await apiPatch<{ enabled: boolean }>("/assistant/memory-settings", { enabled: !memoryEnabled });
+      const result = await apiPatch<{ enabled: boolean }>("/assistant/memory-settings", { enabled: nextEnabled });
       setMemoryEnabled(result.enabled);
     } catch (cause) {
+      setMemoryEnabled(!nextEnabled);
       setError(messageOf(cause));
     } finally {
       setBusyKey(null);

@@ -15,6 +15,7 @@ from app.mcp.model_router_server import (
     KimiModelRouterBackend,
     MockModelRouterBackend,
     ModelRouterMCPServer,
+    _await_with_cancel,
     _kimi_provider_messages,
     _provider_for_request,
     _provider_retry_count,
@@ -315,7 +316,12 @@ async def test_kimi_backend_streams_provider_sse_deltas(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     async def fake_stream_json_events(
-        url: str, *, payload: dict, headers: dict, timeout_seconds: float
+        url: str,
+        *,
+        payload: dict,
+        headers: dict,
+        timeout_seconds: float,
+        cancel_check=None,
     ):
         captured.update(payload=payload, timeout=timeout_seconds)
         events = (
@@ -367,6 +373,22 @@ async def test_kimi_backend_streams_provider_sse_deltas(monkeypatch) -> None:
     assert deltas == ["第一段", "第二段"]
     assert response.content == "第一段第二段"
     assert response.token_usage["total_tokens"] == 10
+
+
+@pytest.mark.asyncio
+async def test_stream_wait_can_be_canceled_before_the_first_provider_token() -> None:
+    checks = 0
+
+    def cancel_check() -> None:
+        nonlocal checks
+        checks += 1
+        if checks >= 2:
+            raise RuntimeError("run canceled")
+
+    with pytest.raises(RuntimeError, match="run canceled"):
+        await _await_with_cancel(asyncio.sleep(10), cancel_check)
+
+    assert checks >= 2
 
 
 @pytest.mark.asyncio

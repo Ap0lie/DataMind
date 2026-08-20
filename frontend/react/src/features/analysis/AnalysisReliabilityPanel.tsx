@@ -135,6 +135,9 @@ function ReliabilityMetric({ label, value }: { label: string; value: string }) {
 }
 
 function LineageSummary({ lineage }: { lineage: AnalysisLineage }) {
+  const graphNodes = Array.isArray(lineage.relationship_graph.nodes)
+    ? lineage.relationship_graph.nodes as Record<string, unknown>[]
+    : [];
   const graphEdges = Array.isArray(lineage.relationship_graph.edges)
     ? lineage.relationship_graph.edges
     : [];
@@ -143,6 +146,9 @@ function LineageSummary({ lineage }: { lineage: AnalysisLineage }) {
     : [];
   const isSafe = lineage.grain_plan.safe !== false;
   const reportCount = lineage.nodes.filter((node) => node.node_type === "report").length;
+  const entityNames = new Map(
+    graphNodes.map((node) => [String(node.entity_id ?? ""), String(node.name ?? node.entity_id ?? "未知表")]),
+  );
 
   return (
     <div className="mt-5 border-t border-line pt-4">
@@ -168,7 +174,7 @@ function LineageSummary({ lineage }: { lineage: AnalysisLineage }) {
         <div className="mt-3 flex flex-wrap gap-2">
           {steps.slice(0, 5).map((step, index) => (
             <span key={String(step.relationship_id ?? index)} className="rounded-lg bg-slate-50 px-3 py-2 text-xs font-bold text-slate-700">
-              {String(step.strategy ?? "direct_join")} · {String(step.from_entity_id ?? "")} → {String(step.to_entity_id ?? "")}
+              {joinStrategyLabel(step.strategy)} · {entityLabel(step.from_entity_id, entityNames)} → {entityLabel(step.to_entity_id, entityNames)}
             </span>
           ))}
         </div>
@@ -180,4 +186,20 @@ function LineageSummary({ lineage }: { lineage: AnalysisLineage }) {
       )}
     </div>
   );
+}
+
+function entityLabel(value: unknown, names: Map<string, string>) {
+  const id = String(value ?? "");
+  return names.get(id) ?? "未知实体";
+}
+
+function joinStrategyLabel(value: unknown) {
+  const strategy = String(value ?? "direct_join");
+  const labels: Record<string, string> = {
+    direct_join: "直接连接",
+    pre_aggregate: "预聚合后连接",
+    semi_join: "半连接",
+    deduplicate: "去重后连接",
+  };
+  return labels[strategy] ?? strategy;
 }

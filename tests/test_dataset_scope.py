@@ -257,6 +257,31 @@ def test_approved_forbidden_relationship_prunes_join_without_field_requirements(
     }
 
 
+def test_relationship_clause_preserves_every_edge_in_a_multi_table_path(tmp_path) -> None:
+    repository = DatasetStoreRepository(str(tmp_path), user_id="default")
+    datasets, _ = _commerce_package(repository)
+    question = "将 order_payments 连接 orders 再连接 customers 后分析。"
+
+    intent = IntentCompilationHarness(
+        model_router=None,
+        settings=Settings(environment="test", intent_compiler_mode="shadow"),
+    ).compile(
+        question=question,
+        context=build_intent_compilation_context(
+            repository,
+            dataset_ids=tuple(dataset.id for dataset in datasets.values()),
+        ),
+    ).intent
+
+    assert tuple(
+        (constraint.left_dataset_id, constraint.right_dataset_id)
+        for constraint in intent.relationship_constraints
+    ) == (
+        (datasets["order_payments"].id, datasets["orders"].id),
+        (datasets["orders"].id, datasets["customers"].id),
+    )
+
+
 def test_required_relationship_rejects_an_unsubmitted_authorized_dataset(
     tmp_path,
 ) -> None:

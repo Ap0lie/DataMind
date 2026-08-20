@@ -9,6 +9,11 @@ type DriftChange = {
   change_type: string;
   severity: "info" | "warning" | "critical";
   field?: string | null;
+  previous_field?: string | null;
+  current_field?: string | null;
+  previous_value?: unknown;
+  current_value?: unknown;
+  score?: number | null;
   message: string;
 };
 
@@ -168,7 +173,7 @@ export function DriftMonitorPanel({
               </span>
               <span>
                 <b className="mr-1 text-slate-950">{change.datasetName}</b>
-                {change.message}
+                {driftMessage(change)}
               </span>
             </div>
           ))}
@@ -196,4 +201,55 @@ function statusLabel(status: DriftStatus) {
   if (status === "warning") return "存在变化";
   if (status === "baseline") return "基线已建立";
   return "状态稳定";
+}
+
+function driftMessage(change: DriftChange) {
+  const field = change.field ?? change.current_field ?? change.previous_field ?? "未知字段";
+  switch (change.change_type) {
+    case "column_renamed":
+      return `字段 ${change.previous_field ?? "未知字段"} 可能已重命名为 ${change.current_field ?? field}。`;
+    case "column_removed":
+      return `字段 ${change.previous_field ?? field} 已被删除。`;
+    case "column_added":
+      return `新增字段 ${change.current_field ?? field}。`;
+    case "type_changed":
+      return hasComparisonValues(change)
+        ? `字段 ${field} 的类型从 ${displayValue(change.previous_value)} 变为 ${displayValue(change.current_value)}。`
+        : localizedFallback(change.message, `字段 ${field} 的类型发生变化。`);
+    case "missing_rate_drift":
+      return hasComparisonValues(change)
+        ? `字段 ${field} 的缺失率从 ${displayRate(change.previous_value)} 变为 ${displayRate(change.current_value)}。`
+        : localizedFallback(change.message, `字段 ${field} 的缺失率发生变化。`);
+    case "unique_rate_drift":
+      return hasComparisonValues(change)
+        ? `字段 ${field} 的唯一率从 ${displayRate(change.previous_value)} 变为 ${displayRate(change.current_value)}。`
+        : localizedFallback(change.message, `字段 ${field} 的唯一率发生变化。`);
+    case "distribution_drift":
+      return `字段 ${field} 的均值偏移了 ${Number(change.score ?? 0).toFixed(2)} 个标准差。`;
+    case "row_count_drift":
+      return `数据行数从 ${displayValue(change.previous_value)} 变为 ${displayValue(change.current_value)}。`;
+    default:
+      return change.message || "检测到数据变化。";
+  }
+}
+
+function hasComparisonValues(change: DriftChange) {
+  return change.previous_value !== null
+    && change.previous_value !== undefined
+    && change.current_value !== null
+    && change.current_value !== undefined;
+}
+
+function localizedFallback(message: string, fallback: string) {
+  return /[\u3400-\u9fff]/u.test(message) ? message : fallback;
+}
+
+function displayRate(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${(number * 100).toFixed(1)}%` : "未知";
+}
+
+function displayValue(value: unknown) {
+  if (value === null || value === undefined || value === "") return "未知";
+  return typeof value === "number" ? value.toLocaleString("zh-CN") : String(value);
 }

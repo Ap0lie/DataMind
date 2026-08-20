@@ -155,7 +155,6 @@ export function AnalysisPage({
   useEffect(() => {
     if (!selectedJobId) {
       setCurrentJob(null);
-      setError(null);
       return;
     }
     let canceled = false;

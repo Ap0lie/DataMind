@@ -560,6 +560,9 @@ class AssistantWorkflowRunner:
                         "allow_provider_fallback": False,
                         "streaming": True,
                     },
+                    cancel_check=lambda: ensure_run_continuable(
+                        self.assistant_store, run_id
+                    ),
                 )
                 ensure_run_continuable(self.assistant_store, run_id)
                 if not accumulated and not pending and response.content:
@@ -616,6 +619,7 @@ class AssistantWorkflowRunner:
                     )
                     continuation_deltas: list[str] = []
 
+                    ensure_run_continuable(self.assistant_store, run_id)
                     continuation = stream_complete(
                         messages=[
                             *final_messages,
@@ -641,6 +645,9 @@ class AssistantWorkflowRunner:
                             "streaming": True,
                             "continuation": continuation_count,
                         },
+                        cancel_check=lambda: ensure_run_continuable(
+                            self.assistant_store, run_id
+                        ),
                     )
                     ensure_run_continuable(self.assistant_store, run_id)
                     continuation_text = "".join(continuation_deltas)

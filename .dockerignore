@@ -17,6 +17,7 @@ build
 *.egg-info
 data
 artifacts
+.artifacts
 benchmarks
 tests
 frontend/react/node_modules

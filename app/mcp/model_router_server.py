@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import suppress
 from typing import Any, Protocol
 
 import httpx
@@ -191,6 +192,8 @@ class KimiModelRouterBackend:
         self,
         request: ModelRouterRequest,
         on_delta: Callable[[str], None],
+        *,
+        cancel_check: Callable[[], None] | None = None,
     ) -> ModelRouterResponse:
         api_key = _secret_value(self._settings.kimi_api_key) or _secret_value(
             self._settings.llm_api_key
@@ -224,6 +227,7 @@ class KimiModelRouterBackend:
             max_retries=_provider_retry_count(self._settings, request),
             backoff_seconds=self._settings.llm_retry_backoff_seconds,
             on_delta=on_delta,
+            cancel_check=cancel_check,
         )
 
 
@@ -292,17 +296,60 @@ async def _stream_json_events(
     payload: dict[str, Any],
     headers: dict[str, str],
     timeout_seconds: float,
+    cancel_check: Callable[[], None] | None = None,
 ) -> AsyncIterator[str]:
     if timeout_seconds <= 0:
         raise TimeoutError("Provider API request deadline has expired.")
     timeout = httpx.Timeout(timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", url, json=payload, headers=headers) as response:
+        stream = client.stream("POST", url, json=payload, headers=headers)
+        response = await _await_with_cancel(stream.__aenter__(), cancel_check)
+        try:
             if response.status_code >= 400:
                 body = (await response.aread()).decode("utf-8", errors="replace")
                 raise _ProviderHTTPError(response.status_code, body)
-            async for line in response.aiter_lines():
-                yield line
+            iterator = response.aiter_lines().__aiter__()
+            pending: asyncio.Task[str] | None = None
+            try:
+                while True:
+                    if cancel_check is not None:
+                        cancel_check()
+                    if pending is None:
+                        pending = asyncio.create_task(anext(iterator))
+                    done, _ = await asyncio.wait({pending}, timeout=0.25)
+                    if not done:
+                        continue
+                    try:
+                        line = pending.result()
+                    except StopAsyncIteration:
+                        break
+                    pending = None
+                    yield line
+            finally:
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await pending
+        finally:
+            await stream.__aexit__(None, None, None)
+
+
+async def _await_with_cancel(
+    awaitable: Awaitable[Any],
+    cancel_check: Callable[[], None] | None,
+) -> Any:
+    task = asyncio.create_task(awaitable)
+    try:
+        while not task.done():
+            if cancel_check is not None:
+                cancel_check()
+            await asyncio.wait({task}, timeout=0.25)
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 async def _kimi_request_with_transient_retry(
@@ -373,11 +420,14 @@ async def _stream_kimi_response(
     max_retries: int,
     backoff_seconds: float,
     on_delta: Callable[[str], None],
+    cancel_check: Callable[[], None] | None = None,
 ) -> ModelRouterResponse:
     """Consume Kimi's provider SSE and retry only before the first visible token."""
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     attempt = 0
     while True:
+        if cancel_check is not None:
+            cancel_check()
         attempt += 1
         emitted = False
         content_parts: list[str] = []
@@ -390,6 +440,7 @@ async def _stream_kimi_response(
                 payload=payload,
                 headers=headers,
                 timeout_seconds=_remaining_provider_timeout(deadline, "Kimi"),
+                cancel_check=cancel_check,
             ):
                 line = line.strip()
                 if not line.startswith("data:"):
@@ -459,6 +510,7 @@ async def _stream_kimi_response(
             else 0.0,
             deadline=deadline,
             provider="Kimi",
+            cancel_check=cancel_check,
         )
 
 
@@ -474,13 +526,19 @@ async def _sleep_before_retry(
     *,
     deadline: float,
     provider: str,
+    cancel_check: Callable[[], None] | None = None,
 ) -> None:
     remaining = _remaining_provider_timeout(deadline, provider)
     if delay_seconds >= remaining:
         await asyncio.sleep(remaining)
         raise TimeoutError(f"{provider} API request deadline has expired.")
-    if delay_seconds > 0:
-        await asyncio.sleep(delay_seconds)
+    remaining_delay = delay_seconds
+    while remaining_delay > 0:
+        if cancel_check is not None:
+            cancel_check()
+        interval = min(0.25, remaining_delay)
+        await asyncio.sleep(interval)
+        remaining_delay -= interval
 
 
 def _provider_timeout_seconds(settings: Settings, request: ModelRouterRequest) -> float:
@@ -539,12 +597,22 @@ class ConfiguredModelRouterBackend:
         self,
         request: ModelRouterRequest,
         on_delta: Callable[[str], None],
+        *,
+        cancel_check: Callable[[], None] | None = None,
     ) -> ModelRouterResponse:
         provider = _provider_for_request(request, self._settings)
+        if cancel_check is not None:
+            cancel_check()
         if provider == "kimi":
             try:
-                return await self._kimi.stream_complete(request, on_delta)
+                return await self._kimi.stream_complete(
+                    request,
+                    on_delta,
+                    cancel_check=cancel_check,
+                )
             except (RuntimeError, TimeoutError):
+                if cancel_check is not None:
+                    cancel_check()
                 allow_fallback = request.metadata.get("allow_provider_fallback")
                 if allow_fallback is None:
                     allow_fallback = self._settings.llm_allow_provider_fallback
@@ -560,6 +628,8 @@ class ConfiguredModelRouterBackend:
             response = await self._mock.complete(request)
         else:
             raise RuntimeError(f"Unsupported LLM provider: {provider}")
+        if cancel_check is not None:
+            cancel_check()
         if response.content:
             on_delta(response.content)
         return response
