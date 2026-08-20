@@ -89,6 +89,10 @@ stop before any analysis tool runs.
   with timeout, output limits, chart compaction, repair attempts, and fallback.
 - Statistical verification for requested metrics/dimensions, Join grain,
   evidence coverage, comparison support, confidence intervals, and causal wording.
+- SQL AST result-scope analysis distinguishes complete results, highest/lowest-N
+  groups, limited groups, and limited rows. Before commit, reports reconcile filtered
+  populations, Join cardinality, and chart wording so partial subtotals are not stated
+  as population totals.
 - Structured web reports with charts, brief/standard/detailed views, versioning,
   HTML/Markdown export, and browser-print PDF.
 - Persistent analysis, cleaning, and Assistant jobs with cancellation, retry,
@@ -233,6 +237,9 @@ creation intent still creates a new conversation.
 Attachments support JPEG, PNG, WebP, CSV, XLSX, JSON, and TXT. Large data files are
 streamed to protected staging storage and parsed one file at a time. Final answers
 stream real provider tokens and may cite only assets actually read during the run.
+Pausing a Kimi run cooperatively interrupts an in-flight provider stream and retry
+backoff. Completed events and messages remain recoverable, and no late answer is
+committed after cancellation.
 
 Kimi memory has three explicit layers: sourced structured summaries compress older
 messages; versioned semantic memory carries approved preferences, terminology,
@@ -262,6 +269,9 @@ projections expose semantic memory to Kimi, approved metric/business context and
 validated experience to Planner, provenance checks to Reviewer, and style preferences
 to Report. SQL and Python never search the memory store directly. Formation, recall,
 suppression, conflict, validation, feedback, and dormancy emit privacy-safe audit events.
+Validated analysis experience is keyed by a stable signature over the Contract,
+semantic version, Join/grain plan, and tool sequence. Semantically equivalent reruns
+merge source job provenance instead of accumulating duplicate memories.
 
 ## MCP Status
 
@@ -290,6 +300,8 @@ python -m pytest -o addopts="" -m sandbox
 python -m pytest -o addopts="" -m benchmark
 python -m app.evaluation.cli run --suite release
 python -m app.evaluation.cli run --suite memory
+python -m app.evaluation.cli run --suite context
+python -m app.evaluation.cli run --suite tool-context
 
 npm --prefix frontend/react run build
 npm --prefix frontend/react run test:e2e

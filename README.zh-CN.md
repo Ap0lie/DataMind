@@ -74,6 +74,8 @@ Guard 可把具体错误反馈给模型修复，最多两次；仍不可靠时�
 - DuckDB 安全 SQL，只允许访问授权数据集、字段和已声明的关系路径。
 - Python 代码在受控子进程或一次性容器执行，具备超时、输出限制、图表压缩、修复和回退。
 - 验证用户要求的指标/维度、Join 数据粒度、证据覆盖、比较型结论、置信区间和因果措辞。
+- 使用 SQL AST 区分全量结果、最高/最低 N 个分组、有限分组和有限行；报告提交前会核对
+  过滤前后样本量、Join 基数与图表说明，局部小计不会被表述为总体结论。
 - 结构化 Web 报告、图表、简洁/标准/详细模板、版本历史、HTML/Markdown 和浏览器打印 PDF。
 - 分析、清洗和 Assistant 任务支持取消、重试、Checkpoint 恢复、有序事件和跨页面持续运行。
 
@@ -202,6 +204,8 @@ Kimi 可以读取当前用户的数据集、已完成分析和报告。问答模
 
 附件支持 JPEG、PNG、WebP、CSV、XLSX、JSON 和 TXT。大文件采用受保护的落盘暂存，
 逐个文件解析。最终回答使用模型真实 Token 流，并且只能引用本轮实际读取过的资产。
+暂停 Kimi 任务会协作式中断正在等待的 Provider 流和重试退避；已完成事件与消息仍可恢复，
+不会在停止后继续产生迟到回答。
 
 Kimi Memory 分为三层：带来源的结构化摘要压缩较早消息；版本化语义记忆跨对话保存
 偏好、术语、指标口径和业务背景；Checkpoint 只负责单次任务恢复。显式冲突会创建
@@ -219,6 +223,8 @@ SQLite，Docker/生产使用 PostgreSQL；现有 BGE Provider 只负责候选重
 和已验证经验，Reviewer 只读取来源一致性上下文，Report 只读取样式偏好和已验证结论；
 SQL/Python 不直接检索 Memory。形成、召回、抑制、冲突、验证、反馈与休眠都会产生不含
 正文的审计事件。
+通过验证的分析经验使用 Contract、语义版本、Join/粒度计划与工具序列生成稳定签名；
+语义等价的重复任务会合并来源 Job，而不是不断写入重复经验。
 用户可以把实际召回的记忆标记为“有用、无关、错误”；低质量记忆只进入可恢复休眠，
 不会静默删除。自动休眠仍需完成至少 5 个有效基准批次后再启用。
 
@@ -248,6 +254,8 @@ python -m pytest -o addopts="" -m sandbox
 python -m pytest -o addopts="" -m benchmark
 python -m app.evaluation.cli run --suite release
 python -m app.evaluation.cli run --suite memory
+python -m app.evaluation.cli run --suite context
+python -m app.evaluation.cli run --suite tool-context
 
 npm --prefix frontend/react run build
 npm --prefix frontend/react run test:e2e
